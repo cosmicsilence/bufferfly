@@ -1,0 +1,9 @@
+dependencies {
+    implementation project(':bufferfly-core')
+
+    implementation platform('org.springframework.boot:spring-boot-dependencies:3.4.4')
+    implementation 'org.springframework.boot:spring-boot-autoconfigure'
+    implementation 'org.springframework:spring-context'
+
+    testImplementation 'org.springframework.boot:spring-boot-starter-test'
+}
