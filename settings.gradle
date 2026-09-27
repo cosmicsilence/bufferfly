@@ -1,0 +1,4 @@
+rootProject.name = 'bufferfly'
+
+include 'bufferfly-core'
+include 'bufferfly-spring-kafka'

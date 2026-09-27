@@ -1,0 +1,28 @@
+subprojects {
+    apply plugin: 'java'
+
+    group = 'io.bufferfly'
+    version = '0.1.0-SNAPSHOT'
+
+    java {
+        sourceCompatibility = JavaVersion.toVersion('25')
+        targetCompatibility = JavaVersion.toVersion('25')
+    }
+
+    repositories {
+        mavenCentral()
+    }
+
+    jar {
+        manifest {
+            attributes(
+                'Implementation-Title': project.name,
+                'Implementation-Version': project.version
+            )
+        }
+    }
+
+    tasks.withType(JavaCompile).configureEach {
+        options.encoding = 'UTF-8'
+    }
+}

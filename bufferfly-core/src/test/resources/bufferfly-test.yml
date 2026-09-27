@@ -1,0 +1,10 @@
+bufferfly:
+  actors:
+    default-mailbox-capacity: 750
+    default-dispatcher: io.bufferfly.core.actor.VTDispatcher
+    overrides:
+      yaml-actor:
+        mailbox-capacity: 200
+        dispatcher: io.bufferfly.core.actor.VTDispatcher
+      another-actor:
+        mailbox-capacity: 300
