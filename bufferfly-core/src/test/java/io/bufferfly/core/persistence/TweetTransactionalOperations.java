@@ -1,64 +1,94 @@
 package io.bufferfly.core.persistence;
 
+import org.springframework.dao.CannotAcquireLockException;
+import org.springframework.dao.DataAccessException;
+import org.springframework.dao.QueryTimeoutException;
+import org.springframework.dao.TransientDataAccessException;
+import org.springframework.jdbc.CannotGetJdbcConnectionException;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.jdbc.datasource.DataSourceTransactionManager;
+import org.springframework.jdbc.datasource.DriverManagerDataSource;
+import org.springframework.transaction.CannotCreateTransactionException;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.TransactionException;
+import org.springframework.transaction.support.TransactionTemplate;
+
+import javax.sql.DataSource;
 import java.io.IOException;
 import java.net.SocketException;
-import java.sql.Connection;
-import java.sql.DriverManager;
-import java.sql.PreparedStatement;
-import java.sql.ResultSet;
 import java.sql.SQLException;
-import java.sql.Statement;
-import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * Concrete {@link TransactionalOperations} implementation for {@link Tweet} entities,
- * interacting with an HSQLDB database table {@code tweet (id VARCHAR(50) PRIMARY KEY, text VARCHAR2(100))}.
+ * Concrete {@link TransactionalOperations} implementation for {@link Tweet} entities using
+ * Spring's {@link JdbcTemplate} and {@link TransactionTemplate}.
  *
- * <p>Handles:
+ * <p>Leverages Spring's JDBC abstractions to:
  * <ul>
- *   <li>Atomic batch inserts with transaction commit/rollback.</li>
- *   <li>Poison pill detection (e.g., text exceeding 100 characters) triggering {@link SingleItemException}.</li>
- *   <li>Transient network/connection failures triggering {@link TransientException}.</li>
- *   <li>Dead-letter / poison-pill recording in {@link #onPoisonPill}.</li>
+ *   <li>Execute atomic batch inserts with automatic transaction rollback on failure.</li>
+ *   <li>Translate low-level SQL exceptions into Spring's exception hierarchy.</li>
+ *   <li>Classify transient errors (connection refused, timeouts, deadlocks) into {@link TransientException}.</li>
+ *   <li>Classify data constraint violations (poison pills, e.g. text > 100 chars) into {@link SingleItemException}.</li>
+ *   <li>Provide concise query helpers without JDBC boilerplate.</li>
  * </ul>
  */
 public class TweetTransactionalOperations implements TransactionalOperations<Tweet> {
 
-    @FunctionalInterface
-    public interface ConnectionSupplier {
-        Connection getConnection() throws SQLException;
-    }
+    private final JdbcTemplate jdbcTemplate;
+    private final TransactionTemplate transactionTemplate;
+    private final String tableName;
 
-    private final ConnectionSupplier connectionSupplier;
-
-    private final List<Tweet> poisonPills = Collections.synchronizedList(new ArrayList<>());
-    private final List<Exception> poisonPillCauses = Collections.synchronizedList(new ArrayList<>());
+    private final List<Tweet> poisonPills = new CopyOnWriteArrayList<>();
+    private final List<Exception> poisonPillCauses = new CopyOnWriteArrayList<>();
 
     private final AtomicInteger runCallCount = new AtomicInteger(0);
     private final AtomicInteger persistedCount = new AtomicInteger(0);
     private final AtomicInteger transientExceptionCount = new AtomicInteger(0);
     private final AtomicInteger singleItemExceptionCount = new AtomicInteger(0);
 
-    public TweetTransactionalOperations(ConnectionSupplier connectionSupplier) {
-        if (connectionSupplier == null) throw new NullPointerException("connectionSupplier must not be null");
-        this.connectionSupplier = connectionSupplier;
+    public TweetTransactionalOperations(DataSource dataSource, String tableName) {
+        if (dataSource == null) throw new NullPointerException("dataSource must not be null");
+        this.tableName = (tableName != null) ? tableName : "tweet";
+        this.jdbcTemplate = new JdbcTemplate(dataSource);
+        PlatformTransactionManager txManager = new DataSourceTransactionManager(dataSource);
+        this.transactionTemplate = new TransactionTemplate(txManager);
+    }
+
+    public TweetTransactionalOperations(DataSource dataSource) {
+        this(dataSource, "tweet");
+    }
+
+    public TweetTransactionalOperations(String jdbcUrl, String user, String password, String tableName) {
+        this(new DriverManagerDataSource(jdbcUrl, user, password), tableName);
     }
 
     public TweetTransactionalOperations(String jdbcUrl, String user, String password) {
-        this(() -> DriverManager.getConnection(jdbcUrl, user, password));
+        this(jdbcUrl, user, password, "tweet");
+    }
+
+    public TweetTransactionalOperations(JdbcTemplate jdbcTemplate, TransactionTemplate transactionTemplate, String tableName) {
+        if (jdbcTemplate == null) throw new NullPointerException("jdbcTemplate must not be null");
+        if (transactionTemplate == null) throw new NullPointerException("transactionTemplate must not be null");
+        this.tableName = (tableName != null) ? tableName : "tweet";
+        this.jdbcTemplate = jdbcTemplate;
+        this.transactionTemplate = transactionTemplate;
     }
 
     /**
      * Creates the tweet table if it does not already exist.
      */
-    public void createTableIfNotExists() throws SQLException {
-        try (Connection conn = connectionSupplier.getConnection();
-             Statement stmt = conn.createStatement()) {
-            stmt.execute("CREATE TABLE tweet (id VARCHAR(50) PRIMARY KEY, text VARCHAR2(100))");
-        }
+    public void createTableIfNotExists() {
+        jdbcTemplate.execute("CREATE TABLE " + tableName + " (id VARCHAR(50) PRIMARY KEY, text VARCHAR2(100))");
+    }
+
+    /**
+     * Truncates the table.
+     */
+    public void truncateTable() {
+        jdbcTemplate.execute("TRUNCATE TABLE " + tableName);
     }
 
     @Override
@@ -68,36 +98,24 @@ public class TweetTransactionalOperations implements TransactionalOperations<Twe
         }
         runCallCount.incrementAndGet();
 
-        Connection conn;
         try {
-            conn = connectionSupplier.getConnection();
-        } catch (SQLException | RuntimeException e) {
-            // Cannot connect to database -> database is unavailable -> throw TransientException
-            transientExceptionCount.incrementAndGet();
-            throw new TransientException("Database unavailable: " + e.getMessage(), e);
-        }
-
-        try (conn) {
-            conn.setAutoCommit(false);
-            try (PreparedStatement ps = conn.prepareStatement("INSERT INTO tweet (id, text) VALUES (?, ?)")) {
-                for (Tweet tweet : batch) {
-                    ps.setString(1, tweet.id());
-                    ps.setString(2, tweet.text());
-                    ps.addBatch();
-                }
-                ps.executeBatch();
-                conn.commit();
-                persistedCount.addAndGet(batch.size());
-            } catch (SQLException e) {
-                try {
-                    conn.rollback();
-                } catch (SQLException rollbackEx) {
-                    // Suppress secondary rollback failure
-                }
-                handleSqlException(e, batch);
-            }
-        } catch (SQLException e) {
-            handleSqlException(e, batch);
+            transactionTemplate.execute(status -> {
+                jdbcTemplate.batchUpdate(
+                        "INSERT INTO " + tableName + " (id, text) VALUES (?, ?)",
+                        batch,
+                        batch.size(),
+                        (ps, tweet) -> {
+                            ps.setString(1, tweet.id());
+                            ps.setString(2, tweet.text());
+                        }
+                );
+                return null;
+            });
+            persistedCount.addAndGet(batch.size());
+        } catch (DataAccessException | TransactionException e) {
+            handleException(e, batch);
+        } catch (Exception e) {
+            handleException(e, batch);
         }
     }
 
@@ -107,7 +125,7 @@ public class TweetTransactionalOperations implements TransactionalOperations<Twe
         poisonPillCauses.add(cause);
     }
 
-    private void handleSqlException(SQLException e, List<Tweet> batch) {
+    private void handleException(Exception e, List<Tweet> batch) {
         if (isTransient(e)) {
             transientExceptionCount.incrementAndGet();
             throw new TransientException("Transient database failure: " + e.getMessage(), e);
@@ -118,83 +136,74 @@ public class TweetTransactionalOperations implements TransactionalOperations<Twe
     }
 
     /**
-     * Determines whether an SQL exception represents a transient failure (e.g. network disconnect,
-     * timeout, deadlock) that can succeed on retry.
+     * Determines whether an exception represents a transient failure that can be retried.
      */
-    private boolean isTransient(SQLException e) {
-        if (e instanceof java.sql.SQLTransientException) return true;
-        if (e instanceof java.sql.SQLRecoverableException) return true;
+    private boolean isTransient(Exception e) {
+        if (e instanceof CannotCreateTransactionException) return true;
+        if (e instanceof CannotGetJdbcConnectionException) return true;
+        if (e instanceof TransientDataAccessException) return true;
+        if (e instanceof QueryTimeoutException) return true;
+        if (e instanceof CannotAcquireLockException) return true;
 
-        String sqlState = e.getSQLState();
-        if (sqlState != null) {
-            if (sqlState.startsWith("08")) return true; // Connection exception (08001, 08003, 08006, etc.)
-            if (sqlState.startsWith("40")) return true; // Transaction rollback / deadlock
-        }
-
-        String msg = e.getMessage();
-        if (msg != null) {
-            String lower = msg.toLowerCase();
-            if (lower.contains("connection") || lower.contains("network")
-                    || lower.contains("socket") || lower.contains("refused")
-                    || lower.contains("timeout") || lower.contains("closed")
-                    || lower.contains("broken pipe") || lower.contains("reset by peer")) {
+        Throwable current = e;
+        while (current != null) {
+            if (current instanceof SQLException sqlEx) {
+                String sqlState = sqlEx.getSQLState();
+                if (sqlState != null) {
+                    if (sqlState.startsWith("08")) return true; // Connection exception (08001, 08003, etc.)
+                    if (sqlState.startsWith("40")) return true; // Transaction rollback / deadlock
+                }
+                String msg = sqlEx.getMessage();
+                if (msg != null) {
+                    String lower = msg.toLowerCase();
+                    if (lower.contains("connection") || lower.contains("network")
+                            || lower.contains("socket") || lower.contains("refused")
+                            || lower.contains("timeout") || lower.contains("closed")
+                            || lower.contains("broken pipe") || lower.contains("reset by peer")) {
+                        return true;
+                    }
+                }
+            }
+            if (current instanceof IOException || current instanceof SocketException) {
                 return true;
             }
-        }
-
-        Throwable cause = e.getCause();
-        while (cause != null) {
-            if (cause instanceof IOException || cause instanceof SocketException) {
-                return true;
-            }
-            cause = cause.getCause();
+            current = current.getCause();
         }
         return false;
     }
 
     // -----------------------------------------------------------------------
-    // Query / Assertion helpers
+    // Query / Assertion helpers using JdbcTemplate
     // -----------------------------------------------------------------------
 
-    public int countTweets() throws SQLException {
-        try (Connection conn = connectionSupplier.getConnection();
-             Statement stmt = conn.createStatement();
-             ResultSet rs = stmt.executeQuery("SELECT COUNT(*) FROM tweet")) {
-            if (rs.next()) {
-                return rs.getInt(1);
-            }
-            return 0;
-        }
+    public int countTweets() {
+        Integer count = jdbcTemplate.queryForObject("SELECT COUNT(*) FROM " + tableName, Integer.class);
+        return count != null ? count : 0;
     }
 
-    public Tweet findTweetById(String id) throws SQLException {
-        try (Connection conn = connectionSupplier.getConnection();
-             PreparedStatement ps = conn.prepareStatement("SELECT id, text FROM tweet WHERE id = ?")) {
-            ps.setString(1, id);
-            try (ResultSet rs = ps.executeQuery()) {
-                if (rs.next()) {
-                    return new Tweet(rs.getString("id"), rs.getString("text"));
-                }
-                return null;
-            }
-        }
+    public Tweet findTweetById(String id) {
+        List<Tweet> list = jdbcTemplate.query(
+                "SELECT id, text FROM " + tableName + " WHERE id = ?",
+                (rs, rowNum) -> new Tweet(rs.getString("id"), rs.getString("text")),
+                id
+        );
+        return list.isEmpty() ? null : list.get(0);
     }
 
-    public List<Tweet> getAllTweets() throws SQLException {
-        List<Tweet> list = new ArrayList<>();
-        try (Connection conn = connectionSupplier.getConnection();
-             Statement stmt = conn.createStatement();
-             ResultSet rs = stmt.executeQuery("SELECT id, text FROM tweet ORDER BY id")) {
-            while (rs.next()) {
-                list.add(new Tweet(rs.getString("id"), rs.getString("text")));
-            }
-        }
-        return list;
+    public List<Tweet> getAllTweets() {
+        return jdbcTemplate.query(
+                "SELECT id, text FROM " + tableName + " ORDER BY id",
+                (rs, rowNum) -> new Tweet(rs.getString("id"), rs.getString("text"))
+        );
     }
 
     // -----------------------------------------------------------------------
     // Metrics and Inspector getters
     // -----------------------------------------------------------------------
+
+    public JdbcTemplate getJdbcTemplate() {
+        return jdbcTemplate;
+    }
 
     public List<Tweet> getPoisonPills() {
         return Collections.unmodifiableList(poisonPills);

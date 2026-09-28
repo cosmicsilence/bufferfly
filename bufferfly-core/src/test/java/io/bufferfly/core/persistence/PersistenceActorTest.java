@@ -50,7 +50,7 @@ class PersistenceActorTest {
     private ActorReference<Tweet> actorRef;
 
     @BeforeEach
-    void setUp() throws SQLException {
+    void setUp() {
         dbName = "tweetdb_" + UUID.randomUUID().toString().replace("-", "");
         jdbcUrl = "jdbc:hsqldb:mem:" + dbName + ";sql.syntax_ora=true;sql.enforce_strict_size=true";
 
@@ -74,10 +74,9 @@ class PersistenceActorTest {
         if (actorRef != null) {
             actorRef.stop();
         }
-        try (Connection conn = DriverManager.getConnection(jdbcUrl, "SA", "");
-             Statement stmt = conn.createStatement()) {
-            stmt.execute("SHUTDOWN");
-        } catch (SQLException ignored) {
+        try {
+            operations.getJdbcTemplate().execute("SHUTDOWN");
+        } catch (Exception ignored) {
         }
     }
 
