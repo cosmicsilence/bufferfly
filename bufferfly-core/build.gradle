@@ -6,6 +6,9 @@ dependencies {
     testRuntimeOnly   'org.junit.platform:junit-platform-launcher'
 
     testImplementation 'org.awaitility:awaitility:4.3.0'
+    testImplementation 'org.hsqldb:hsqldb:2.7.4'
+    testImplementation 'com.github.netcrusherorg:netcrusher-core:0.10'
+    testRuntimeOnly   'org.slf4j:slf4j-simple:2.0.16'
 }
 
 test {

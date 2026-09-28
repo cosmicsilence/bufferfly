@@ -74,4 +74,19 @@ public abstract class AbstractPersistentActor<T, E> extends AbstractActor<T> {
     public final void receive(T message) {
         runner.enqueue(apply(message));
     }
+
+    /**
+     * Returns the underlying {@link PersistenceRunner}.
+     */
+    protected PersistenceRunner<E> runner() {
+        return runner;
+    }
+
+    /**
+     * Stops the underlying persistence runner when this actor is stopped.
+     */
+    @Override
+    protected void postStop() {
+        runner.stop();
+    }
 }
