@@ -62,8 +62,8 @@ java -Xms5g -Xmx5g \
 
 BufferFly is an actively growing ecosystem built to revolutionize high-throughput enterprise systems. The core development milestones include:
 - [x] Separate CPU-bound Actor & I/O-bound Persistence Runner Loops
-- [x] Functional `Container::pause` Backpressure Bridge
-- [x] Optimistic Lock Fencing via Database Co-Persistence Trans-Tracking
+- [ ] Functional `Container::pause` Backpressure Bridge
+- [ ] Optimistic Lock Fencing via Database Co-Persistence Trans-Tracking
 - [ ] Complete Declarative Hierarchical Actor Topology (`ActorContext`)
 - [ ] Out-of-the-box cluster dashboards for monitoring processing lag vs DB flush latency
 
