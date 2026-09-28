@@ -1,5 +1,8 @@
 # 🦋 BufferFly
 
+Let your data streams fly while keeping your database protected. BufferFly combines the Single-Writer Actor model with Java 25 Virtual Threads to turn high-latency transactional updates into ultra-fast with Natural Batching, 
+zero-locking bulk ingestion."
+
 BufferFly is a ultra-high-throughput, lightweight, **Virtual-Thread-native Actor framework** for Java 25+. It is designed specifically to act as an elastic 
 in-memory shock absorber and natural batching engine in front of high-volume persistent databases, driven directly by **Apache Kafka** partition streams.
 
@@ -36,7 +39,18 @@ bufferfly:
     batch-size: 1000         # Maximum rows per array write
     timeout-ms: 50           # Max wait time for a batch to fill under light load
 ```
-
+```yaml
+bufferfly:
+  actors:
+    default-mailbox-capacity: 750
+    default-dispatcher: io.bufferfly.core.actor.VTDispatcher
+    overrides:
+      yaml-actor:
+        mailbox-capacity: 200
+        dispatcher: io.bufferfly.core.actor.VTDispatcher
+      another-actor:
+        mailbox-capacity: 300
+```
 ---
 
 ## 🔒 Production Tuning & JVM Requirements
