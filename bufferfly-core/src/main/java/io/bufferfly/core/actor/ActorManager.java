@@ -17,16 +17,20 @@ public class ActorManager {
      */
     private final Map<String, Dispatcher> configuredDispatchers;
 
-    /** The dispatcher used when no per-actor override is configured. */
+    /**
+     * The dispatcher used when no per-actor override is configured.
+     */
     private final Dispatcher defaultDispatcher;
 
     // -----------------------------------------------------------------------
     // Constructors
     // -----------------------------------------------------------------------
 
-    /** Creates an ActorManager with default settings (VTDispatcher, capacity 20 000). */
+    /**
+     * Creates an ActorManager with default settings (VTDispatcher, capacity 20 000).
+     */
     public ActorManager() {
-        this.defaultDispatcher     = new VTDispatcher();
+        this.defaultDispatcher = new VTDispatcher();
         this.configuredDispatchers = new ConcurrentHashMap<>();
     }
 
@@ -55,9 +59,9 @@ public class ActorManager {
         });
 
         this.defaultDispatcher = instantiateDispatcher(
-            actors.getDefaultDispatcher(),
-            actors.getDefaultMailboxCapacity(),
-            allCapacityOverrides
+                actors.getDefaultDispatcher(),
+                actors.getDefaultMailboxCapacity(),
+                allCapacityOverrides
         );
 
         Map<String, Dispatcher> perActor = new HashMap<>();
@@ -65,8 +69,8 @@ public class ActorManager {
             String fqn = override.getDispatcher();
             if (fqn != null && !fqn.equals(actors.getDefaultDispatcher())) {
                 int capacity = override.getMailboxCapacity() > 0
-                    ? override.getMailboxCapacity()
-                    : actors.getDefaultMailboxCapacity();
+                        ? override.getMailboxCapacity()
+                        : actors.getDefaultMailboxCapacity();
                 perActor.put(actorName, instantiateDispatcher(fqn, capacity, Map.of()));
             }
         });
@@ -90,9 +94,12 @@ public class ActorManager {
     public <T> ActorReference<T> start(Actor<T> actor) {
         final var registered = startedActors.computeIfAbsent(actor.name(), ignored -> {
             Dispatcher dispatcher = configuredDispatchers.getOrDefault(
-                actor.name(), defaultDispatcher);
+                    actor.name(), defaultDispatcher);
             DispatchingActor<T> dispatchingActor = new DispatchingActor<>(actor, dispatcher);
             dispatchingActor.start();
+            if (actor instanceof AbstractActor<T> abstractActor) {
+                abstractActor.setSelf(dispatchingActor);
+            }
             return dispatchingActor;
         });
         return (ActorReference<T>) registered;
@@ -114,15 +121,15 @@ public class ActorManager {
             Class<?> cls = Class.forName(fqn);
             if (!Dispatcher.class.isAssignableFrom(cls)) {
                 throw new IllegalArgumentException(
-                    "Class '%s' does not implement Dispatcher".formatted(fqn));
+                        "Class '%s' does not implement Dispatcher".formatted(fqn));
             }
             return (Dispatcher) cls.getDeclaredConstructor().newInstance();
         } catch (ClassNotFoundException e) {
             throw new IllegalArgumentException(
-                "Dispatcher class not found on classpath: " + fqn, e);
+                    "Dispatcher class not found on classpath: " + fqn, e);
         } catch (ReflectiveOperationException e) {
             throw new IllegalArgumentException(
-                "Failed to instantiate dispatcher '%s' via no-arg constructor".formatted(fqn), e);
+                    "Failed to instantiate dispatcher '%s' via no-arg constructor".formatted(fqn), e);
         }
     }
 
@@ -137,21 +144,23 @@ public class ActorManager {
      *
      * <p>Routing: {@code tell()} → {@link Dispatcher#dispatch} → {@link Actor#receive}.
      * <p>Lifecycle: {@code start()} delegates to {@link Actor#start()};
-     *               {@code stop()} drains / clears the dispatcher and calls
-     *               {@link AbstractActor#shutdown()} if the delegate is an
-     *               {@link AbstractActor}.
+     * {@code stop()} drains / clears the dispatcher and calls
+     * {@link AbstractActor#shutdown()} if the delegate is an
+     * {@link AbstractActor}.
      */
     final class DispatchingActor<T> implements ActorReference<T> {
 
-        private final Actor<T>   delegate;
+        private final Actor<T> delegate;
         private final Dispatcher dispatcher;
 
         DispatchingActor(Actor<T> delegate, Dispatcher dispatcher) {
-            this.delegate   = delegate;
+            this.delegate = delegate;
             this.dispatcher = dispatcher;
         }
 
-        /** Starts the underlying actor (idempotent). */
+        /**
+         * Starts the underlying actor (idempotent).
+         */
         void start() {
             delegate.start();
         }
@@ -160,7 +169,7 @@ public class ActorManager {
         public void tell(T message) {
             if (!delegate.isStarted()) {
                 throw new IllegalStateException(
-                    "Actor '%s' has not been started".formatted(delegate.name()));
+                        "Actor '%s' has not been started".formatted(delegate.name()));
             }
             dispatcher.dispatch(message, delegate);
         }

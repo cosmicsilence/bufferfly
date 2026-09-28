@@ -20,6 +20,12 @@ public abstract class AbstractActor<T> implements Actor<T> {
     private final AtomicBoolean started = new AtomicBoolean(false);
     private final AtomicBoolean stopped = new AtomicBoolean(false);
 
+    protected ActorReference<T> self;
+
+    public void setSelf(ActorReference<T> self) {
+        this.self = self;
+    }
+
     // -----------------------------------------------------------------------
     // Lifecycle — called by ActorManager / DispatchingActor, not by callers
     // -----------------------------------------------------------------------
