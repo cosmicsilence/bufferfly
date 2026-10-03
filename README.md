@@ -43,11 +43,11 @@ bufferfly:
 bufferfly:
   actors:
     default-mailbox-capacity: 750
-    default-dispatcher: io.cosmicsilence.bufferfly.core.actor.VTDispatcher
+    default-dispatcher: io.bufferfly.core.actor.VTDispatcher
     overrides:
       yaml-actor:
         mailbox-capacity: 200
-        dispatcher: io.cosmicsilence.bufferfly.core.actor.VTDispatcher
+        dispatcher: io.bufferfly.core.actor.VTDispatcher
       another-actor:
         mailbox-capacity: 300
 ```
