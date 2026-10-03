@@ -8,6 +8,7 @@ public final class BufferflyCore {
     private BufferflyCore() {}
 
     public static String version() {
-        return "0.1.0-SNAPSHOT";
+        String version = BufferflyCore.class.getPackage().getImplementationVersion();
+        return version != null ? version : "unknown";
     }
 }
