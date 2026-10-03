@@ -1,8 +1,35 @@
+buildscript {
+    configurations.classpath {
+        resolutionStrategy.activateDependencyLocking()
+    }
+}
+
+dependencyLocking {
+    lockAllConfigurations()
+}
+
+tasks.register('resolveAndLockAll') {
+    notCompatibleWithConfigurationCache('Resolves configurations at execution time')
+    doFirst {
+        assert gradle.startParameter.writeDependencyLocks: 'Must be run with --write-locks'
+    }
+    doLast {
+        allprojects { p ->
+            p.buildscript.configurations.findAll { it.canBeResolved }*.resolve()
+            p.configurations.findAll { it.canBeResolved }*.resolve()
+        }
+    }
+}
+
 subprojects {
     apply plugin: 'java'
 
     group = 'io.bufferfly'
     version = '0.1.0-SNAPSHOT'
+
+    dependencyLocking {
+        lockAllConfigurations()
+    }
 
     java {
         sourceCompatibility = JavaVersion.toVersion('25')

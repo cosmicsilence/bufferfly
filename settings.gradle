@@ -1,3 +1,9 @@
+buildscript {
+    configurations.classpath {
+        resolutionStrategy.activateDependencyLocking()
+    }
+}
+
 rootProject.name = 'bufferfly'
 
 include 'bufferfly-core'
