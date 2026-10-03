@@ -1,5 +1,7 @@
+description = 'Spring Boot auto-configuration wiring BufferFly actors to Apache Kafka partition streams.'
+
 dependencies {
-    implementation project(':bufferfly-core')
+    api project(':bufferfly-core')
 
     implementation platform('org.springframework.boot:spring-boot-dependencies:3.4.4')
     implementation 'org.springframework.boot:spring-boot-autoconfigure'
