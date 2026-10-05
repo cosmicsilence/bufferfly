@@ -1,7 +1,6 @@
 # This is a Gradle generated file for dependency locking.
 # Manual edits can break the build and are not advised.
 # This file is expected to be part of source control.
-# To regenerate this file, run: ./gradlew :bufferfly-core:dependencies --write-locks
 com.github.netcrusherorg:netcrusher-core:0.10=testCompileClasspath,testRuntimeClasspath
 org.apiguardian:apiguardian-api:1.1.2=testCompileClasspath
 org.awaitility:awaitility:4.3.0=testCompileClasspath,testRuntimeClasspath

@@ -1,3 +1,7 @@
+description = '''\
+Virtual-thread-native actor framework for Java 25+ that acts as an in-memory \
+shock absorber and natural batching engine in front of high-volume databases.'''
+
 dependencies {
     implementation 'org.yaml:snakeyaml:2.4'
 
