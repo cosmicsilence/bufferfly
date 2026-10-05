@@ -1,8 +1,12 @@
-subprojects {
-    apply plugin: 'java'
+plugins {
+    id 'com.vanniktech.maven.publish' version '0.37.0' apply false
+}
 
-    group = 'io.bufferfly'
-    version = '0.1.0-SNAPSHOT'
+subprojects {
+    apply plugin: 'java-library'
+    apply plugin: 'com.vanniktech.maven.publish'
+
+    group = 'io.github.cosmicsilence'
 
     java {
         toolchain {
@@ -25,5 +29,44 @@ subprojects {
 
     tasks.withType(JavaCompile).configureEach {
         options.encoding = 'UTF-8'
+    }
+
+    tasks.withType(Javadoc).configureEach {
+        options.encoding = 'UTF-8'
+        options.addStringOption('Xdoclint:all,-missing', '-quiet')
+    }
+
+    mavenPublishing {
+        publishToMavenCentral(false)
+        signAllPublications()
+
+        pom {
+            name = project.name
+            description = provider { project.description }
+            url = 'https://github.com/cosmicsilence/bufferfly'
+            inceptionYear = '2026'
+
+            licenses {
+                license {
+                    name = 'The Apache License, Version 2.0'
+                    url = 'https://www.apache.org/licenses/LICENSE-2.0.txt'
+                    distribution = 'repo'
+                }
+            }
+
+            developers {
+                developer {
+                    id = 'thiagoampj'
+                    name = 'Thiago Moraes'
+                    url = 'https://github.com/thiagoampj'
+                }
+            }
+
+            scm {
+                url = 'https://github.com/cosmicsilence/bufferfly'
+                connection = 'scm:git:https://github.com/cosmicsilence/bufferfly.git'
+                developerConnection = 'scm:git:ssh://git@github.com/cosmicsilence/bufferfly.git'
+            }
+        }
     }
 }
