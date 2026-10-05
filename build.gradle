@@ -1,5 +1,28 @@
+buildscript {
+    configurations.classpath {
+        resolutionStrategy.activateDependencyLocking()
+    }
+}
+
 plugins {
     id 'com.vanniktech.maven.publish' version '0.37.0' apply false
+}
+
+dependencyLocking {
+    lockAllConfigurations()
+}
+
+tasks.register('resolveAndLockAll') {
+    notCompatibleWithConfigurationCache('Resolves configurations at execution time')
+    doFirst {
+        assert gradle.startParameter.writeDependencyLocks: 'Must be run with --write-locks'
+    }
+    doLast {
+        allprojects { p ->
+            p.buildscript.configurations.findAll { it.canBeResolved }*.resolve()
+            p.configurations.findAll { it.canBeResolved }*.resolve()
+        }
+    }
 }
 
 subprojects {
@@ -7,6 +30,10 @@ subprojects {
     apply plugin: 'com.vanniktech.maven.publish'
 
     group = 'io.github.cosmicsilence'
+
+    dependencyLocking {
+        lockAllConfigurations()
+    }
 
     java {
         toolchain {
