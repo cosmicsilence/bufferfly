@@ -9,8 +9,9 @@ subprojects {
     group = 'io.github.cosmicsilence'
 
     java {
-        sourceCompatibility = JavaVersion.toVersion('25')
-        targetCompatibility = JavaVersion.toVersion('25')
+        toolchain {
+            languageVersion = JavaLanguageVersion.of(25)
+        }
     }
 
     repositories {

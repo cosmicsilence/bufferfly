@@ -7,9 +7,20 @@ rootProject.name = 'bufferfly'
 include 'bufferfly-core'
 include 'bufferfly-spring-kafka'
 
+
 reckon {
     defaultInferredScope = 'patch'
     stages('beta', 'rc', 'final')
     scopeCalc = calcScopeFromProp().or(calcScopeFromCommitMessages())
     stageCalc = calcStageFromProp()
+}
+
+gradle.taskGraph.whenReady {
+    println '''
+  ___         __   __            ___  _
+ | _ ) _  _  / _| / _| ___  _ _ | __|| | _  _
+ | _ \\| || ||  _||  _|/ -_)| \'_|| _| | || || |
+ |___/ \\_,_||_|  |_|  \\___||_|  |_|  |_| \\_, |
+                                         |__/
+'''
 }
