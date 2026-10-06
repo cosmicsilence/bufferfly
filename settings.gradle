@@ -12,6 +12,7 @@ rootProject.name = 'bufferfly'
 
 include 'bufferfly-core'
 include 'bufferfly-spring-kafka'
+include 'bufferfly-cpu-bound'
 
 reckon {
     defaultInferredScope = 'patch'
@@ -29,3 +30,4 @@ gradle.taskGraph.whenReady {
                                          |__/
 '''
 }
+
