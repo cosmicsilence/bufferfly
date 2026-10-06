@@ -63,6 +63,11 @@ subprojects {
         options.addStringOption('Xdoclint:all,-missing', '-quiet')
     }
 
+    // javadoc's doclint is not wired into check/assemble by default.
+    tasks.named('check') {
+        dependsOn tasks.named('javadoc')
+    }
+
     mavenPublishing {
         publishToMavenCentral(false)
         signAllPublications()

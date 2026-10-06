@@ -18,12 +18,12 @@ import java.util.concurrent.ConcurrentHashMap;
  * strategies (JCTools/Mechanical Sympathy) and will <b>busy-spin awake infinitely</b>
  * to completely eliminate thread scheduling and context-switching overhead.
  *
- * <h3>Hardware Implications:</h3>
+ * <h2>Hardware Implications</h2>
  * <ul>
  *   <li><b>100% Core Saturation:</b> Each dispatched Actor will permanently pin a
  *       physical CPU core to 100% utilization, regardless of whether traffic is actively
  *       flowing through the mailbox.</li>
- *   <li><b>Thermal Throttling & Thread Migration:</b> Without native CPU core affinity,
+ *   <li><b>Thermal Throttling &amp; Thread Migration:</b> Without native CPU core affinity,
  *       the OS kernel scheduler may forcibly migrate this spinning thread across cores
  *       to manage hardware heat spikes, inducing localized L1/L2 cache misses.</li>
  *   <li><b>Carrier Pool Starvation:</b> Never execute this dispatcher inside standard
