@@ -45,6 +45,6 @@ public class BlockingMailbox<T> implements Mailbox<T> {
             throw new MailBoxInterrupted();
         }
     }
-    static class MailBoxInterrupted extends RuntimeException {
+    public static class MailBoxInterrupted extends RuntimeException {
     }
 }
