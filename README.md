@@ -1,5 +1,10 @@
 # 🦋 BufferFly
 
+![Build Status](https://github.com/cosmicsilence/bufferfly/actions/workflows/build.yml/badge.svg)
+[![Latest Version](https://img.shields.io/maven-central/v/io.github.cosmicsilence/bufferfly)](https://central.sonatype.com/artifact/io.github.cosmicsilence/bufferfly)
+[![Java](https://img.shields.io/badge/Java-25+-orange.svg)](https://adoptium.net/temurin/releases/?version=25)
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+
 Let your data streams fly while keeping your database protected. BufferFly combines the Single-Writer Actor model with Java 25 Virtual Threads to turn high-latency transactional updates into ultra-fast with Natural Batching, 
 zero-locking bulk ingestion."
 
