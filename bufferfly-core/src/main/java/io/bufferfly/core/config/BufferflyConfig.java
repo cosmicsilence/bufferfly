@@ -46,7 +46,7 @@ public final class BufferflyConfig {
 
     private final ActorsConfig actors;
 
-    private BufferflyConfig(ActorsConfig actors) {
+    public BufferflyConfig(ActorsConfig actors) {
         this.actors = actors;
     }
 
@@ -101,7 +101,7 @@ public final class BufferflyConfig {
          */
         private final Map<String, ActorOverrideConfig> overrides;
 
-        private ActorsConfig(Builder b) {
+        public ActorsConfig(Builder b) {
             this.defaultMailboxCapacity = b.defaultMailboxCapacity;
             this.defaultDispatcher = b.defaultDispatcher;
             this.overrides = Collections.unmodifiableMap(new HashMap<>(b.overrides));

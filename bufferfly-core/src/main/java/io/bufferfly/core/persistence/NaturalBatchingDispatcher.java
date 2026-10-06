@@ -37,7 +37,7 @@ import java.util.concurrent.atomic.AtomicReference;
  * An unbounded {@link ConcurrentLinkedQueue} ensures {@link #enqueue} is
  * always non-blocking and never stalls the actor loop.
  */
-public final class NaturalBatchingDispatcher<E> implements PersistenceDispatcher<E> {
+public class NaturalBatchingDispatcher<E> implements PersistenceDispatcher<E> {
 
     private final int batchSize;
     private final long timeoutMs;
@@ -87,8 +87,8 @@ public final class NaturalBatchingDispatcher<E> implements PersistenceDispatcher
             Thread.currentThread().interrupt();
             return;
         } finally {
-            scheduled.set(false);
             runningTask.set(null);
+            scheduled.set(false);
         }
         // Double-check: events may have arrived between the last buffer.poll()
         // and the scheduled.set(false) above. If so, reschedule immediately.
@@ -102,25 +102,27 @@ public final class NaturalBatchingDispatcher<E> implements PersistenceDispatcher
 
         // Wait for the first event up to timeoutMs
         long deadline = System.currentTimeMillis() + timeoutMs;
-        while (true) {
+
+        int counter = 0 ;
+        while (counter < batchSize) {
             E head = buffer.poll();
             if (head != null) {
+                counter = counter + 1;
                 batch.add(head);
-                break;
+            } else {
+                Thread.sleep(5);
             }
             if (System.currentTimeMillis() >= deadline) {
-                return batch; // nothing arrived within the window
+                break; // nothing arrived within the window
             }
-            Thread.sleep(10); // yield carrier thread rather than busy-spinning
         }
-
-        // Greedily fill the remainder of the batch without waiting
+        // Greedily fill the remainder with the batch without waiting
         while (batch.size() < batchSize) {
             E next = buffer.poll();
             if (next == null) break;
             batch.add(next);
         }
-
         return batch;
     }
+
 }
