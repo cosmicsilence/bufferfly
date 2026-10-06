@@ -19,6 +19,9 @@ public class VTDispatcher implements Dispatcher {
      */
     private final Map<String, Integer> mailboxCapacityOverrides;
 
+    //TODO make this threshold dynamic based on amount of actors and mailbox size with limits of min and max
+    public static final int YIELD_THRESHOLD = 32;
+
     private final ExecutorService vtExecutor = Executors.newVirtualThreadPerTaskExecutor();
     private final Map<Actor<?>, Future<?>> runningActors = new ConcurrentHashMap<>();
     private final Map<String, Mailbox<?>>  mailboxes     = new ConcurrentHashMap<>();
@@ -67,12 +70,18 @@ public class VTDispatcher implements Dispatcher {
             var mailbox = mailboxFor(actor);
             boolean interrupted = false;
             T message;
+            int executions = 0;
             try {
                 while ((message = mailbox.poll()) != null) {
                     try {
                         actor.receive(message);
                     } catch (Exception e) {
                         actor.onError(message, e);
+                    }
+                    // protection against greedy actors, letting others be scheduled
+                    if (++executions >= YIELD_THRESHOLD) {
+                        Thread.yield();
+                        executions = 0;
                     }
                 }
             } catch (BlockingMailbox.MailBoxInterrupted e) {
