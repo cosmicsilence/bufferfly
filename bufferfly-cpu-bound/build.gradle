@@ -1,3 +1,5 @@
+description = 'CPU-bound dispatcher that pins each Actor to a dedicated spinning thread for ultra-low-latency, deterministic processing.'
+
 dependencies {
     implementation project(':bufferfly-core')
     implementation 'org.jctools:jctools-core:4.0.7'
