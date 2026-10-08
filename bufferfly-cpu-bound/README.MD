@@ -8,16 +8,16 @@ The framework is divided into two discrete components, isolating standard high-c
 
 🔥 Breaking the 15 Million Messages/Sec Mark
 
-During head-to-head microbenchmarking simulating intense, concurrent multi-producer firehose pressure, BufferFly shatters execution expectations for high-performance computing in managed languages. By aligning software constructs directly with processor architectures (Mechanical Sympathy), it peaks at over 15,000,000 messages per second delivered to a single actor.
-================================================================================
- BENCHMARK — HARDWARE-PINNED FIREHOSE PERFORMANCE (5,000,000 Messages)
---------------------------------------------------------------------------------
- Upstream Producers     VTDispatcher (Virtual Threads)   BufferFly (Pinned XADD Core)
---------------------------------------------------------------------------------
- 1 Active Producer                 ~5.5M msg/s                 ⚡ 16.08M msg/s
- 10 Contending Producers           ~4.4M msg/s                 ⚡ 12.61M msg/s
- 50 Contending Producers           ~4.6M msg/s                 ⚡ 12.50M msg/s
-================================================================================
+During head-to-head microbenchmarking simulating intense, concurrent multi-producer firehose pressure, 
+BufferFly shatters execution expectations for high-performance computing in managed languages. By aligning software constructs directly with processor architectures (Mechanical Sympathy), it peaks at over 15,000,000 messages per second delivered to a single actor.
+
+
+| Producers | Spinning (msg/s) | VTDispatcher (msg/s) | Speedup |
+| :--- | :---: | :---: | :---: |
+| **1 producer** | 14,256,609 | 5,574,676 | **2.56x** |
+| **10 producers** | 12,681,708 | 4,807,439 | **2.64x** |
+| **50 producers** | 13,827,169 | 4,496,647 | **3.07x** |
+
 
 Why standard architectures fall off a cliff:
 
