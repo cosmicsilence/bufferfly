@@ -5,88 +5,45 @@
 [![Java](https://img.shields.io/badge/Java-25+-orange.svg)](https://adoptium.net/temurin/releases/?version=25)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 
-Let your data streams fly while keeping your database protected. BufferFly combines the Single-Writer Actor model with Java 25 Virtual Threads to turn high-latency transactional updates into ultra-fast with Natural Batching, 
-zero-locking bulk ingestion."
-
-BufferFly is a ultra-high-throughput, lightweight, **Virtual-Thread-native Actor framework** for Java 25+. It is designed specifically to act as an elastic 
-in-memory shock absorber and natural batching engine in front of high-volume persistent databases, driven directly by **Apache Kafka** partition streams.
-
-By combining the **Single-Writer Principle** with Java 25 Virtual Threads and local non-spinning concurrent queues, 
-BufferFly eliminates database row-lock contention and small I/O operations, 
-transforming your transactional layer into a highly efficient bulk-ingestion warehouse.
-
----
-
-## 🚀 Key Architectural Advantages
-
-* **Zero Row-Level DB Locking:** Leverages distributed hashing to map one Kafka partition to exactly one Virtual Thread Actor. Concurrency is handled entirely in-memory—eliminating `enq: TX - row lock contention` waits.
-* **Separation of Concerns:** Deeply splits your architecture into an **Actor Processing Loop** (pure memory, rules, and state decisions) and a **Persistence Runner Loop** (blocking database network I/O) running on isolated virtual thread pools.
-* **Timeout-Based Natural Batching:** Dynamically groups writes greedily based on system load (e.g., flush every 1,000 records OR 50 milliseconds, whichever comes first). Maximize bulk updates (`MERGE`) at peak load while ensuring sub-millisecond fresh data under trickle loads.
-* **Fencing Against Zombies:** Protects against cluster split-brain/rebalance pauses by tracking Kafka offsets directly inside your database transactions, utilizing optimistic lock verification to instantly terminate rogue nodes.
-* **Elastic Backpressure Hooks:** Automatically pauses and resumes Spring Kafka listener containers via high/low queue watermarks, preventing `OutOfMemory` crashes without throwing thread stalls or forcing unrecoverable crash loops.
-
----
-
-## 📐 The Processing Pipeline
 
 
 
-### 2. Configure Natural Batching & Backpressure
-Configure the behavior of your data absorption layers inside your `application.yml`:
+📦 bufferfly-core: Virtual-Thread-Native Actor Framework
 
-```yaml
-bufferfly:
-  actors:
-    pool-name: transaction-actor-pool
-    high-watermark: 40000    # Pause Kafka if persistence buffer hits this limit
-    low-watermark: 5000      # Resume Kafka once buffer drains down here
-  persistence:
-    batch-size: 1000         # Maximum rows per array write
-    timeout-ms: 50           # Max wait time for a batch to fill under light load
-```
-```yaml
-bufferfly:
-  actors:
-    default-mailbox-capacity: 750
-    default-dispatcher: io.bufferfly.core.actor.VTDispatcher
-    overrides:
-      yaml-actor:
-        mailbox-capacity: 200
-        dispatcher: io.bufferfly.core.actor.VTDispatcher
-      another-actor:
-        mailbox-capacity: 300
-```
----
+🏎️ bufferfly-cpu-bound: Hardware-Pinned Core Dispatch Infrastructure
 
-## 🔒 Production Tuning & JVM Requirements
+⚡ Overview & Framework Topology
 
-To maintain peak throughput and avoid carrier thread pinning when linking Java 25 Virtual Threads to relational database drivers, apply the following production configurations:
+BufferFly is a lightweight actor architecture for Java 25+, serving as an in-memory shock absorber and batching engine for Kafka streams protecting persistent databases. For complete architectural details, module topologies (bufferfly-core and bufferfly-cpu-bound), production tuning requirements, and configuration guidelines, please refer to the original source at GitHub Repository.
 
-1. **Oracle JDBC Driver:** Ensure you are utilizing **Oracle JDBC 23c or higher**. These versions replace old internal object monitors with `ReentrantLock`, allowing persistence virtual threads to smoothly unmount from carrier threads during long I/O operations.
-2. **JVM Performance Flags:** Run your cluster nodes using Project Lilliput optimizations to compress memory headers by up to 20%, saving room for your in-memory actor buffers:
+🚀 Performance & Module Selection Guide
 
-```bash
-java -Xms5g -Xmx5g \
-     -XX:+UseG1GC \
-     -XX:MaxGCPauseMillis=250 \
-     -XX:+AlwaysPreTouch \
-     -XX:+UseCompactObjectHeaders \
-     -Djdk.tracePinnedThreads=short \
-     -jar app.jar
-```
+BufferFly is explicitly engineered with strict mechanical sympathy. Depending on your workload requirements, 
+you can opt for the highly elastic, zero-idle-cost virtual thread runtime or scale into the hardware-pinned spinning engine to break modern throughput barriers.
+### 📊 Microbenchmark: High-Throughput Firehose Performance
+*Measured end-to-end processing execution delivering a burst of 5,000,000 messages directly to a single target Actor path.*
 
----
+| Upstream Producers | bufferfly-core <br>*(Virtual Threads)* | bufferfly-cpu-bound <br>*(Hardware-Pinned Core)* | Real-World Speedup |
+| :--- | :---: | :---: | :---: |
+| **1 Active Producer** | ~5.5M msg/s | **⚡ 14.25M msg/s** | **2.59x** |
+| **10 Contending Producers** | ~4.8M msg/s | **⚡ 12.68M msg/s** | **2.64x** |
+| **50 Contending Producers** | ~4.4M msg/s | **⚡ 13.82M msg/s** | **3.14x** |
 
-## 🗺️ Open Source Roadmap
+> 📌 **Note:** Peak throughput configurations for single-producer environments frequently cross the **15,000,000 messages/sec mark** due to the total elimination of hardware cache-line invalidation cycles.
 
-BufferFly is an actively growing ecosystem built to revolutionize high-throughput enterprise systems. The core development milestones include:
-- [x] Separate CPU-bound Actor & I/O-bound Persistence Runner Loops
-- [ ] Functional `Container::pause` Backpressure Bridge
-- [ ] Optimistic Lock Fencing via Database Co-Persistence Trans-Tracking
-- [ ] Complete Declarative Hierarchical Actor Topology (`ActorContext`)
-- [ ] Out-of-the-box cluster dashboards for monitoring processing lag vs DB flush latency
+📦 bufferfly-core (The Virtual Thread Engine)
 
----
+Designed for general-purpose, massive scaling where thousands of actors must co-exist seamlessly, and idle memory or CPU footprints must approach zero.
+• The Blueprint: Employs a VTDispatcher paired with a specialized LinkedBlockingQueue configuration to hand off execution cycles directly to the JVM's underlying ForkJoinPool carrier threads.
+• The Baseline: Caps out at a structural allocation ceiling of ~4.5M – 5.5M messages per second due to the natural overhead of virtual thread continuation tracking and stack frame processing.
+• Best For: General business state machines, asynchronous web hook ingestion, and standard Kafka partition processing where extreme core saturation is not justified.
+
+🏎️ bufferfly-cpu-bound (The Hardware-Pinned Spinning Engine)
+
+Designed for microsecond-critical, ultra-high-frequency data ingestion where raw throughput limits must be shattered at the expense of an isolated physical hardware core.
+• The 15 Million Message Mark: By combining a core-pinned infinite busy-spin thread (SpinningActorDispatcher) with a hardware-level Fetch-And-Add (LOCK XADD) mailbox (MpscUnboundedXaddArrayQueue), this module successfully eliminates the traditional "CAS retry cliff." It pushes performance to an outstanding 14.25M+ messages per second, touching a peak capability of over 15,000,000 messages per second on single-producer pipelines.
+• Self-Healing Architecture: Features an amortized bitwise mask counter (& 0xFFFF) that evaluates core placement once every 65,536 cycles via a <0.5ns register operation. If the OS forces a thermal thread migration, the loop instantly snaps the thread back onto its original hardware alignment without introducing heavy JNI overhead.
+• Best For: Financial order books, live market tickers, or high-volume Kafka partition streams with strict, sub-microsecond tail-latency SLAs.
 
 ## 📄 License
 

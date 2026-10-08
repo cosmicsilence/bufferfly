@@ -1,9 +1,12 @@
 package io.bufferfly.cpu.bound;
 
 import io.bufferfly.core.actor.AbstractActor;
+import io.bufferfly.core.actor.Dispatcher;
 import io.bufferfly.core.actor.VTDispatcher;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.util.LongSummaryStatistics;
 import java.util.concurrent.CountDownLatch;
@@ -47,11 +50,13 @@ class DispatcherComparisonBenchmarkTest {
     // Scenario constants
     // -----------------------------------------------------------------------
 
-    private static final int FIREHOSE_TOTAL  = 100_000;
-    private static final int FIREHOSE_WARMUP = 2_000;
+    private static final int FIREHOSE_TOTAL = 5_000_000;
+    private static final int FIREHOSE_WARMUP = 200_000;
 
     private static final int PING_ROUNDS = 2_000;
     private static final int PING_WARMUP = 200;
+    public static final String EOF = "EOF";
+    private static final Logger log = LoggerFactory.getLogger(DispatcherComparisonBenchmarkTest.class);
 
     // -----------------------------------------------------------------------
     // Scenario 1 — High-Throughput Firehose
@@ -59,29 +64,24 @@ class DispatcherComparisonBenchmarkTest {
 
     @Test
     @Timeout(300)
-    void benchmark_firehose_spinningVsVT_singleActorUnderIncreasingProducerContention()
-            throws InterruptedException {
+    void benchmark_firehose_spinningVsVT_singleActorUnderIncreasingProducerContention() throws InterruptedException {
 
         int[] producerCounts = {1, 10, 50};
 
         double[][] spinResults = new double[producerCounts.length][2]; // [durationMs, throughput]
-        double[][] vtResults   = new double[producerCounts.length][2];
+        double[][] vtResults = new double[producerCounts.length][2];
+        SpinningActorDispatcher spinDispatcher = new SpinningActorDispatcher(new SpinningActorDispatcher.Config(FIREHOSE_TOTAL));
+        VTDispatcher vtDispatcher = new VTDispatcher(FIREHOSE_TOTAL);
+        // warmup
+        runFirehose(spinDispatcher, 1, FIREHOSE_WARMUP);
+        runFirehose(vtDispatcher, 1, FIREHOSE_WARMUP);
 
         for (int i = 0; i < producerCounts.length; i++) {
             int producers = producerCounts[i];
 
-            // Spinning: mailbox sized to hold the full burst so no offer is rejected.
-            SpinningActorDispatcher spinDispatcher =
-                    new SpinningActorDispatcher(new SpinningActorDispatcher.Config(FIREHOSE_TOTAL));
-            VTDispatcher vtDispatcher = new VTDispatcher(FIREHOSE_TOTAL);
-
-            // warmup
-            runFirehose(spinDispatcher, producers, FIREHOSE_WARMUP);
-            runFirehose(vtDispatcher,   producers, FIREHOSE_WARMUP);
-
             // measured
             spinResults[i] = runFirehose(spinDispatcher, producers, FIREHOSE_TOTAL);
-            vtResults[i]   = runFirehose(vtDispatcher,   producers, FIREHOSE_TOTAL);
+            vtResults[i] = runFirehose(vtDispatcher, producers, FIREHOSE_TOTAL);
         }
 
         // ===================================================================
@@ -92,17 +92,14 @@ class DispatcherComparisonBenchmarkTest {
         System.out.println(" BENCHMARK — FIREHOSE THROUGHPUT COMPARISON");
         System.out.printf(" Total messages: %,d  |  Warmup: %,d%n", FIREHOSE_TOTAL, FIREHOSE_WARMUP);
         System.out.println("--------------------------------------------------------------------------------");
-        System.out.printf(" %-14s  %20s  %20s  %10s%n",
-                "Producers", "Spinning (msg/s)", "VTDispatcher (msg/s)", "Speedup");
+        System.out.printf(" %-14s  %20s  %20s  %10s%n", "Producers", "Spinning (msg/s)", "VTDispatcher (msg/s)", "Speedup");
         System.out.println("--------------------------------------------------------------------------------");
 
         for (int i = 0; i < producerCounts.length; i++) {
             double spinTp = spinResults[i][1];
-            double vtTp   = vtResults[i][1];
+            double vtTp = vtResults[i][1];
             double speedup = spinTp / vtTp;
-            System.out.printf(" %-14s  %20.0f  %20.0f  %9.2fx%n",
-                    producerCounts[i] + " producer" + (producerCounts[i] > 1 ? "s" : " "),
-                    spinTp, vtTp, speedup);
+            System.out.printf(" %-14s  %20.0f  %20.0f  %9.2fx%n", producerCounts[i] + " producer" + (producerCounts[i] > 1 ? "s" : " "), spinTp, vtTp, speedup);
         }
 
         System.out.println("================================================================================");
@@ -114,23 +111,27 @@ class DispatcherComparisonBenchmarkTest {
      *
      * @return {@code double[]{durationMs, throughputMsgPerSec}}
      */
-    private double[] runFirehose(io.bufferfly.core.actor.Dispatcher dispatcher,
-                                  int producers, int total)
-            throws InterruptedException {
+    private double[] runFirehose(Dispatcher dispatcher, int producers, int total) throws InterruptedException {
 
-        LatchCountingActor actor = new LatchCountingActor("firehose-cmp-actor", total);
+        System.out.println("Running firehose for dispatcher=%s producers=%d total=%d".formatted(dispatcher.getClass().getSimpleName(),
+                producers, total));
+        LatchCountingActor actor = new LatchCountingActor("firehose-cmp-actor");
         actor.start();
 
         int perProducer = total / producers;
-        int remainder   = total % producers;
+        int remainder = total % producers;
 
-        CountDownLatch startGate    = new CountDownLatch(1);
+        CountDownLatch startGate = new CountDownLatch(1);
         CountDownLatch producersDone = new CountDownLatch(producers);
 
         for (int p = 0; p < producers; p++) {
             final int count = perProducer + (p < remainder ? 1 : 0);
             Thread.ofVirtual().start(() -> {
-                try { startGate.await(); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+                try {
+                    startGate.await();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
                 for (int i = 0; i < count; i++) {
                     dispatcher.dispatch("msg", actor);
                 }
@@ -140,19 +141,21 @@ class DispatcherComparisonBenchmarkTest {
 
         long startNs = System.nanoTime();
         startGate.countDown();
+
         producersDone.await(30, TimeUnit.SECONDS);
 
+        dispatcher.dispatch(EOF, actor);
         actor.awaitCompletion(30, TimeUnit.SECONDS);
-        long endNs = System.nanoTime();
 
-        assertEquals(total, actor.getReceiveCount(),
-                "100% delivery required for a valid benchmark result");
+        long endNs = System.nanoTime();
+        assertEquals(total, actor.getReceiveCount(), "100% delivery required for a valid benchmark result");
 
         if (dispatcher instanceof SpinningActorDispatcher sd) sd.clear(actor);
-        if (dispatcher instanceof VTDispatcher vt)          vt.clear(actor);
+        if (dispatcher instanceof VTDispatcher vt) vt.clear(actor);
 
-        double durationMs = (endNs - startNs) / 1_000_000.0;
-        double throughput = total / (durationMs / 1_000.0);
+        long durationNs = endNs - startNs;
+        double durationMs = durationNs / 1_000_000.0;
+        double throughput = (double) total * 1_000_000_000.0 / durationNs;
         return new double[]{durationMs, throughput};
     }
 
@@ -162,15 +165,13 @@ class DispatcherComparisonBenchmarkTest {
 
     @Test
     @Timeout(120)
-    void benchmark_ping_spinningVsVT_burstToIdleLatencyComparison()
-            throws InterruptedException {
+    void benchmark_ping_spinningVsVT_burstToIdleLatencyComparison() throws InterruptedException {
 
-        SpinningActorDispatcher spinDispatcher =
-                new SpinningActorDispatcher(new SpinningActorDispatcher.Config(PING_ROUNDS + PING_WARMUP));
+        SpinningActorDispatcher spinDispatcher = new SpinningActorDispatcher(new SpinningActorDispatcher.Config(PING_ROUNDS + PING_WARMUP));
         VTDispatcher vtDispatcher = new VTDispatcher(PING_ROUNDS + PING_WARMUP);
 
         long[] spinLatencies = runPing(spinDispatcher);
-        long[] vtLatencies   = runPing(vtDispatcher);
+        long[] vtLatencies = runPing(vtDispatcher);
 
         // ===================================================================
         // Print results
@@ -180,16 +181,15 @@ class DispatcherComparisonBenchmarkTest {
         System.out.println(" BENCHMARK — BURST-TO-IDLE PING LATENCY COMPARISON");
         System.out.printf(" Rounds: %,d  |  Warmup: %,d%n", PING_ROUNDS, PING_WARMUP);
         System.out.println("--------------------------------------------------------------------------------");
-        System.out.printf(" %-10s  %18s  %18s  %12s%n",
-                "Percentile", "Spinning (µs)", "VTDispatcher (µs)", "Ratio (VT/Spin)");
+        System.out.printf(" %-10s  %18s  %18s  %12s%n", "Percentile", "Spinning (µs)", "VTDispatcher (µs)", "Ratio (VT/Spin)");
         System.out.println("--------------------------------------------------------------------------------");
 
-        printPingRow("min",  percentile(spinLatencies, 0.00), percentile(vtLatencies, 0.00));
-        printPingRow("avg",  avg(spinLatencies),               avg(vtLatencies));
-        printPingRow("p50",  percentile(spinLatencies, 0.50), percentile(vtLatencies, 0.50));
-        printPingRow("p95",  percentile(spinLatencies, 0.95), percentile(vtLatencies, 0.95));
-        printPingRow("p99",  percentile(spinLatencies, 0.99), percentile(vtLatencies, 0.99));
-        printPingRow("max",  percentile(spinLatencies, 1.00), percentile(vtLatencies, 1.00));
+        printPingRow("min", percentile(spinLatencies, 0.00), percentile(vtLatencies, 0.00));
+        printPingRow("avg", avg(spinLatencies), avg(vtLatencies));
+        printPingRow("p50", percentile(spinLatencies, 0.50), percentile(vtLatencies, 0.50));
+        printPingRow("p95", percentile(spinLatencies, 0.95), percentile(vtLatencies, 0.95));
+        printPingRow("p99", percentile(spinLatencies, 0.99), percentile(vtLatencies, 0.99));
+        printPingRow("max", percentile(spinLatencies, 1.00), percentile(vtLatencies, 1.00));
 
         System.out.println("================================================================================");
         System.out.println();
@@ -199,8 +199,7 @@ class DispatcherComparisonBenchmarkTest {
      * Runs the ping benchmark for the given dispatcher.
      * Returns an array of {@value #PING_ROUNDS} nanosecond latency samples.
      */
-    private long[] runPing(io.bufferfly.core.actor.Dispatcher dispatcher)
-            throws InterruptedException {
+    private long[] runPing(io.bufferfly.core.actor.Dispatcher dispatcher) throws InterruptedException {
 
         PingActor actor = new PingActor("ping-cmp-actor");
         actor.start();
@@ -223,7 +222,7 @@ class DispatcherComparisonBenchmarkTest {
         }
 
         if (dispatcher instanceof SpinningActorDispatcher sd) sd.clear(actor);
-        if (dispatcher instanceof VTDispatcher vt)          vt.clear(actor);
+        if (dispatcher instanceof VTDispatcher vt) vt.clear(actor);
 
         return latencies;
     }
@@ -234,8 +233,7 @@ class DispatcherComparisonBenchmarkTest {
 
     private void printPingRow(String label, double spinNs, double vtNs) {
         double ratio = vtNs / spinNs;
-        System.out.printf(" %-10s  %18.2f  %18.2f  %11.2fx%n",
-                label, spinNs / 1_000.0, vtNs / 1_000.0, ratio);
+        System.out.printf(" %-10s  %18.2f  %18.2f  %11.2fx%n", label, spinNs / 1_000.0, vtNs / 1_000.0, ratio);
     }
 
     private double percentile(long[] sorted, double p) {
@@ -257,31 +255,49 @@ class DispatcherComparisonBenchmarkTest {
     static class LatchCountingActor extends AbstractActor<String> {
 
         private final String actorName;
-        private final AtomicInteger received = new AtomicInteger(0);
+        private int received;
+        private volatile int safeReceived = 0;
         private final CountDownLatch done;
 
-        LatchCountingActor(String name, int target) {
+        LatchCountingActor(String name) {
             this.actorName = name;
-            this.done = new CountDownLatch(target);
+            this.done = new CountDownLatch(1);
         }
 
         @Override
         public void receive(String message) {
-            received.incrementAndGet();
-            done.countDown();
+            if (message.equals(EOF)) {
+                safeReceived = received;
+                done.countDown();
+            } else {
+                received++;
+            }
         }
 
-        @Override public String name()           { return actorName; }
-        @Override protected void preStart()      {}
-        @Override protected void postStop()      {}
-        @Override public void onError(String m, Exception e) {}
+        @Override
+        public String name() {
+            return actorName;
+        }
 
-        int getReceiveCount() { return received.get(); }
+        @Override
+        protected void preStart() {
+        }
+
+        @Override
+        protected void postStop() {
+        }
+
+        @Override
+        public void onError(String m, Exception e) {
+        }
+
+        int getReceiveCount() {
+            return safeReceived;
+        }
 
         void awaitCompletion(long timeout, TimeUnit unit) throws InterruptedException {
             if (!done.await(timeout, unit)) {
-                throw new AssertionError(
-                        "Timed out waiting for all messages — received " + received.get());
+                throw new AssertionError("Timed out waiting for all messages — received " + safeReceived);
             }
         }
     }
@@ -300,7 +316,9 @@ class DispatcherComparisonBenchmarkTest {
         private final AtomicInteger totalReceived = new AtomicInteger(0);
         private volatile CountDownLatch roundLatch = new CountDownLatch(1);
 
-        PingActor(String name) { this.actorName = name; }
+        PingActor(String name) {
+            this.actorName = name;
+        }
 
         @Override
         public void receive(String message) {
@@ -308,12 +326,26 @@ class DispatcherComparisonBenchmarkTest {
             roundLatch.countDown();
         }
 
-        @Override public String name()           { return actorName; }
-        @Override protected void preStart()      {}
-        @Override protected void postStop()      {}
-        @Override public void onError(String m, Exception e) {}
+        @Override
+        public String name() {
+            return actorName;
+        }
 
-        void arm() { roundLatch = new CountDownLatch(1); }
+        @Override
+        protected void preStart() {
+        }
+
+        @Override
+        protected void postStop() {
+        }
+
+        @Override
+        public void onError(String m, Exception e) {
+        }
+
+        void arm() {
+            roundLatch = new CountDownLatch(1);
+        }
 
         void await() throws InterruptedException {
             if (!roundLatch.await(5, TimeUnit.SECONDS)) {

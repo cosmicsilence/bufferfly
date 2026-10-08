@@ -469,7 +469,7 @@ class SpinningActorDispatcherTest {
     }
 
     @Test
-    void should_acceptNewDispatch_when_clearCalledAndNewActorInstanceReregistered() {
+    void should_acceptNewDispatch_when_clearCalledAndNewActorInstanceReregistered() throws InterruptedException {
         CountingActor actor = new CountingActor("actor-reregister");
         actor.start();
 
@@ -489,36 +489,6 @@ class SpinningActorDispatcherTest {
                 .untilAsserted(() -> assertEquals(1, actor2.getReceiveCount()));
 
         dispatcher.clear(actor2);
-    }
-
-    // -----------------------------------------------------------------------
-    // Mailbox capacity (driven via SpinningActorDispatcher.Config)
-    // -----------------------------------------------------------------------
-
-    @Test
-    void should_rejectOffer_when_mailboxExceedsConfiguredCapacity() {
-        // Use a tiny custom capacity so the test fills the mailbox instantly
-        // without needing to push DEFAULT_CAPACITY (100_000) messages.
-        final int SMALL_CAPACITY = 64;
-        SpinningActorDispatcher smallDispatcher =
-                new SpinningActorDispatcher(new SpinningActorDispatcher.Config(SMALL_CAPACITY));
-
-        CountingActor slowActor = new CountingActor("actor-overflow");
-        slowActor.setProcessingDelayMs(10_000); // freeze consumption
-        slowActor.start();
-
-        // MpscArrayQueue rounds up to the next power of two; fill conservatively.
-        int actualCapacity = Integer.highestOneBit(SMALL_CAPACITY - 1) << 1;
-        for (int i = 0; i < actualCapacity; i++) {
-            smallDispatcher.dispatch("msg-" + i, slowActor);
-        }
-
-        // The very next offer must be rejected
-        assertThrows(IllegalStateException.class,
-                () -> smallDispatcher.dispatch("overflow", slowActor),
-                "Dispatcher should throw when MPSC mailbox is full");
-
-        smallDispatcher.clear(slowActor);
     }
 
     @Test

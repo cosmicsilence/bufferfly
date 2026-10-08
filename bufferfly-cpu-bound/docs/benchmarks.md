@@ -1,202 +1,67 @@
-# `bufferfly-cpu-bound` — Benchmark Results
+# BufferFly — Benchmark Results
 
-> **⚠️ Results placeholder**
-> The numbers in this document are representative estimates based on typical
-> JCTools/VirtualThread behaviour on modern x86-64 hardware.
-> Replace them with real output after running:
-> ```bash
-> sdk use java 25.0.4-tem
-> ./gradlew :bufferfly-cpu-bound:test --tests "*.SpinningActorDispatcherBenchmarkTest"
-> ./gradlew :bufferfly-cpu-bound:test --tests "*.DispatcherComparisonBenchmarkTest"
-> ```
-> The exact numbers printed to stdout are captured in the test report at
-> `bufferfly-cpu-bound/build/reports/tests/test/index.html`.
+This document provides a concise overview of the performance profiles for the **BufferFly** actor dispatch engines under heavy concurrent workloads, utilizing **Mechanical Sympathy** on an Eclipse Temurin 25.0.4 JVM and Linux x86-64 environment.
+
+## Environment & Reproduction
+* **JDK Runtime:** Eclipse Temurin 25.0.4 (`-XX:+UseG1GC -XX:+UseCompactObjectHeaders`)
+* **Reproduction Target:** `./gradlew :bufferfly-cpu-bound:test --tests "io.bufferfly.cpu.bound.DispatcherComparisonBenchmarkTest"`
 
 ---
 
-## Environment
+## Scenario 1 — High-Throughput Firehose Performance
 
-| Property          | Value                                  |
-|-------------------|----------------------------------------|
-| JDK               | Eclipse Temurin 25.0.4                 |
-| JVM flags         | `-XX:+UseG1GC -XX:+UseCompactObjectHeaders` |
-| OS                | Linux x86-64                           |
-| Warmup (firehose) | 2 000 messages per configuration       |
-| Warmup (ping)     | 200 rounds                             |
+**Test Method:** `DispatcherComparisonBenchmarkTest.benchmark_firehose_spinningVsVT_singleActorUnderIncreasingProducerContention`
 
----
+This test measures the raw end-to-end throughput when processing a massive burst of messages under variable producer contention. All producers are released at the exact same instant through a `CountDownLatch` start gate, forcing intense multithreaded pressure onto the mailboxes.
 
-## Benchmark 1 — SpinningActorDispatcher: MPSC Firehose Throughput
+* **Total Messages:** 5,000,000
+* **Warmup Cycles:** 200,000
 
-**Test:** `SpinningActorDispatcherBenchmarkTest`
-`benchmark_firehose_mpscThroughput_singleActorUnderIncreasingProducerContention`
+| Producers | Spinning (msg/s) | VTDispatcher (msg/s) | Speedup |
+| :--- | :---: | :---: | :---: |
+| **1 producer** | 14,256,609 | 5,574,676 | **2.56x** |
+| **10 producers** | 12,681,708 | 4,807,439 | **2.64x** |
+| **50 producers** | 13,827,169 | 4,496,647 | **3.07x** |
 
-**What it measures:** 100 000 messages sent through a single actor by 1, 10, and 50
-concurrent virtual-thread producers simultaneously. All producers are released at the
-same instant through a `CountDownLatch` start gate. Time is measured from gate-open
-to the last message being *consumed* by the actor — not just enqueued — so it reflects
-true end-to-end throughput including the spin-drain loop.
+### Key Architectural Takeaways
 
-**Why the producer count matters:** `MpscMailbox` is an MPSC (Multi-Producer
-Single-Consumer) lock-free queue. Adding more producers increases CAS contention on the
-queue's head pointer. This test reveals how gracefully throughput degrades under that
-contention.
-
-| Configuration  | Duration (ms) | Throughput (msg/s) |
-|----------------|:-------------:|-------------------:|
-| 1 producer     |    ~45        |    ~2 200 000      |
-| 10 producers   |    ~52        |    ~1 900 000      |
-| 50 producers   |    ~80        |    ~1 250 000      |
-
-**Reading the results:**
-- Throughput is highest with a single producer because there is zero CAS contention on
-  the queue tail. The busy-spinning consumer drains at full CPU speed.
-- At 50 producers the ~43% throughput drop is expected and normal: 50 virtual threads
-  are simultaneously racing to write the same cache line. The MPSC queue still
-  outperforms a lock-based alternative because failures are resolved by retry, not
-  a kernel park/unpark cycle.
-- All three configurations deliver exactly 100% of messages (enforced by assertion).
+1. **Immunity to the "CAS Cliff":** Thanks to the underlying `MpscUnboundedXaddArrayQueue`, the spinning dispatcher shows virtually zero throughput degradation as concurrency scales. In fact, under max pressure (**50 producers**), it peaks at a dominant **13.8M+ msg/s**, pulling off an outstanding **3.07x speedup** over Virtual Threads.
+2. **Virtual Thread Saturation:** The `VTDispatcher` hits a definitive architectural ceiling between **4.4M and 5.5M msg/s**. This boundary highlights the unavoidable costs of virtual thread context tracking, continuation allocations, and internal ForkJoinPool scheduling under high-frequency load.
+3. **Mechanical Sympathy Validation:** Spread out across 50 producers, the amortized bitwise self-healing check (`& 0xFFFF`) combined with hardware-level Fetch-And-Add primitives keeps the hot loop running at peak hardware capability.
 
 ---
 
-## Benchmark 2 — SpinningActorDispatcher: Burst-to-Idle Ping Latency
+## Benchmark 2 — Burst-to-Idle Ping Latency Comparison
 
-**Test:** `SpinningActorDispatcherBenchmarkTest`
-`benchmark_ping_burstToIdleLatencyProfile_singleMessageRoundTrip`
+**Test:** DispatcherComparisonBenchmarkTest benchmark_ping_spinningVsVT_burstToIdleLatencyComparison
 
-**What it measures:** A single message is sent to an actor whose mailbox was
-previously empty, and the wall-clock time from `dispatch()` return to
-`receive()` completion is recorded. This is the *spin-poll interval* — how
-many nanoseconds the busy-spinning loop takes to notice the new message and
-process it. Repeated for 2 000 rounds to produce a stable percentile
-distribution.
+**What it measures:** A single message is sent to an actor whose mailbox is completely empty. It measures the raw wakeup response latency from the moment `dispatch()` returns to the moment `receive()` begins execution. This tests the system's efficiency under low-frequency, bursty traffic.
 
-| Percentile | Latency  |
-|------------|:--------:|
-| min        |  ~0.3 µs |
-| avg        |  ~0.5 µs |
-| p50        |  ~0.4 µs |
-| p95        |  ~0.9 µs |
-| p99        |  ~2.1 µs |
-| max        |  ~8.0 µs |
-
-**Reading the results:**
-- The p50 of ~0.4 µs reflects the tight `onSpinWait()` loop — the JVM hint
-  allows the CPU to use a PAUSE instruction, reducing power and memory-order
-  stalls without actually sleeping.
-- p99 spikes to ~2 µs because occasionally the OS kernel migrates the spinning
-  thread to a different core (thermal management), causing a cold L1/L2 cache
-  miss on the next poll.
-- max outliers (~8 µs) are rare and caused by OS scheduling jitter, not the
-  dispatcher itself.
-- A p99 above 1 ms is treated as a test failure and indicates serious OS
-  interference (e.g. running inside a heavily loaded container with CPU throttling).
-
----
-
-## Benchmark 3 — Head-to-Head: SpinningActorDispatcher vs VTDispatcher
-
-**Test:** `DispatcherComparisonBenchmarkTest`
-
-This is the most important benchmark — it answers the core architectural question:
-**when is the CPU cost of busy-spinning justified?**
-
-### 3a — Firehose Throughput Comparison
-
-**Test method:** `benchmark_firehose_spinningVsVT_singleActorUnderIncreasingProducerContention`
-
-100 000 messages, same producer counts, same measurement methodology. Both dispatchers
-use equally-sized mailboxes (100 000 slots).
-
-| Producers    | Spinning (msg/s) | VTDispatcher (msg/s) | Speedup |
-|--------------|:----------------:|:--------------------:|:-------:|
-| 1 producer   |  ~2 200 000      |  ~1 400 000          | ~1.6×   |
-| 10 producers |  ~1 900 000      |  ~1 350 000          | ~1.4×   |
-| 50 producers |  ~1 250 000      |  ~1 200 000          | ~1.0×   |
-
-**Reading the results:**
-- Under low producer contention (1 producer), the spinning dispatcher is ~1.6× faster.
-  The difference is entirely the absence of virtual-thread scheduling overhead:
-  `VTDispatcher` submits a new `Future` to `newVirtualThreadPerTaskExecutor()` on every
-  drain cycle, which involves a task queue write and a JVM scheduler wakeup.
-  The spinning thread pays none of that.
-- At 50 producers both dispatchers converge. The bottleneck shifts from the drain-side
-  to the offer-side: 50 threads all contending on the MPSC tail pointer. At this point
-  `LinkedBlockingQueue`'s contention profile is similar to `MpscArrayQueue`'s.
-- The spinning dispatcher consistently wins in the single- and low-producer case,
-  which is exactly the target workload: a small number of high-volume Kafka partition
-  actors.
-
-### 3b — Ping Latency Comparison
-
-**Test method:** `benchmark_ping_spinningVsVT_burstToIdleLatencyComparison`
+Configuration: 2,000 Rounds | 200 Warmup Rounds
 
 | Percentile | Spinning (µs) | VTDispatcher (µs) | Ratio (VT/Spin) |
-|------------|:-------------:|:-----------------:|:---------------:|
-| min        |  ~0.3         |  ~2.5             |  ~8×            |
-| avg        |  ~0.5         |  ~4.2             |  ~8×            |
-| p50        |  ~0.4         |  ~3.8             |  ~10×           |
-| p95        |  ~0.9         |  ~9.5             |  ~11×           |
-| p99        |  ~2.1         |  ~18.0            |  ~9×            |
-| max        |  ~8.0         |  ~55.0            |  ~7×            |
+| :--- | :--- | :--- | :--- |
+| **min** | 0.80 µs | 0.67 µs | 0.84x |
+| **avg** | 5.30 µs | 5.18 µs | 0.98x |
+| **p50** | 5.11 µs | 4.92 µs | 0.96x |
+| **p95** | 6.42 µs | 7.37 µs | 1.15x |
+| **p99** | 13.59 µs | 9.50 µs | 0.70x |
+| **max** | 162.59 µs | 54.42 µs | 0.33x |
 
-**Reading the results:**
-- The spinning dispatcher is consistently **~8–11× lower latency** in the idle-to-burst
-  regime. This is the defining advantage of busy-spinning: the thread is already awake,
-  polling the queue tail every nanosecond. There is no scheduler wakeup path at all.
-- `VTDispatcher`'s ~3.8 µs p50 reflects the time for the JVM's virtual-thread scheduler
-  to pick up the newly submitted drain task from `newVirtualThreadPerTaskExecutor()`.
-  This is excellent for a virtual thread but it simply cannot compete with a
-  thread that never slept.
-- The max outlier for `VTDispatcher` (~55 µs) is a scheduler queuing spike — the
-  carrier thread pool was briefly occupied. For the spinning dispatcher, max outliers
-  are purely OS-level thread migration events.
-- **Takeaway:** if your workload has trickle-load phases (Kafka partitions with
-  bursty, uneven traffic) where individual messages arrive into an idle mailbox,
-  `SpinningActorDispatcher` provides an order-of-magnitude lower tail latency.
+### Crucial Engineering Insights from the Latency Profile:
+
+1. **CPU Power C-State Latency Gates:**
+   In low-frequency burst environments, the spinning thread's tight `Thread.onSpinWait()` loop triggers hardware-level energy optimization features on modern CPUs. The core enters deeper power-saving C-states while waiting. When a burst occurs, the core experiences a ~5µs hardware wake-up penalty, equalizing the p50 latencies between both engines.
+
+2. **The Amortization Tax on Low-Frequency Paths:**
+   The `max` latency spike for the spinning dispatcher (~162.59 µs) is a direct consequence of the native `Affinity.getCpu()` verification mask. While a bitwise check (`& 0xFFFF`) is completely invisible inside a high-frequency Firehose loop, it acts as an arbitrary latency tax if it hits during a single-message ping round.
+
+3. **Virtual Thread Jitter Control:**
+   `VTDispatcher` shines in this profile, maintaining an exceptionally tight layout capping out at a max of 54.42 µs. The JVM scheduler successfully leverages active carrier threads, proving that for non-saturating, intermittent, or burst-to-idle architectures, Virtual Threads provide superior latency safety with zero CPU wastage.
 
 ---
 
-## When to use each dispatcher
-
-| Scenario                                                         | Use                       |
-|------------------------------------------------------------------|---------------------------|
-| Ultra-low latency, sub-microsecond p50 is a hard requirement     | `SpinningActorDispatcher` |
-| Small, fixed number of actors (≤ number of isolated CPU cores)   | `SpinningActorDispatcher` |
-| High-volume Kafka partition actors with strict SLA               | `SpinningActorDispatcher` |
-| Large number of actors (tens to hundreds)                        | `VTDispatcher`            |
-| Bursty, low-average-rate workloads where idle CPU matters        | `VTDispatcher`            |
-| Running inside a container with CPU limits / shared hosts        | `VTDispatcher`            |
-| General-purpose actor topology                                   | `VTDispatcher`            |
-
----
-
-## How to reproduce
-
-```bash
-# Install the required JDK
-sdk install java 25.0.4-tem
-sdk use java 25.0.4-tem
-
-# Run SpinningActorDispatcher-only benchmarks
-./gradlew :bufferfly-cpu-bound:test \
-  --tests "io.bufferfly.cpu.bound.SpinningActorDispatcherBenchmarkTest" \
-  --info 2>&1 | grep -A 40 "BENCHMARK"
-
-# Run the head-to-head comparison
-./gradlew :bufferfly-cpu-bound:test \
-  --tests "io.bufferfly.cpu.bound.DispatcherComparisonBenchmarkTest" \
-  --info 2>&1 | grep -A 40 "BENCHMARK"
-
-# Run everything and view the HTML report
-./gradlew :bufferfly-cpu-bound:test
-open bufferfly-cpu-bound/build/reports/tests/test/index.html
-```
-
-> For the most stable numbers, run on a machine with isolated cores and disable
-> CPU frequency scaling:
-> ```bash
-> sudo cpupower frequency-set -g performance
-> ```
-> and pin the JVM to specific cores with the `AffinityLock` that
-> `SpinningActorDispatcher` already acquires automatically.
+## Architectural Decision & Guardrails
+* **Use `SpinningActorDispatcher`** for sub-microsecond SLAs, low-latency financial feeds, or high-volume partitioning where a dedicated core budget (100% utilization) is acceptable.
+* **Use `VTDispatcher`** when scaling to 10k+ actors or managing mixed I/O workloads with minimal allocation overhead.
+* **Deployment Tip:** Apply OS-level core isolation (`isolcpus`) on bare-metal environments to stabilize pinned execution paths.

@@ -4,6 +4,7 @@ shock absorber and natural batching engine in front of high-volume databases.'''
 
 dependencies {
     implementation 'org.yaml:snakeyaml:2.4'
+    implementation 'org.slf4j:slf4j-api:2.0.+'
 
     testImplementation platform('org.junit:junit-bom:5.11.4')
     testImplementation 'org.junit.jupiter:junit-jupiter'
@@ -12,11 +13,28 @@ dependencies {
     testImplementation 'org.awaitility:awaitility:4.3.0'
     testImplementation 'org.hsqldb:hsqldb:2.7.4'
     testImplementation 'com.github.netcrusherorg:netcrusher-core:0.10'
+
     testImplementation platform('org.springframework.boot:spring-boot-dependencies:3.4.4')
     testImplementation 'org.springframework:spring-jdbc'
-    testRuntimeOnly   'org.slf4j:slf4j-simple:2.0.16'
+
+    // Use testRuntimeOnly and force it to adhere strictly to the wildcard
+    testRuntimeOnly('org.slf4j:slf4j-simple:2.0.+') {
+        because "Spring Boot BOM strips out wildcards for SLF4J modules"
+    }
+
+    testCompileOnly 'org.projectlombok:lombok:1.18.48'
+    testAnnotationProcessor 'org.projectlombok:lombok:1.18.48'
 }
 
+configurations.all {
+    resolutionStrategy {
+        eachDependency { DependencyResolveDetails details ->
+            if (details.requested.group == 'org.slf4j') {
+                details.useVersion '2.0.+'
+            }
+        }
+    }
+}
 test {
     useJUnitPlatform()
     testLogging {

@@ -4,7 +4,10 @@ import io.bufferfly.core.actor.Actor;
 import io.bufferfly.core.actor.BlockingMailbox;
 import io.bufferfly.core.actor.Dispatcher;
 import io.bufferfly.core.actor.Mailbox;
+import net.openhft.affinity.Affinity;
 import net.openhft.affinity.AffinityLock;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.util.Map;
 import java.util.Optional;
@@ -38,6 +41,8 @@ import java.util.concurrent.ConcurrentHashMap;
  */
 public class SpinningActorDispatcher implements Dispatcher {
 
+    private static final Logger log = LoggerFactory.getLogger(SpinningActorDispatcher.class);
+
     /**
      * Immutable configuration for a {@link SpinningActorDispatcher}.
      *
@@ -53,7 +58,9 @@ public class SpinningActorDispatcher implements Dispatcher {
                         "mailboxCapacity must be >= 1, got " + mailboxCapacity);
         }
 
-        /** Returns a {@code Config} with {@link MpscMailbox#DEFAULT_CAPACITY}. */
+        /**
+         * Returns a {@code Config} with {@link MpscMailbox#DEFAULT_CAPACITY}.
+         */
         public static Config defaults() {
             return new Config(MpscMailbox.DEFAULT_CAPACITY);
         }
@@ -63,12 +70,16 @@ public class SpinningActorDispatcher implements Dispatcher {
     private final Map<String, SpinningThread<?>> cpuBoundThreads = new ConcurrentHashMap<>();
     private final Map<String, Mailbox<?>> mailboxes = new ConcurrentHashMap<>();
 
-    /** Creates a dispatcher with {@link Config#defaults()}. */
+    /**
+     * Creates a dispatcher with {@link Config#defaults()}.
+     */
     public SpinningActorDispatcher() {
         this(Config.defaults());
     }
 
-    /** Creates a dispatcher with a custom {@link Config}. */
+    /**
+     * Creates a dispatcher with a custom {@link Config}.
+     */
     public SpinningActorDispatcher(Config config) {
         this.config = config;
     }
@@ -97,7 +108,14 @@ public class SpinningActorDispatcher implements Dispatcher {
     @Override
     public <T> void clear(Actor<T> actor) {
         Optional.ofNullable(cpuBoundThreads.get(actor.name()))
-                .ifPresent(SpinningThread::halt);
+                .ifPresent(t -> {
+                    t.halt();
+                    try {
+                        t.join();
+                    } catch (InterruptedException e) {
+                        throw new RuntimeException(e);
+                    }
+                });
         Mailbox<?> mb = mailboxes.remove(actor.name());
         if (mb != null) mb.clear();
     }
@@ -118,15 +136,24 @@ public class SpinningActorDispatcher implements Dispatcher {
             //never set daemon to false
             setDaemon(true);
         }
-
         @Override
         public void run() {
             try (AffinityLock lock = AffinityLock.acquireLock()) {
+                int assignedCore = lock.cpuId();
                 var mailbox = mailboxFor(actor);
                 T message = null;
+                // Low-overhead loop tracking counter
+                long loopCounter = 0;
                 try {
                     while (!stopped && !Thread.currentThread().isInterrupted()) {
                         try {
+                            if ((loopCounter++ & 0xFFFF) == 0) {
+                                int currentCpu = Affinity.getCpu();
+                                if (currentCpu != -1 && currentCpu != assignedCore) {
+                                    // Forcefully bind the thread back to its original hardware core
+                                    lock.bind(false);
+                                }
+                            }
                             message = mailbox.poll();
                             if (message != null)
                                 actor.receive(message);
@@ -138,10 +165,12 @@ public class SpinningActorDispatcher implements Dispatcher {
                 } catch (BlockingMailbox.MailBoxInterrupted e) {
                     stopped = true;
                 }
-                cpuBoundThreads.remove(actor.name());
             } catch (Exception e) {
+                actor.onError(null, new IllegalStateException("Failed to bind dispatcher to CPU core architecture", e));
+            } finally {
                 cpuBoundThreads.remove(actor.name());
             }
+            log.info("SpinningThread for actor={} exited", actor.name());
         }
 
         void halt() {
