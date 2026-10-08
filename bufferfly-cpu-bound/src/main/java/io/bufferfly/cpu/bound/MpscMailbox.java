@@ -1,14 +1,16 @@
 package io.bufferfly.cpu.bound;
 
 import io.bufferfly.core.actor.Mailbox;
+import org.jctools.queues.MpmcArrayQueue;
 import org.jctools.queues.MpscArrayQueue;
+import org.jctools.queues.MpscUnboundedXaddArrayQueue;
 
 //Not public - Maybe should be private do @SpinningDispather
 class MpscMailbox<T> implements Mailbox<T> {
 
     static final int DEFAULT_CAPACITY = 100_000;
 
-    private final MpscArrayQueue<T> queue;
+    private final MpscUnboundedXaddArrayQueue<T> queue;
 
     MpscMailbox() {
         this(DEFAULT_CAPACITY);
@@ -16,7 +18,7 @@ class MpscMailbox<T> implements Mailbox<T> {
 
     MpscMailbox(int capacity) {
         if (capacity < 1) throw new IllegalArgumentException("capacity must be >= 1, got " + capacity);
-        this.queue = new MpscArrayQueue<>(capacity);
+        this.queue = new MpscUnboundedXaddArrayQueue<>(capacity);
     }
 
     @Override
