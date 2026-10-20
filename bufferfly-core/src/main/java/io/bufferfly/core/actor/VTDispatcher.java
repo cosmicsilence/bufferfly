@@ -22,10 +22,9 @@ public class VTDispatcher implements Dispatcher {
     public static final int YIELD_THRESHOLD = 32;
 
     private final ExecutorService vtExecutor = Executors.newVirtualThreadPerTaskExecutor();
-    private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
+    private final PreStartBuffer preStartBuffer = new PreStartBuffer();
     private final Map<Actor<?>, Future<?>> runningActors = new ConcurrentHashMap<>();
     private final Map<String, Mailbox<?>> mailboxes = new ConcurrentHashMap<>();
-    private final Map<String, ScheduledFuture<?>> startingTasks = new ConcurrentHashMap<>();
 
     /**
      * Creates a dispatcher with the built-in default capacity (20 000).
@@ -71,11 +70,8 @@ public class VTDispatcher implements Dispatcher {
     }
 
     private <T> void consume(Actor<T> actor) {
-        if (actor.isPreStarting()) {
-            Runnable runnable = () -> consume(actor);
-            startingTasks.putIfAbsent(actor.name(), scheduler.schedule(runnable, 50, TimeUnit.MILLISECONDS));
-        } else {
-            runningActors.computeIfAbsent(actor, ignored -> vtExecutor.submit(() -> {
+        if (preStartBuffer.bufferIfPreStarting(actor, () -> consume(actor))) return;
+        runningActors.computeIfAbsent(actor, ignored -> vtExecutor.submit(() -> {
                 var mailbox = mailboxFor(actor);
                 boolean interrupted = false;
                 T message;
@@ -102,8 +98,6 @@ public class VTDispatcher implements Dispatcher {
                     consume(actor);
                 }
             }));
-        }
-
     }
 
     @Override
@@ -118,7 +112,7 @@ public class VTDispatcher implements Dispatcher {
         runningActors.values().forEach(f -> f.cancel(true));
         runningActors.clear();
         mailboxes.clear();
-        scheduler.shutdown();
+        preStartBuffer.stop();
         vtExecutor.shutdown();
     }
 
