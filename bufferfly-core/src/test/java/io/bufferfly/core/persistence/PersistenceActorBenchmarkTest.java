@@ -68,13 +68,14 @@ class PersistenceActorBenchmarkTest {
         actorOperations.createTableIfNotExists();
         directOperations.createTableIfNotExists();
 
-        BatchingPersistenceRunner.Config config = new BatchingPersistenceRunner.Config(
+        PersistenceConfig<Tweet> config = new PersistenceConfig<>(
+                actorOperations,
                 1_000, // batchSize
                 10L,   // timeoutMs
                 3      // maxRetries
         );
-        runner = new BatchingPersistenceRunner<>(actorOperations, config);
-        actor = new TweeterActor("tweeter-bench-" + UUID.randomUUID(), runner);
+        actor = new TweeterActor("tweeter-bench-" + UUID.randomUUID(), config);
+        runner = (BatchingPersistenceRunner<Tweet>) actor.runner();
         manager = new ActorManager();
         actorRef = manager.start(actor);
     }

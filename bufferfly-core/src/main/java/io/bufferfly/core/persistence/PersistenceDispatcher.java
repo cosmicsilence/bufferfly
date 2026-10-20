@@ -17,7 +17,7 @@ public interface PersistenceDispatcher<E> {
      * Accepts one event into the buffer and ensures the consume loop is
      * scheduled. Must be non-blocking.
      */
-    void enqueue(E event, BatchingPersistenceRunner<E> runner);
+    void enqueue(PersistenceRunner.PersistenceEvent<E> event, PersistenceRunner<E> runner);
 
     /**
      * Cancels the in-flight consume task and discards any buffered events.

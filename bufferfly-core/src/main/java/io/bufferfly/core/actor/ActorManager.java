@@ -5,11 +5,14 @@ import io.bufferfly.core.config.BufferflyConfig;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 public class ActorManager {
 
-    private final Map<String, ActorReference<?>> startedActors = new ConcurrentHashMap<>();
+    private final Map<String, DispatchingActor<?>> startedActors = new ConcurrentHashMap<>();
 
+    private final ExecutorService callStartExecutor = Executors.newVirtualThreadPerTaskExecutor();
     /**
      * Per-actor dispatcher registry.
      * Key = actor name, value = the Dispatcher instance to use for that actor.
@@ -21,10 +24,6 @@ public class ActorManager {
      * The dispatcher used when no per-actor override is configured.
      */
     private final Dispatcher defaultDispatcher;
-
-    // -----------------------------------------------------------------------
-    // Constructors
-    // -----------------------------------------------------------------------
 
     /**
      * Creates an ActorManager with default settings (VTDispatcher, capacity 20 000).
@@ -77,10 +76,6 @@ public class ActorManager {
         this.configuredDispatchers = new ConcurrentHashMap<>(perActor);
     }
 
-    // -----------------------------------------------------------------------
-    // Public API
-    // -----------------------------------------------------------------------
-
     /**
      * Registers and starts {@code actor}, returning an {@link ActorReference}
      * through which callers can send messages and stop the actor.
@@ -96,18 +91,11 @@ public class ActorManager {
             Dispatcher dispatcher = configuredDispatchers.getOrDefault(
                     actor.name(), defaultDispatcher);
             DispatchingActor<T> dispatchingActor = new DispatchingActor<>(actor, dispatcher);
-            dispatchingActor.start();
-            if (actor instanceof AbstractActor<T> abstractActor) {
-                abstractActor.setSelf(dispatchingActor);
-            }
+            callStartExecutor.execute(dispatchingActor::start);
             return dispatchingActor;
         });
         return (ActorReference<T>) registered;
     }
-
-    // -----------------------------------------------------------------------
-    // Dispatcher instantiation
-    // -----------------------------------------------------------------------
 
     private static Dispatcher instantiateDispatcher(
             String fqn,
@@ -133,10 +121,6 @@ public class ActorManager {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // Inner class: DispatchingActor
-    // -----------------------------------------------------------------------
-
     /**
      * Package-private bridge between an {@link Actor} implementation and the
      * outside world. Implements only {@link ActorReference} — callers never
@@ -145,10 +129,10 @@ public class ActorManager {
      * <p>Routing: {@code tell()} → {@link Dispatcher#dispatch} → {@link Actor#receive}.
      * <p>Lifecycle: {@code start()} delegates to {@link Actor#start()};
      * {@code stop()} drains / clears the dispatcher and calls
-     * {@link AbstractActor#shutdown()} if the delegate is an
+     * {@link AbstractActor#stop()} if the delegate is an
      * {@link AbstractActor}.
      */
-    final class DispatchingActor<T> implements ActorReference<T> {
+    private final class DispatchingActor<T> implements ActorReference<T> {
 
         private final Actor<T> delegate;
         private final Dispatcher dispatcher;
@@ -158,28 +142,23 @@ public class ActorManager {
             this.dispatcher = dispatcher;
         }
 
-        /**
-         * Starts the underlying actor (idempotent).
-         */
         void start() {
+            delegate.setSelf(this); //this is the ActorReference
             delegate.start();
         }
 
         @Override
         public void tell(T message) {
-            if (!delegate.isStarted()) {
-                throw new IllegalStateException(
-                        "Actor '%s' has not been started".formatted(delegate.name()));
+            if (!delegate.isStarted() && !delegate.isPreStarting()) {
+                throw new ActorNotStartedException(
+                        "Actor='%s' is not started, state=%s".formatted(delegate.name(), delegate.currentState()));
             }
             dispatcher.dispatch(message, delegate);
         }
 
         @Override
         public void stop() {
-            // Shut down the underlying actor lifecycle if it extends AbstractActor
-            if (delegate instanceof AbstractActor<?> a) {
-                a.shutdown();
-            }
+            delegate.stop();
             dispatcher.clear(delegate);
             startedActors.remove(delegate.name());
         }

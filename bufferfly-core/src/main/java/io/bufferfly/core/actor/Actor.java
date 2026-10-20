@@ -14,6 +14,8 @@ public interface Actor<T> {
     /** Called by the dispatcher to deliver one message. */
     void receive(T message);
 
+    void setSelf(ActorReference<T> self);
+
     /** Unique name identifying this actor within an {@link ActorManager}. */
     String name();
 
@@ -26,6 +28,17 @@ public interface Actor<T> {
      */
     void start();
 
+    /**
+     * Stops the actor. Called when ActorReference.stop() is called
+     */
+    void stop();
+
     /** Returns {@code true} once {@link #start()} has been called successfully. */
     boolean isStarted();
+
+    boolean isPreStarting();
+
+    AbstractActor.State currentState();
+
+
 }

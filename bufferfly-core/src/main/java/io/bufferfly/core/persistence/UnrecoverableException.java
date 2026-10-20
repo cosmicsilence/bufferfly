@@ -1,7 +1,7 @@
 package io.bufferfly.core.persistence;
 
 /**
- * Thrown by {@link TransactionalOperations#run} to signal that the batch
+ * Thrown by {@link TransactionalOperations#persistOnTransaction} to signal that the batch
  * failure is permanent and should not be retried.
  *
  * <p>{@link BatchingPersistenceRunner} will discard the batch and move on.

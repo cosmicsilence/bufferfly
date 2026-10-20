@@ -2,10 +2,7 @@ package io.bufferfly.core.actor;
 
 import java.util.Map;
 import java.util.Optional;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
+import java.util.concurrent.*;
 
 public class VTDispatcher implements Dispatcher {
 
@@ -23,8 +20,10 @@ public class VTDispatcher implements Dispatcher {
     public static final int YIELD_THRESHOLD = 32;
 
     private final ExecutorService vtExecutor = Executors.newVirtualThreadPerTaskExecutor();
+    private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
     private final Map<Actor<?>, Future<?>> runningActors = new ConcurrentHashMap<>();
     private final Map<String, Mailbox<?>>  mailboxes     = new ConcurrentHashMap<>();
+    private final Map<String, Actor<?>> startingActors = new ConcurrentHashMap<>();
 
     /** Creates a dispatcher with the built-in default capacity (20 000). */
     public VTDispatcher() {
@@ -50,6 +49,10 @@ public class VTDispatcher implements Dispatcher {
         }
         this.defaultMailboxCapacity    = defaultMailboxCapacity;
         this.mailboxCapacityOverrides  = Map.copyOf(mailboxCapacityOverrides);
+        scheduler.scheduleAtFixedRate(() -> startingActors
+                        .values()
+                        .forEach (this::consume),
+                1, 1, TimeUnit.SECONDS);
     }
 
     @Override
@@ -66,33 +69,39 @@ public class VTDispatcher implements Dispatcher {
     }
 
     private <T> void consume(Actor<T> actor) {
-        runningActors.computeIfAbsent(actor, ignored -> vtExecutor.submit(() -> {
-            var mailbox = mailboxFor(actor);
-            boolean interrupted = false;
-            T message;
-            int executions = 0;
-            try {
-                while ((message = mailbox.poll()) != null) {
-                    try {
-                        actor.receive(message);
-                    } catch (Exception e) {
-                        actor.onError(message, e);
+        if (actor.isPreStarting()) {
+           startingActors.putIfAbsent(actor.name(), actor);
+        } else {
+            startingActors.remove(actor.name());
+            runningActors.computeIfAbsent(actor, ignored -> vtExecutor.submit(() -> {
+                var mailbox = mailboxFor(actor);
+                boolean interrupted = false;
+                T message;
+                int executions = 0;
+                try {
+                    while ((message = mailbox.poll()) != null) {
+                        try {
+                            actor.receive(message);
+                        } catch (Exception e) {
+                            actor.onError(message, e);
+                        }
+                        // protection against greedy actors, letting others be scheduled
+                        if (++executions >= YIELD_THRESHOLD) {
+                            Thread.yield();
+                            executions = 0;
+                        }
                     }
-                    // protection against greedy actors, letting others be scheduled
-                    if (++executions >= YIELD_THRESHOLD) {
-                        Thread.yield();
-                        executions = 0;
-                    }
+                } catch (BlockingMailbox.MailBoxInterrupted e) {
+                    interrupted = true;
                 }
-            } catch (BlockingMailbox.MailBoxInterrupted e) {
-                interrupted = true;
-            }
-            runningActors.remove(actor);
-            // Double-check for messages that raced in after the loop exited.
-            if (!interrupted && mailbox.size() > 0) {
-                consume(actor);
-            }
-        }));
+                runningActors.remove(actor);
+                // Double-check for messages that raced in after the loop exited.
+                if (!interrupted && mailbox.size() > 0) {
+                    consume(actor);
+                }
+            }));
+        }
+
     }
 
     @Override
@@ -100,6 +109,15 @@ public class VTDispatcher implements Dispatcher {
         Optional.ofNullable(runningActors.get(actor)).ifPresent(f -> f.cancel(true));
         Mailbox<?> mb = mailboxes.remove(actor.name());
         if (mb != null) mb.clear();
+    }
+
+    @Override
+    public void stop() {
+        runningActors.values().forEach(f -> f.cancel(true));
+        runningActors.clear();
+        mailboxes.clear();
+        scheduler.shutdown();
+        vtExecutor.shutdown();
     }
 
     private <T> Mailbox<T> mailboxFor(Actor<T> actor) {

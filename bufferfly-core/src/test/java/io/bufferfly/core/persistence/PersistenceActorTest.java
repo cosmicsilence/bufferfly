@@ -7,10 +7,6 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
-import java.sql.Connection;
-import java.sql.DriverManager;
-import java.sql.SQLException;
-import java.sql.Statement;
 import java.time.Duration;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
@@ -57,14 +53,15 @@ class PersistenceActorTest {
         operations = new TweetTransactionalOperations(jdbcUrl, "SA", "");
         operations.createTableIfNotExists();
 
-        BatchingPersistenceRunner.Config config = new BatchingPersistenceRunner.Config(
+        PersistenceConfig<Tweet> config = new PersistenceConfig<>(
+                operations,
                 500,  // batch size
                 20L,  // 20ms timeout
                 3     // 3 retries
         );
-        runner = new BatchingPersistenceRunner<>(operations, config);
 
-        actor = new TweeterActor("tweeter-" + UUID.randomUUID(), runner);
+        actor = new TweeterActor("tweeter-" + UUID.randomUUID(), config);
+        runner = (BatchingPersistenceRunner<Tweet>) actor.runner();
         manager = new ActorManager();
         actorRef = manager.start(actor);
     }
@@ -90,13 +87,14 @@ class PersistenceActorTest {
         actorRef.tell(tweet);
 
         await().atMost(Duration.ofSeconds(5))
-               .untilAsserted(() -> {
-                   assertEquals(1, actor.getReceiveCount());
-                   assertEquals(1, operations.countTweets());
-                   Tweet saved = operations.findTweetById("tweet-1");
-                   assertNotNull(saved);
-                   assertEquals("Hello Bufferfly!", saved.text());
-               });
+                .untilAsserted(() -> {
+                    assertEquals(1, actor.getReceiveCount());
+                    assertEquals(1, operations.countTweets());
+                    Tweet saved = operations.findTweetById("tweet-1");
+                    assertEquals(1, actor.countSideEffects());
+                    assertNotNull(saved);
+                    assertEquals("Hello Bufferfly!", saved.text());
+                });
     }
 
     // -----------------------------------------------------------------------
@@ -110,13 +108,14 @@ class PersistenceActorTest {
         actorRef.tell(new Tweet("tweet-3", "Third tweet"));
 
         await().atMost(Duration.ofSeconds(5))
-               .untilAsserted(() -> {
-                   assertEquals(3, actor.getReceiveCount());
-                   assertEquals(3, operations.countTweets());
-                   assertNotNull(operations.findTweetById("tweet-1"));
-                   assertNotNull(operations.findTweetById("tweet-2"));
-                   assertNotNull(operations.findTweetById("tweet-3"));
-               });
+                .untilAsserted(() -> {
+                    assertEquals(3, actor.getReceiveCount());
+                    assertEquals(3, operations.countTweets());
+                    assertEquals(3, actor.countSideEffects());
+                    assertNotNull(operations.findTweetById("tweet-1"));
+                    assertNotNull(operations.findTweetById("tweet-2"));
+                    assertNotNull(operations.findTweetById("tweet-3"));
+                });
     }
 
     // -----------------------------------------------------------------------
@@ -144,30 +143,32 @@ class PersistenceActorTest {
 
         // The poison pill must be isolated to onPoisonPill, while valid tweets are persisted
         await().atMost(Duration.ofSeconds(5))
-               .untilAsserted(() -> {
-                   assertEquals(4, actor.getReceiveCount());
-                   // Valid tweets (valid1, valid2, valid3) must be in the DB
-                   assertEquals(3, operations.countTweets(), "Only the 3 valid tweets should be in DB");
-                   assertNotNull(operations.findTweetById("valid-1"));
-                   assertNotNull(operations.findTweetById("valid-2"));
-                   assertNotNull(operations.findTweetById("valid-3"));
-                   assertNull(operations.findTweetById("poison-1"));
+                .untilAsserted(() -> {
+                    assertEquals(4, actor.getReceiveCount());
+                    // Valid tweets (valid1, valid2, valid3) must be in the DB
+                    assertEquals(3, operations.countTweets(), "Only the 3 valid tweets should be in DB");
+                    assertEquals(3, actor.countSideEffects());
+                    assertNotNull(operations.findTweetById("valid-1"));
+                    assertNotNull(operations.findTweetById("valid-2"));
+                    assertNotNull(operations.findTweetById("valid-3"));
+                    assertNull(operations.findTweetById("poison-1"));
 
-                   // Poison pill recorded
-                   assertEquals(1, operations.getPoisonPills().size(), "Poison pill count mismatch");
-                   assertEquals("poison-1", operations.getPoisonPills().get(0).id());
-                   assertEquals(101, operations.getPoisonPills().get(0).text().length());
-                   assertFalse(operations.getPoisonPillCauses().isEmpty());
-               });
+                    // Poison pill recorded
+                    assertEquals(1, operations.getPoisonPills().size(), "Poison pill count mismatch");
+                    assertEquals("poison-1", operations.getPoisonPills().get(0).id());
+                    assertEquals(101, operations.getPoisonPills().get(0).text().length());
+                    assertFalse(operations.getPoisonPillCauses().isEmpty());
+                });
 
         // Verify the actor and persistence runner continue operating normally after the poison pill
         actorRef.tell(new Tweet("subsequent", "I am alive after the poison pill"));
 
         await().atMost(Duration.ofSeconds(5))
-               .untilAsserted(() -> {
-                   assertEquals(4, operations.countTweets());
-                   assertNotNull(operations.findTweetById("subsequent"));
-               });
+                .untilAsserted(() -> {
+                    assertEquals(4, operations.countTweets());
+                    assertEquals(4, actor.countSideEffects());
+                    assertNotNull(operations.findTweetById("subsequent"));
+                });
     }
 
     // -----------------------------------------------------------------------
@@ -182,21 +183,21 @@ class PersistenceActorTest {
         actorRef.tell(poison);
 
         await().atMost(Duration.ofSeconds(5))
-               .untilAsserted(() -> {
-                   assertEquals(1, actor.getReceiveCount());
-                   assertEquals(0, operations.countTweets());
-                   assertEquals(1, operations.getPoisonPills().size());
-                   assertEquals("alone-poison", operations.getPoisonPills().get(0).id());
-               });
+                .untilAsserted(() -> {
+                    assertEquals(1, actor.getReceiveCount());
+                    assertEquals(0, operations.countTweets());
+                    assertEquals(1, operations.getPoisonPills().size());
+                    assertEquals("alone-poison", operations.getPoisonPills().get(0).id());
+                });
 
         // Verify actor can still accept and persist good messages
         actorRef.tell(new Tweet("recovery", "Working after standalone poison pill"));
 
         await().atMost(Duration.ofSeconds(5))
-               .untilAsserted(() -> {
-                   assertEquals(1, operations.countTweets());
-                   assertNotNull(operations.findTweetById("recovery"));
-               });
+                .untilAsserted(() -> {
+                    assertEquals(1, operations.countTweets());
+                    assertNotNull(operations.findTweetById("recovery"));
+                });
     }
 
     // -----------------------------------------------------------------------
@@ -234,11 +235,11 @@ class PersistenceActorTest {
         assertTrue(finished, "Senders did not complete in time");
 
         await().atMost(Duration.ofSeconds(20))
-               .untilAsserted(() -> {
-                   assertEquals(TOTAL_TWEETS, actor.getReceiveCount(), "Actor receive count mismatch");
-                   assertEquals(TOTAL_TWEETS, operations.countTweets(), "DB tweet count mismatch");
-                   assertEquals(0, operations.getPoisonPills().size(), "There should be no poison pills");
-               });
+                .untilAsserted(() -> {
+                    assertEquals(TOTAL_TWEETS, actor.getReceiveCount(), "Actor receive count mismatch");
+                    assertEquals(TOTAL_TWEETS, operations.countTweets(), "DB tweet count mismatch");
+                    assertEquals(0, operations.getPoisonPills().size(), "There should be no poison pills");
+                });
     }
 
     // -----------------------------------------------------------------------
@@ -250,12 +251,12 @@ class PersistenceActorTest {
         actorRef.tell(new Tweet("life-1", "Lifecycle test"));
 
         await().atMost(Duration.ofSeconds(5))
-               .untilAsserted(() -> assertEquals(1, operations.countTweets()));
+                .untilAsserted(() -> assertEquals(1, operations.countTweets()));
 
         actorRef.stop();
 
         assertFalse(actor.isStarted(), "Actor should be marked stopped");
         // Verify runner throws IllegalStateException if new items are enqueued after stop
-        assertThrows(IllegalStateException.class, () -> runner.enqueue(new Tweet("illegal", "test")));
+        assertThrows(IllegalStateException.class, () -> runner.enqueue(PersistenceRunner.newEvent(new Tweet("illegal", "test"))));
     }
 }

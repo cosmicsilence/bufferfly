@@ -90,14 +90,16 @@ class PersistenceActorDatabaseUnavailableTest {
         unrecoverableHookCalled = new AtomicBoolean(false);
 
         // Configure runner with 8 retries to allow ample window for transient recovery
-        BatchingPersistenceRunner.Config config = new BatchingPersistenceRunner.Config(
+        PersistenceConfig<Tweet> config = new PersistenceConfig<>(
+                operations,
                 100,  // batch size
                 20L,  // 20ms timeout
-                8     // max retries on TransientException
+                8,    // max retries on TransientException
+                () -> unrecoverableHookCalled.set(true)
         );
 
-        runner = new BatchingPersistenceRunner<>(operations, config, () -> unrecoverableHookCalled.set(true));
-        actor = new TweeterActor("tweeter-resilience-" + UUID.randomUUID(), runner);
+        actor = new TweeterActor("tweeter-resilience-" + UUID.randomUUID(), config);
+        runner = (BatchingPersistenceRunner<Tweet>) actor.runner();
         manager = new ActorManager();
         actorRef = manager.start(actor);
     }
@@ -234,17 +236,16 @@ class PersistenceActorDatabaseUnavailableTest {
     @Test
     void should_exhaustRetriesAndCallUnrecoverable_when_databaseNeverRestores() {
         // Fast retries configuration
-        BatchingPersistenceRunner.Config fastConfig = new BatchingPersistenceRunner.Config(
+        AtomicBoolean unrecoverableTriggered = new AtomicBoolean(false);
+        PersistenceConfig<Tweet> fastConfig = new PersistenceConfig<>(
+                operations,
                 10,   // batch size
                 10L,  // 10ms timeout
-                2     // only 2 retries
+                2,    // only 2 retries
+                () -> unrecoverableTriggered.set(true)
         );
 
-        AtomicBoolean unrecoverableTriggered = new AtomicBoolean(false);
-        BatchingPersistenceRunner<Tweet> fastRunner = new BatchingPersistenceRunner<>(
-                operations, fastConfig, () -> unrecoverableTriggered.set(true));
-
-        TweeterActor exhaustActor = new TweeterActor("exhaust-actor", fastRunner);
+        TweeterActor exhaustActor = new TweeterActor("exhaust-actor", fastConfig);
         ActorReference<Tweet> exhaustRef = manager.start(exhaustActor);
 
         // Close crusher permanently

@@ -120,6 +120,13 @@ public class SpinningActorDispatcher implements Dispatcher {
         if (mb != null) mb.clear();
     }
 
+    @Override
+    public void stop() {
+        cpuBoundThreads.values().forEach(SpinningThread::halt);
+        cpuBoundThreads.clear();
+        mailboxes.clear();
+    }
+
     private <T> Mailbox<T> mailboxFor(Actor<T> actor) {
         return (Mailbox<T>) mailboxes.computeIfAbsent(actor.name(), name ->
                 new MpscMailbox<>(config.mailboxCapacity())

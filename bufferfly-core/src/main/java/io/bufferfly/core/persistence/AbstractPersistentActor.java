@@ -27,15 +27,20 @@ import io.bufferfly.core.actor.AbstractActor;
  * <pre>{@code
  * public class PaymentActor extends AbstractPersistentActor<KafkaEvent, PaymentRecord> {
  *
- *     public PaymentActor(PersistenceRunner<PaymentRecord> runner) {
- *         super(runner);
+ *     public PaymentActor(PersistenceConfig<PaymentRecord> config) {
+ *         super(config);
  *     }
  *
  *     \@Override public String name() { return "payment-actor"; }
  *
  *     \@Override
- *     public PaymentRecord apply(KafkaEvent event) {
- *         return new PaymentRecord(event.id(), event.amount());
+ *     public PersistenceRunner.PersistenceEvent<PaymentRecord> apply(KafkaEvent event) {
+ *         return PersistenceRunner.newEvent(new PaymentRecord(event.id(), event.amount()));
+ *     }
+ *
+ *     \@Override
+ *     public PersistenceRunner.SideEffectProcessor process() {
+ *         return sideEffect -> { /* process side-effects *\/ };
  *     }
  *
  *     \@Override
@@ -50,10 +55,26 @@ public abstract class AbstractPersistentActor<T, E> extends AbstractActor<T> {
 
     private final PersistenceRunner<E> runner;
 
+    protected AbstractPersistentActor(PersistenceConfig<E> config) {
+        if (config == null) throw new NullPointerException("config must not be null");
+        this.runner = config.instantiate(sideEffect -> {
+            PersistenceRunner.SideEffectProcessor processor = process();
+            if (processor != null) {
+                processor.process(sideEffect);
+            }
+        });
+    }
+
     protected AbstractPersistentActor(PersistenceRunner<E> runner) {
         if (runner == null) throw new NullPointerException("runner must not be null");
         this.runner = runner;
     }
+
+    /**
+     * Wise man says -- You should not change actor state during sideEffects
+     * @return method to process sideEffects
+     */
+    protected abstract PersistenceRunner.SideEffectProcessor process();
 
     /**
      * Transforms an incoming message into a persistence event.
@@ -64,7 +85,7 @@ public abstract class AbstractPersistentActor<T, E> extends AbstractActor<T> {
      * @param message the message received by this actor
      * @return the persistence event to enqueue; must not be {@code null}
      */
-    public abstract E apply(T message);
+    public abstract PersistenceRunner.PersistenceEvent<E> apply(T message);
 
     /**
      * Calls {@link #apply} then enqueues the result with the runner.
@@ -78,7 +99,7 @@ public abstract class AbstractPersistentActor<T, E> extends AbstractActor<T> {
     /**
      * Returns the underlying {@link PersistenceRunner}.
      */
-    protected PersistenceRunner<E> runner() {
+    public PersistenceRunner<E> runner() {
         return runner;
     }
 

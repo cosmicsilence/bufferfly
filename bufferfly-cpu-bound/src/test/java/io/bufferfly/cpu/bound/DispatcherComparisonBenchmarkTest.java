@@ -1,8 +1,9 @@
 package io.bufferfly.cpu.bound;
 
-import io.bufferfly.core.actor.AbstractActor;
-import io.bufferfly.core.actor.Dispatcher;
-import io.bufferfly.core.actor.VTDispatcher;
+import io.bufferfly.core.actor.*;
+import io.bufferfly.core.config.BufferflyConfig;
+import io.bufferfly.core.config.BufferflyConfig.ActorOverrideConfig;
+import io.bufferfly.core.config.BufferflyConfig.ActorsConfig;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.slf4j.Logger;
@@ -50,13 +51,22 @@ class DispatcherComparisonBenchmarkTest {
     // Scenario constants
     // -----------------------------------------------------------------------
 
-    private static final int FIREHOSE_TOTAL = 5_000_000;
+    private static final int FIREHOSE_TOTAL = 15_000_000;
     private static final int FIREHOSE_WARMUP = 200_000;
 
     private static final int PING_ROUNDS = 2_000;
     private static final int PING_WARMUP = 200;
     public static final String EOF = "EOF";
-    private static final Logger log = LoggerFactory.getLogger(DispatcherComparisonBenchmarkTest.class);
+    private static final String FIREHOSE_CMP_ACTOR_SP = "firehose-cmp-actor-spinning";
+    private static final String FIREHOSE_CMP_ACTOR_VT = "firehose-cmp-actor-vt";
+    private static final ActorManager manager = new ActorManager(new BufferflyConfig(ActorsConfig
+            .builder()
+            .defaultMailboxCapacity(FIREHOSE_TOTAL)
+            .addOverride(FIREHOSE_CMP_ACTOR_SP, ActorOverrideConfig
+                    .builder()
+                    .dispatcher(SpinningActorDispatcher.class.getName()).build())
+            .build()));
+    public static final String PING_CMP_ACTOR = "ping-cmp-actor";
 
     // -----------------------------------------------------------------------
     // Scenario 1 — High-Throughput Firehose
@@ -70,18 +80,16 @@ class DispatcherComparisonBenchmarkTest {
 
         double[][] spinResults = new double[producerCounts.length][2]; // [durationMs, throughput]
         double[][] vtResults = new double[producerCounts.length][2];
-        SpinningActorDispatcher spinDispatcher = new SpinningActorDispatcher(new SpinningActorDispatcher.Config(FIREHOSE_TOTAL));
-        VTDispatcher vtDispatcher = new VTDispatcher(FIREHOSE_TOTAL);
         // warmup
-        runFirehose(spinDispatcher, 1, FIREHOSE_WARMUP);
-        runFirehose(vtDispatcher, 1, FIREHOSE_WARMUP);
+        runFirehose(FIREHOSE_CMP_ACTOR_SP, 1, FIREHOSE_WARMUP);
+        runFirehose(FIREHOSE_CMP_ACTOR_VT, 1, FIREHOSE_WARMUP);
 
         for (int i = 0; i < producerCounts.length; i++) {
             int producers = producerCounts[i];
 
             // measured
-            spinResults[i] = runFirehose(spinDispatcher, producers, FIREHOSE_TOTAL);
-            vtResults[i] = runFirehose(vtDispatcher, producers, FIREHOSE_TOTAL);
+            spinResults[i] = runFirehose(FIREHOSE_CMP_ACTOR_SP, producers, FIREHOSE_TOTAL);
+            vtResults[i] = runFirehose(FIREHOSE_CMP_ACTOR_VT, producers, FIREHOSE_TOTAL);
         }
 
         // ===================================================================
@@ -111,12 +119,12 @@ class DispatcherComparisonBenchmarkTest {
      *
      * @return {@code double[]{durationMs, throughputMsgPerSec}}
      */
-    private double[] runFirehose(Dispatcher dispatcher, int producers, int total) throws InterruptedException {
+    private double[] runFirehose(String name, int producers, int total) throws InterruptedException {
 
-        System.out.println("Running firehose for dispatcher=%s producers=%d total=%d".formatted(dispatcher.getClass().getSimpleName(),
+        System.out.println("Running firehose for dispatcher=%s producers=%d total=%d".formatted(name,
                 producers, total));
-        LatchCountingActor actor = new LatchCountingActor("firehose-cmp-actor");
-        actor.start();
+        LatchCountingActor actor = new LatchCountingActor(name);
+        final ActorReference<String> actorRef = manager.start(actor);
 
         int perProducer = total / producers;
         int remainder = total % producers;
@@ -133,7 +141,7 @@ class DispatcherComparisonBenchmarkTest {
                     Thread.currentThread().interrupt();
                 }
                 for (int i = 0; i < count; i++) {
-                    dispatcher.dispatch("msg", actor);
+                    actorRef.tell("msg");
                 }
                 producersDone.countDown();
             });
@@ -144,14 +152,12 @@ class DispatcherComparisonBenchmarkTest {
 
         producersDone.await(30, TimeUnit.SECONDS);
 
-        dispatcher.dispatch(EOF, actor);
+        actorRef.tell(EOF);
         actor.awaitCompletion(30, TimeUnit.SECONDS);
 
         long endNs = System.nanoTime();
         assertEquals(total, actor.getReceiveCount(), "100% delivery required for a valid benchmark result");
-
-        if (dispatcher instanceof SpinningActorDispatcher sd) sd.clear(actor);
-        if (dispatcher instanceof VTDispatcher vt) vt.clear(actor);
+        actorRef.stop();
 
         long durationNs = endNs - startNs;
         double durationMs = durationNs / 1_000_000.0;
@@ -201,7 +207,7 @@ class DispatcherComparisonBenchmarkTest {
      */
     private long[] runPing(io.bufferfly.core.actor.Dispatcher dispatcher) throws InterruptedException {
 
-        PingActor actor = new PingActor("ping-cmp-actor");
+        PingActor actor = new PingActor(PING_CMP_ACTOR);
         actor.start();
 
         // warmup

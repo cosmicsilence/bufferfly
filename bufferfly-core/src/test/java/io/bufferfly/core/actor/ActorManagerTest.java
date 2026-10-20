@@ -8,7 +8,9 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -349,5 +351,132 @@ class ActorManagerTest {
         await().atMost(Duration.ofSeconds(30))
                .untilAsserted(() -> assertEquals(BURST, actor.getReceiveCount(),
                    "End-to-end burst not fully delivered"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Scenario 13 — tell during preStart (actor still starting)
+    // -----------------------------------------------------------------------
+
+    @Test
+    void should_deliverMessageEventually_when_actorCallsTellInsidePreStart() throws InterruptedException {
+        CountDownLatch preStartCountDown = new CountDownLatch(1);
+
+        class PreStartTellActor extends AbstractActor<String> {
+            private final String name = "pre-start-tell-" + UUID.randomUUID();
+            private final List<String> received = new CopyOnWriteArrayList<>();
+            private volatile boolean wasPreStarting;
+
+            @Override
+            public String name() {
+                return name;
+            }
+
+            @Override
+            protected void preStart() {
+                wasPreStarting = isPreStarting();
+                self.tell("pre-start-message");
+                preStartCountDown.countDown();
+            }
+
+            @Override
+            public void receive(String message) {
+                received.add(message);
+            }
+
+            @Override
+            public void onError(String message, Exception e) {
+            }
+        }
+
+        PreStartTellActor actor = new PreStartTellActor();
+        manager.start(actor);
+
+        assertTrue(preStartCountDown.await(5, TimeUnit.SECONDS), "preStart should have executed and counted down");
+        assertTrue(actor.wasPreStarting, "Actor should have been in PRE_STARTING state when tell was called");
+
+        await().atMost(Duration.ofSeconds(5))
+               .untilAsserted(() -> assertEquals(List.of("pre-start-message"), actor.received,
+                       "Message sent during preStart must be delivered eventually"));
+    }
+
+    @Test
+    void should_deliverMessagesEventually_when_actorAndExternalCallerTellWhileStarting() throws InterruptedException {
+        CountDownLatch inPreStart = new CountDownLatch(1);
+        CountDownLatch allowPreStartToFinish = new CountDownLatch(1);
+
+        class PausedPreStartActor extends AbstractActor<String> {
+            private final String name = "paused-pre-start-" + UUID.randomUUID();
+            private final List<String> received = new CopyOnWriteArrayList<>();
+
+            @Override
+            public String name() {
+                return name;
+            }
+
+            @Override
+            protected void preStart() {
+                self.tell("actor-msg-during-prestart");
+                inPreStart.countDown();
+                try {
+                    allowPreStartToFinish.await(5, TimeUnit.SECONDS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+
+            @Override
+            public void receive(String message) {
+                received.add(message);
+            }
+
+            @Override
+            public void onError(String message, Exception e) {
+            }
+
+            public ActorReference<String> getSelf() {
+                return self;
+            }
+        }
+
+        PausedPreStartActor actor = new PausedPreStartActor();
+        Thread.ofVirtual().start(() -> manager.start(actor));
+
+        assertTrue(inPreStart.await(5, TimeUnit.SECONDS), "Actor did not enter preStart in time");
+        assertTrue(actor.isPreStarting(), "Actor should be in preStarting state");
+        assertFalse(actor.isStarted(), "Actor should not be marked fully started yet");
+
+        // External caller tells actor while it is still starting
+        actor.getSelf().tell("external-msg-during-prestart");
+
+        // Release preStart to let actor complete its transition to STARTED
+        allowPreStartToFinish.countDown();
+
+        await().atMost(Duration.ofSeconds(5))
+               .untilAsserted(() -> {
+                   assertTrue(actor.isStarted(), "Actor should now be started");
+                   assertEquals(2, actor.received.size(), "Both messages should be delivered");
+                   assertTrue(actor.received.contains("actor-msg-during-prestart"));
+                   assertTrue(actor.received.contains("external-msg-during-prestart"));
+               });
+    }
+
+    @Test
+    void should_throwActorNotStartedException_when_tellCalledOnStoppedActor() {
+        DummyCountingActor actor = new DummyCountingActor("stopped-actor");
+        ActorReference<String> ref = manager.start(actor);
+
+        ref.tell("before-stop");
+        await().atMost(Duration.ofSeconds(5))
+               .untilAsserted(() -> assertEquals(1, actor.getReceiveCount()));
+
+        ref.stop();
+        assertFalse(actor.isStarted(), "Actor should not be started after stop()");
+
+        ActorNotStartedException ex = assertThrows(
+                ActorNotStartedException.class,
+                () -> ref.tell("after-stop")
+        );
+        assertTrue(ex.getMessage().contains("Actor='stopped-actor' is not started"),
+                "Exception message should mention the actor name and not started status");
     }
 }

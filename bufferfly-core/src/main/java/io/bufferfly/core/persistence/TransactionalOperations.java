@@ -7,7 +7,7 @@ import java.util.List;
  * underlying data store.
  *
  * <p>Implementations are called by {@link BatchingPersistenceRunner} on a
- * dedicated virtual thread. Each {@link #run} call wraps one natural batch and
+ * dedicated virtual thread. Each {@link #persistOnTransaction} call wraps one natural batch and
  * should be treated as a single atomic unit of work (e.g. one database
  * transaction, one bulk-insert, or one array-update statement).
  *
@@ -33,7 +33,7 @@ public interface TransactionalOperations<E> {
      * @param batch a non-empty, immutable snapshot of events to persist
      * @throws PersistenceException to signal how the runner should handle a failure
      */
-    void run(List<E> batch);
+    void persistOnTransaction(List<E> batch);
 
     /**
      * Called when an individual element in a batch is identified as a poison
