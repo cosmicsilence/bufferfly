@@ -17,6 +17,7 @@ public class TweeterActor extends AbstractPersistentActor<Tweet, Tweet> {
     private final List<Tweet> errorTweets = Collections.synchronizedList(new ArrayList<>());
     private final List<Exception> errorExceptions = Collections.synchronizedList(new ArrayList<>());
     private final AtomicInteger counterSideEffects = new AtomicInteger();
+    private final List<TweetSideEffect> processedSideEffects = Collections.synchronizedList(new ArrayList<>());
 
     public TweeterActor(String actorName, PersistenceConfig<Tweet> config) {
         super(config);
@@ -40,7 +41,12 @@ public class TweeterActor extends AbstractPersistentActor<Tweet, Tweet> {
 
     @Override
     public PersistenceRunner.SideEffectProcessor process() {
-        return sideEffect -> counterSideEffects.incrementAndGet();
+        return sideEffect -> {
+            counterSideEffects.incrementAndGet();
+            if (sideEffect instanceof TweetSideEffect tse) {
+                processedSideEffects.add(tse);
+            }
+        };
     }
 
     @Override
@@ -54,7 +60,11 @@ public class TweeterActor extends AbstractPersistentActor<Tweet, Tweet> {
         return counterSideEffects.get();
     }
 
-    record TweetSideEffect(Tweet tweet) implements PersistenceRunner.SideEffect {
+    public List<TweetSideEffect> getProcessedSideEffects() {
+        return Collections.unmodifiableList(processedSideEffects);
+    }
+
+    public record TweetSideEffect(Tweet tweet) implements PersistenceRunner.SideEffect {
     }
 
     @Override

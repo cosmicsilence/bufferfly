@@ -132,6 +132,7 @@ class PersistenceActorDatabaseUnavailableTest {
         await().atMost(Duration.ofSeconds(5))
                .untilAsserted(() -> {
                    assertEquals(1, operations.countTweets());
+                   assertEquals(1, actor.countSideEffects());
                    assertNotNull(operations.findTweetById("initial-1"));
                });
 
@@ -151,6 +152,8 @@ class PersistenceActorDatabaseUnavailableTest {
                    // While DB is down, tweets must not be committed yet
                    assertEquals(1, operations.getPersistedCount(),
                            "Outage tweets should not be persisted while DB is down");
+                   assertEquals(1, actor.countSideEffects(),
+                           "No new side effects should run while DB is down");
                });
 
         // 5. Restore the database connection by reopening the crusher proxy
@@ -162,6 +165,8 @@ class PersistenceActorDatabaseUnavailableTest {
                .untilAsserted(() -> {
                    assertEquals(3, operations.countTweets(),
                            "All outage tweets should be committed once DB restored");
+                   assertEquals(3, actor.countSideEffects(),
+                           "All outage tweets should run side effects once DB restored");
                    assertNotNull(operations.findTweetById("outage-1"));
                    assertNotNull(operations.findTweetById("outage-2"));
                    assertFalse(unrecoverableHookCalled.get(),
@@ -174,6 +179,7 @@ class PersistenceActorDatabaseUnavailableTest {
         await().atMost(Duration.ofSeconds(5))
                .untilAsserted(() -> {
                    assertEquals(4, operations.countTweets());
+                   assertEquals(4, actor.countSideEffects());
                    assertNotNull(operations.findTweetById("post-outage"));
                });
     }
@@ -261,6 +267,8 @@ class PersistenceActorDatabaseUnavailableTest {
                            "TransientException should be caught on retries");
                    assertTrue(unrecoverableTriggered.get(),
                            "onUnrecoverable hook must be invoked after exhausting retries");
+                   assertEquals(0, exhaustActor.countSideEffects(),
+                           "No side effect must run when database failure exhausts retries");
                });
 
         exhaustRef.stop();

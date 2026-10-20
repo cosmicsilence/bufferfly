@@ -6,7 +6,9 @@ import java.util.concurrent.*;
 
 public class VTDispatcher implements Dispatcher {
 
-    /** Default mailbox capacity used when no per-actor override is present. */
+    /**
+     * Default mailbox capacity used when no per-actor override is present.
+     */
     private final int defaultMailboxCapacity;
 
     /**
@@ -22,15 +24,19 @@ public class VTDispatcher implements Dispatcher {
     private final ExecutorService vtExecutor = Executors.newVirtualThreadPerTaskExecutor();
     private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
     private final Map<Actor<?>, Future<?>> runningActors = new ConcurrentHashMap<>();
-    private final Map<String, Mailbox<?>>  mailboxes     = new ConcurrentHashMap<>();
-    private final Map<String, Actor<?>> startingActors = new ConcurrentHashMap<>();
+    private final Map<String, Mailbox<?>> mailboxes = new ConcurrentHashMap<>();
+    private final Map<String, ScheduledFuture<?>> startingTasks = new ConcurrentHashMap<>();
 
-    /** Creates a dispatcher with the built-in default capacity (20 000). */
+    /**
+     * Creates a dispatcher with the built-in default capacity (20 000).
+     */
     public VTDispatcher() {
         this(20_000, Map.of());
     }
 
-    /** Creates a dispatcher with a custom default capacity and no per-actor overrides. */
+    /**
+     * Creates a dispatcher with a custom default capacity and no per-actor overrides.
+     */
     public VTDispatcher(int defaultMailboxCapacity) {
         this(defaultMailboxCapacity, Map.of());
     }
@@ -39,20 +45,16 @@ public class VTDispatcher implements Dispatcher {
      * Creates a dispatcher with a custom default capacity and per-actor mailbox
      * capacity overrides.
      *
-     * @param defaultMailboxCapacity default capacity for actors without an override
+     * @param defaultMailboxCapacity   default capacity for actors without an override
      * @param mailboxCapacityOverrides map of actor-name → capacity; may be empty
      */
     public VTDispatcher(int defaultMailboxCapacity, Map<String, Integer> mailboxCapacityOverrides) {
         if (defaultMailboxCapacity <= 0) {
             throw new IllegalArgumentException(
-                "defaultMailboxCapacity must be > 0, got: " + defaultMailboxCapacity);
+                    "defaultMailboxCapacity must be > 0, got: " + defaultMailboxCapacity);
         }
-        this.defaultMailboxCapacity    = defaultMailboxCapacity;
-        this.mailboxCapacityOverrides  = Map.copyOf(mailboxCapacityOverrides);
-        scheduler.scheduleAtFixedRate(() -> startingActors
-                        .values()
-                        .forEach (this::consume),
-                1, 1, TimeUnit.SECONDS);
+        this.defaultMailboxCapacity = defaultMailboxCapacity;
+        this.mailboxCapacityOverrides = Map.copyOf(mailboxCapacityOverrides);
     }
 
     @Override
@@ -61,7 +63,7 @@ public class VTDispatcher implements Dispatcher {
             final var accepted = mailboxFor(actor).offer(t);
             if (!accepted) {
                 throw new IllegalStateException(
-                    "Mailbox refused for the actor.name=%s".formatted(actor.name()));
+                        "Mailbox refused for the actor.name=%s".formatted(actor.name()));
             }
         } finally {
             consume(actor);
@@ -70,9 +72,9 @@ public class VTDispatcher implements Dispatcher {
 
     private <T> void consume(Actor<T> actor) {
         if (actor.isPreStarting()) {
-           startingActors.putIfAbsent(actor.name(), actor);
+            Runnable runnable = () -> consume(actor);
+            startingTasks.putIfAbsent(actor.name(), scheduler.schedule(runnable, 50, TimeUnit.MILLISECONDS));
         } else {
-            startingActors.remove(actor.name());
             runningActors.computeIfAbsent(actor, ignored -> vtExecutor.submit(() -> {
                 var mailbox = mailboxFor(actor);
                 boolean interrupted = false;
