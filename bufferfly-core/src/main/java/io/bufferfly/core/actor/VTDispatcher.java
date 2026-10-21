@@ -2,14 +2,13 @@ package io.bufferfly.core.actor;
 
 import java.util.Map;
 import java.util.Optional;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
+import java.util.concurrent.*;
 
 public class VTDispatcher implements Dispatcher {
 
-    /** Default mailbox capacity used when no per-actor override is present. */
+    /**
+     * Default mailbox capacity used when no per-actor override is present.
+     */
     private final int defaultMailboxCapacity;
 
     /**
@@ -23,15 +22,20 @@ public class VTDispatcher implements Dispatcher {
     public static final int YIELD_THRESHOLD = 32;
 
     private final ExecutorService vtExecutor = Executors.newVirtualThreadPerTaskExecutor();
+    private final PreStartBuffer preStartBuffer = new PreStartBuffer();
     private final Map<Actor<?>, Future<?>> runningActors = new ConcurrentHashMap<>();
-    private final Map<String, Mailbox<?>>  mailboxes     = new ConcurrentHashMap<>();
+    private final Map<String, Mailbox<?>> mailboxes = new ConcurrentHashMap<>();
 
-    /** Creates a dispatcher with the built-in default capacity (20 000). */
+    /**
+     * Creates a dispatcher with the built-in default capacity (20 000).
+     */
     public VTDispatcher() {
         this(20_000, Map.of());
     }
 
-    /** Creates a dispatcher with a custom default capacity and no per-actor overrides. */
+    /**
+     * Creates a dispatcher with a custom default capacity and no per-actor overrides.
+     */
     public VTDispatcher(int defaultMailboxCapacity) {
         this(defaultMailboxCapacity, Map.of());
     }
@@ -40,16 +44,16 @@ public class VTDispatcher implements Dispatcher {
      * Creates a dispatcher with a custom default capacity and per-actor mailbox
      * capacity overrides.
      *
-     * @param defaultMailboxCapacity default capacity for actors without an override
+     * @param defaultMailboxCapacity   default capacity for actors without an override
      * @param mailboxCapacityOverrides map of actor-name → capacity; may be empty
      */
     public VTDispatcher(int defaultMailboxCapacity, Map<String, Integer> mailboxCapacityOverrides) {
         if (defaultMailboxCapacity <= 0) {
             throw new IllegalArgumentException(
-                "defaultMailboxCapacity must be > 0, got: " + defaultMailboxCapacity);
+                    "defaultMailboxCapacity must be > 0, got: " + defaultMailboxCapacity);
         }
-        this.defaultMailboxCapacity    = defaultMailboxCapacity;
-        this.mailboxCapacityOverrides  = Map.copyOf(mailboxCapacityOverrides);
+        this.defaultMailboxCapacity = defaultMailboxCapacity;
+        this.mailboxCapacityOverrides = Map.copyOf(mailboxCapacityOverrides);
     }
 
     @Override
@@ -58,7 +62,7 @@ public class VTDispatcher implements Dispatcher {
             final var accepted = mailboxFor(actor).offer(t);
             if (!accepted) {
                 throw new IllegalStateException(
-                    "Mailbox refused for the actor.name=%s".formatted(actor.name()));
+                        "Mailbox refused for the actor.name=%s".formatted(actor.name()));
             }
         } finally {
             consume(actor);
@@ -66,33 +70,34 @@ public class VTDispatcher implements Dispatcher {
     }
 
     private <T> void consume(Actor<T> actor) {
+        if (preStartBuffer.bufferIfPreStarting(actor, () -> consume(actor))) return;
         runningActors.computeIfAbsent(actor, ignored -> vtExecutor.submit(() -> {
-            var mailbox = mailboxFor(actor);
-            boolean interrupted = false;
-            T message;
-            int executions = 0;
-            try {
-                while ((message = mailbox.poll()) != null) {
-                    try {
-                        actor.receive(message);
-                    } catch (Exception e) {
-                        actor.onError(message, e);
+                var mailbox = mailboxFor(actor);
+                boolean interrupted = false;
+                T message;
+                int executions = 0;
+                try {
+                    while ((message = mailbox.poll()) != null) {
+                        try {
+                            actor.receive(message);
+                        } catch (Exception e) {
+                            actor.onError(message, e);
+                        }
+                        // protection against greedy actors, letting others be scheduled
+                        if (++executions >= YIELD_THRESHOLD) {
+                            Thread.yield();
+                            executions = 0;
+                        }
                     }
-                    // protection against greedy actors, letting others be scheduled
-                    if (++executions >= YIELD_THRESHOLD) {
-                        Thread.yield();
-                        executions = 0;
-                    }
+                } catch (BlockingMailbox.MailBoxInterrupted e) {
+                    interrupted = true;
                 }
-            } catch (BlockingMailbox.MailBoxInterrupted e) {
-                interrupted = true;
-            }
-            runningActors.remove(actor);
-            // Double-check for messages that raced in after the loop exited.
-            if (!interrupted && mailbox.size() > 0) {
-                consume(actor);
-            }
-        }));
+                runningActors.remove(actor);
+                // Double-check for messages that raced in after the loop exited.
+                if (!interrupted && mailbox.size() > 0) {
+                    consume(actor);
+                }
+            }));
     }
 
     @Override
@@ -100,6 +105,15 @@ public class VTDispatcher implements Dispatcher {
         Optional.ofNullable(runningActors.get(actor)).ifPresent(f -> f.cancel(true));
         Mailbox<?> mb = mailboxes.remove(actor.name());
         if (mb != null) mb.clear();
+    }
+
+    @Override
+    public void stop() {
+        runningActors.values().forEach(f -> f.cancel(true));
+        runningActors.clear();
+        mailboxes.clear();
+        preStartBuffer.stop();
+        vtExecutor.shutdown();
     }
 
     private <T> Mailbox<T> mailboxFor(Actor<T> actor) {

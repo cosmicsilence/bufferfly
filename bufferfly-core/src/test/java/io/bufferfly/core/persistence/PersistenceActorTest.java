@@ -1,5 +1,6 @@
 package io.bufferfly.core.persistence;
 
+import io.bufferfly.core.actor.Actor;
 import io.bufferfly.core.actor.ActorManager;
 import io.bufferfly.core.actor.ActorReference;
 import org.junit.jupiter.api.AfterEach;
@@ -7,14 +8,12 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
-import java.sql.Connection;
-import java.sql.DriverManager;
-import java.sql.SQLException;
-import java.sql.Statement;
 import java.time.Duration;
+import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.*;
@@ -57,14 +56,15 @@ class PersistenceActorTest {
         operations = new TweetTransactionalOperations(jdbcUrl, "SA", "");
         operations.createTableIfNotExists();
 
-        BatchingPersistenceRunner.Config config = new BatchingPersistenceRunner.Config(
+        PersistenceConfig<Tweet> config = new PersistenceConfig<>(
+                operations,
                 500,  // batch size
                 20L,  // 20ms timeout
                 3     // 3 retries
         );
-        runner = new BatchingPersistenceRunner<>(operations, config);
 
-        actor = new TweeterActor("tweeter-" + UUID.randomUUID(), runner);
+        actor = new TweeterActor("tweeter-" + UUID.randomUUID(), config);
+        runner = (BatchingPersistenceRunner<Tweet>) actor.runner();
         manager = new ActorManager();
         actorRef = manager.start(actor);
     }
@@ -90,13 +90,14 @@ class PersistenceActorTest {
         actorRef.tell(tweet);
 
         await().atMost(Duration.ofSeconds(5))
-               .untilAsserted(() -> {
-                   assertEquals(1, actor.getReceiveCount());
-                   assertEquals(1, operations.countTweets());
-                   Tweet saved = operations.findTweetById("tweet-1");
-                   assertNotNull(saved);
-                   assertEquals("Hello Bufferfly!", saved.text());
-               });
+                .untilAsserted(() -> {
+                    assertEquals(1, actor.getReceiveCount());
+                    assertEquals(1, operations.countTweets());
+                    Tweet saved = operations.findTweetById("tweet-1");
+                    assertEquals(1, actor.countSideEffects());
+                    assertNotNull(saved);
+                    assertEquals("Hello Bufferfly!", saved.text());
+                });
     }
 
     // -----------------------------------------------------------------------
@@ -110,13 +111,14 @@ class PersistenceActorTest {
         actorRef.tell(new Tweet("tweet-3", "Third tweet"));
 
         await().atMost(Duration.ofSeconds(5))
-               .untilAsserted(() -> {
-                   assertEquals(3, actor.getReceiveCount());
-                   assertEquals(3, operations.countTweets());
-                   assertNotNull(operations.findTweetById("tweet-1"));
-                   assertNotNull(operations.findTweetById("tweet-2"));
-                   assertNotNull(operations.findTweetById("tweet-3"));
-               });
+                .untilAsserted(() -> {
+                    assertEquals(3, actor.getReceiveCount());
+                    assertEquals(3, operations.countTweets());
+                    assertEquals(3, actor.countSideEffects());
+                    assertNotNull(operations.findTweetById("tweet-1"));
+                    assertNotNull(operations.findTweetById("tweet-2"));
+                    assertNotNull(operations.findTweetById("tweet-3"));
+                });
     }
 
     // -----------------------------------------------------------------------
@@ -144,30 +146,32 @@ class PersistenceActorTest {
 
         // The poison pill must be isolated to onPoisonPill, while valid tweets are persisted
         await().atMost(Duration.ofSeconds(5))
-               .untilAsserted(() -> {
-                   assertEquals(4, actor.getReceiveCount());
-                   // Valid tweets (valid1, valid2, valid3) must be in the DB
-                   assertEquals(3, operations.countTweets(), "Only the 3 valid tweets should be in DB");
-                   assertNotNull(operations.findTweetById("valid-1"));
-                   assertNotNull(operations.findTweetById("valid-2"));
-                   assertNotNull(operations.findTweetById("valid-3"));
-                   assertNull(operations.findTweetById("poison-1"));
+                .untilAsserted(() -> {
+                    assertEquals(4, actor.getReceiveCount());
+                    // Valid tweets (valid1, valid2, valid3) must be in the DB
+                    assertEquals(3, operations.countTweets(), "Only the 3 valid tweets should be in DB");
+                    assertEquals(3, actor.countSideEffects());
+                    assertNotNull(operations.findTweetById("valid-1"));
+                    assertNotNull(operations.findTweetById("valid-2"));
+                    assertNotNull(operations.findTweetById("valid-3"));
+                    assertNull(operations.findTweetById("poison-1"));
 
-                   // Poison pill recorded
-                   assertEquals(1, operations.getPoisonPills().size(), "Poison pill count mismatch");
-                   assertEquals("poison-1", operations.getPoisonPills().get(0).id());
-                   assertEquals(101, operations.getPoisonPills().get(0).text().length());
-                   assertFalse(operations.getPoisonPillCauses().isEmpty());
-               });
+                    // Poison pill recorded
+                    assertEquals(1, operations.getPoisonPills().size(), "Poison pill count mismatch");
+                    assertEquals("poison-1", operations.getPoisonPills().get(0).id());
+                    assertEquals(101, operations.getPoisonPills().get(0).text().length());
+                    assertFalse(operations.getPoisonPillCauses().isEmpty());
+                });
 
         // Verify the actor and persistence runner continue operating normally after the poison pill
         actorRef.tell(new Tweet("subsequent", "I am alive after the poison pill"));
 
         await().atMost(Duration.ofSeconds(5))
-               .untilAsserted(() -> {
-                   assertEquals(4, operations.countTweets());
-                   assertNotNull(operations.findTweetById("subsequent"));
-               });
+                .untilAsserted(() -> {
+                    assertEquals(4, operations.countTweets());
+                    assertEquals(4, actor.countSideEffects());
+                    assertNotNull(operations.findTweetById("subsequent"));
+                });
     }
 
     // -----------------------------------------------------------------------
@@ -182,21 +186,23 @@ class PersistenceActorTest {
         actorRef.tell(poison);
 
         await().atMost(Duration.ofSeconds(5))
-               .untilAsserted(() -> {
-                   assertEquals(1, actor.getReceiveCount());
-                   assertEquals(0, operations.countTweets());
-                   assertEquals(1, operations.getPoisonPills().size());
-                   assertEquals("alone-poison", operations.getPoisonPills().get(0).id());
-               });
+                .untilAsserted(() -> {
+                    assertEquals(1, actor.getReceiveCount());
+                    assertEquals(0, operations.countTweets());
+                    assertEquals(0, actor.countSideEffects(), "Poison pill alone must NOT execute side effects");
+                    assertEquals(1, operations.getPoisonPills().size());
+                    assertEquals("alone-poison", operations.getPoisonPills().get(0).id());
+                });
 
         // Verify actor can still accept and persist good messages
         actorRef.tell(new Tweet("recovery", "Working after standalone poison pill"));
 
         await().atMost(Duration.ofSeconds(5))
-               .untilAsserted(() -> {
-                   assertEquals(1, operations.countTweets());
-                   assertNotNull(operations.findTweetById("recovery"));
-               });
+                .untilAsserted(() -> {
+                    assertEquals(1, operations.countTweets());
+                    assertEquals(1, actor.countSideEffects(), "Subsequent valid message must execute side effect");
+                    assertNotNull(operations.findTweetById("recovery"));
+                });
     }
 
     // -----------------------------------------------------------------------
@@ -234,11 +240,12 @@ class PersistenceActorTest {
         assertTrue(finished, "Senders did not complete in time");
 
         await().atMost(Duration.ofSeconds(20))
-               .untilAsserted(() -> {
-                   assertEquals(TOTAL_TWEETS, actor.getReceiveCount(), "Actor receive count mismatch");
-                   assertEquals(TOTAL_TWEETS, operations.countTweets(), "DB tweet count mismatch");
-                   assertEquals(0, operations.getPoisonPills().size(), "There should be no poison pills");
-               });
+                .untilAsserted(() -> {
+                    assertEquals(TOTAL_TWEETS, actor.getReceiveCount(), "Actor receive count mismatch");
+                    assertEquals(TOTAL_TWEETS, operations.countTweets(), "DB tweet count mismatch");
+                    assertEquals(TOTAL_TWEETS, actor.countSideEffects(), "All successfully persisted tweets must run side effects");
+                    assertEquals(0, operations.getPoisonPills().size(), "There should be no poison pills");
+                });
     }
 
     // -----------------------------------------------------------------------
@@ -250,12 +257,223 @@ class PersistenceActorTest {
         actorRef.tell(new Tweet("life-1", "Lifecycle test"));
 
         await().atMost(Duration.ofSeconds(5))
-               .untilAsserted(() -> assertEquals(1, operations.countTweets()));
+                .untilAsserted(() -> assertEquals(1, operations.countTweets()));
 
         actorRef.stop();
 
-        assertFalse(actor.isStarted(), "Actor should be marked stopped");
+        assertEquals(actor.currentState(), Actor.State.STOPPED);
         // Verify runner throws IllegalStateException if new items are enqueued after stop
-        assertThrows(IllegalStateException.class, () -> runner.enqueue(new Tweet("illegal", "test")));
+        assertThrows(IllegalStateException.class, () -> runner.enqueue(PersistenceRunner.newEvent(new Tweet("illegal", "test"))));
+    }
+
+    // -----------------------------------------------------------------------
+    // Scenario 7 — When persistence throws UnrecoverableException, no side effects run
+    // -----------------------------------------------------------------------
+
+    @Test
+    void should_notRunSideEffects_when_persistenceThrowsUnrecoverableException() {
+        AtomicBoolean unrecoverableCalled = new AtomicBoolean(false);
+        TransactionalOperations<Tweet> failingOps = new TransactionalOperations<>() {
+            @Override
+            public void persistOnTransaction(List<Tweet> batch) {
+                throw new UnrecoverableException("Fatal database corruption");
+            }
+
+            @Override
+            public void onPoisonPill(Tweet event, Exception cause) {
+            }
+        };
+
+        PersistenceConfig<Tweet> failingConfig = new PersistenceConfig<>(
+                failingOps,
+                10,
+                10L,
+                1,
+                () -> unrecoverableCalled.set(true)
+        );
+
+        TweeterActor failingActor = new TweeterActor("fatal-actor-" + UUID.randomUUID(), failingConfig);
+        ActorReference<Tweet> ref = manager.start(failingActor);
+
+        ref.tell(new Tweet("fatal-1", "This will fail unrecoverably"));
+
+        await().atMost(Duration.ofSeconds(5))
+                .untilAsserted(() -> {
+                    assertTrue(unrecoverableCalled.get(), "onUnrecoverable hook must be invoked");
+                    assertEquals(0, failingActor.countSideEffects(), "No side effect must run when persistence fails unrecoverably");
+                });
+
+        ref.stop();
+    }
+
+    // -----------------------------------------------------------------------
+    // Scenario 8 — When transient retries are exhausted, no side effects run
+    // -----------------------------------------------------------------------
+
+    @Test
+    void should_notRunSideEffects_when_persistenceRetriesExhausted() {
+        AtomicBoolean unrecoverableCalled = new AtomicBoolean(false);
+        TransactionalOperations<Tweet> failingOps = new TransactionalOperations<>() {
+            @Override
+            public void persistOnTransaction(List<Tweet> batch) {
+                throw new TransientException("Transient outage");
+            }
+
+            @Override
+            public void onPoisonPill(Tweet event, Exception cause) {
+            }
+        };
+
+        PersistenceConfig<Tweet> failingConfig = new PersistenceConfig<>(
+                failingOps,
+                10,
+                10L,
+                2,
+                () -> unrecoverableCalled.set(true)
+        );
+
+        TweeterActor failingActor = new TweeterActor("exhaust-retries-actor-" + UUID.randomUUID(), failingConfig);
+        ActorReference<Tweet> ref = manager.start(failingActor);
+
+        await().until(() -> failingActor.currentState() == Actor.State.STARTED);
+        ref.tell(new Tweet("transient-1", "This will fail and exhaust retries"));
+
+        await().atMost(Duration.ofSeconds(5))
+                .untilAsserted(() -> {
+                    assertTrue(unrecoverableCalled.get(), "onUnrecoverable hook must be invoked after retries exhausted");
+                    assertEquals(0, failingActor.countSideEffects(), "No side effect must run when transient retries are exhausted");
+                });
+
+        ref.stop();
+    }
+
+    // -----------------------------------------------------------------------
+    // Scenario 9 — When unexpected RuntimeException is thrown, no side effects run
+    // -----------------------------------------------------------------------
+
+    @Test
+    void should_notRunSideEffects_when_unexpectedRuntimeExceptionOccurs() {
+        AtomicBoolean unrecoverableCalled = new AtomicBoolean(false);
+        TransactionalOperations<Tweet> failingOps = new TransactionalOperations<>() {
+            @Override
+            public void persistOnTransaction(List<Tweet> batch) {
+                throw new RuntimeException("Unexpected disk failure");
+            }
+
+            @Override
+            public void onPoisonPill(Tweet event, Exception cause) {
+            }
+        };
+
+        PersistenceConfig<Tweet> failingConfig = new PersistenceConfig<>(
+                failingOps,
+                10,
+                10L,
+                1,
+                () -> unrecoverableCalled.set(true)
+        );
+
+        TweeterActor failingActor = new TweeterActor("unexpected-error-actor-" + UUID.randomUUID(), failingConfig);
+        ActorReference<Tweet> ref = manager.start(failingActor);
+
+        ref.tell(new Tweet("unexpected-1", "This will fail with unexpected runtime exception"));
+
+        await().atMost(Duration.ofSeconds(5))
+                .untilAsserted(() -> {
+                    assertTrue(unrecoverableCalled.get(), "onUnrecoverable hook must be invoked on unexpected exception");
+                    assertEquals(0, failingActor.countSideEffects(), "No side effects must run on unexpected exception");
+                });
+
+        ref.stop();
+    }
+
+    // -----------------------------------------------------------------------
+    // Scenario 10 — Multiple poison pills: side effects run ONLY for valid items
+    // -----------------------------------------------------------------------
+
+    @Test
+    void should_isolateMultiplePoisonPillsAndRunSideEffectsOnlyForValidItems() {
+        String poisonPill101 = "X".repeat(101);
+
+        Tweet poison1 = new Tweet("multi-poison-1", poisonPill101);
+        Tweet valid1 = new Tweet("multi-valid-1", "Valid message 1");
+        Tweet poison2 = new Tweet("multi-poison-2", poisonPill101);
+        Tweet valid2 = new Tweet("multi-valid-2", "Valid message 2");
+
+        actorRef.tell(poison1);
+        actorRef.tell(valid1);
+        actorRef.tell(poison2);
+        actorRef.tell(valid2);
+
+        await().atMost(Duration.ofSeconds(5))
+                .untilAsserted(() -> {
+                    assertEquals(4, actor.getReceiveCount());
+                    assertEquals(2, operations.countTweets(), "Only 2 valid tweets should be in DB");
+                    assertEquals(2, operations.getPoisonPills().size(), "Both poison pills should be recorded");
+                    assertEquals(2, actor.countSideEffects(), "Exactly 2 side effects must run for valid tweets only");
+
+                    List<String> sideEffectTweetIds = actor.getProcessedSideEffects().stream()
+                            .map(se -> se.tweet().id())
+                            .toList();
+                    assertEquals(List.of("multi-valid-1", "multi-valid-2"), sideEffectTweetIds,
+                            "Side effects must only be processed for valid tweets");
+                });
+    }
+
+    // -----------------------------------------------------------------------
+    // Scenario 11 — Unrecoverable failure during single-item isolation aborts remaining side effects
+    // -----------------------------------------------------------------------
+
+    @Test
+    void should_abortRemainingSideEffects_when_singleItemIsolationThrowsUnrecoverableException() {
+        AtomicBoolean unrecoverableCalled = new AtomicBoolean(false);
+
+        TransactionalOperations<Tweet> ops = new TransactionalOperations<>() {
+            @Override
+            public void persistOnTransaction(List<Tweet> batch) {
+                if (batch.size() > 1) {
+                    // Trigger single-item fallback
+                    throw new SingleItemException("Batch data issue, retry individually");
+                }
+                Tweet single = batch.get(0);
+                if ("item-1".equals(single.id())) {
+                    // Item 1 succeeds
+                    return;
+                }
+                if ("item-2".equals(single.id())) {
+                    // Item 2 fails unrecoverably
+                    throw new UnrecoverableException("Fatal database disk error on item-2");
+                }
+                // Item 3 should be abandoned
+            }
+
+            @Override
+            public void onPoisonPill(Tweet event, Exception cause) {
+            }
+        };
+
+        PersistenceConfig<Tweet> config = new PersistenceConfig<>(
+                ops,
+                10,
+                10L,
+                1,
+                () -> unrecoverableCalled.set(true)
+        );
+
+        TweeterActor partialActor = new TweeterActor("partial-actor-" + UUID.randomUUID(), config);
+        ActorReference<Tweet> ref = manager.start(partialActor);
+
+        ref.tell(new Tweet("item-1", "First item"));
+        ref.tell(new Tweet("item-2", "Second item"));
+        ref.tell(new Tweet("item-3", "Third item"));
+
+        await().atMost(Duration.ofSeconds(5))
+                .untilAsserted(() -> {
+                    assertTrue(unrecoverableCalled.get(), "onUnrecoverable hook must be invoked when single-item run throws UnrecoverableException");
+                    assertEquals(1, partialActor.countSideEffects(), "Only item-1 side effect should run; item-2 threw and item-3 was abandoned");
+                    assertEquals(List.of("item-1"), partialActor.getProcessedSideEffects().stream().map(se -> se.tweet().id()).toList());
+                });
+
+        ref.stop();
     }
 }

@@ -42,7 +42,7 @@ public class NaturalBatchingDispatcher<E> implements PersistenceDispatcher<E> {
     private final int batchSize;
     private final long timeoutMs;
 
-    private final ConcurrentLinkedQueue<E> buffer = new ConcurrentLinkedQueue<>();
+    private final ConcurrentLinkedQueue<PersistenceRunner.PersistenceEvent<E>> buffer = new ConcurrentLinkedQueue<>();
     private final ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
     private final AtomicBoolean scheduled = new AtomicBoolean(false);
     private final AtomicReference<Future<?>> runningTask = new AtomicReference<>(null);
@@ -55,7 +55,7 @@ public class NaturalBatchingDispatcher<E> implements PersistenceDispatcher<E> {
     }
 
     @Override
-    public void enqueue(E event, BatchingPersistenceRunner<E> runner) {
+    public void enqueue(PersistenceRunner.PersistenceEvent<E> event, PersistenceRunner<E> runner) {
         buffer.offer(event);
         tryConsumeSafely(runner);
     }
@@ -69,7 +69,7 @@ public class NaturalBatchingDispatcher<E> implements PersistenceDispatcher<E> {
         buffer.clear();
     }
 
-    private void tryConsumeSafely(BatchingPersistenceRunner<E> runner) {
+    private void tryConsumeSafely(PersistenceRunner<E> runner) {
         if (!scheduled.compareAndSet(false, true)) {
             return; // another thread is already scheduled or running
         }
@@ -77,11 +77,11 @@ public class NaturalBatchingDispatcher<E> implements PersistenceDispatcher<E> {
         runningTask.set(task);
     }
 
-    private void consumeLoop(BatchingPersistenceRunner<E> runner) {
+    private void consumeLoop(PersistenceRunner<E> runner) {
         try {
-            List<E> batch = drainBatch();
+            List<PersistenceRunner.PersistenceEvent<E>> batch = drainBatch();
             if (!batch.isEmpty()) {
-                runner.flush(batch);
+                runner.persistBatch(batch);
             }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -97,15 +97,15 @@ public class NaturalBatchingDispatcher<E> implements PersistenceDispatcher<E> {
         }
     }
 
-    private List<E> drainBatch() throws InterruptedException {
-        List<E> batch = new ArrayList<>(batchSize);
+    private List<PersistenceRunner.PersistenceEvent<E>> drainBatch() throws InterruptedException {
+        List<PersistenceRunner.PersistenceEvent<E>> batch = new ArrayList<>(batchSize);
 
         // Wait for the first event up to timeoutMs
         long deadline = System.currentTimeMillis() + timeoutMs;
 
         int counter = 0 ;
         while (counter < batchSize) {
-            E head = buffer.poll();
+            PersistenceRunner.PersistenceEvent<E> head = buffer.poll();
             if (head != null) {
                 counter = counter + 1;
                 batch.add(head);
@@ -118,7 +118,7 @@ public class NaturalBatchingDispatcher<E> implements PersistenceDispatcher<E> {
         }
         // Greedily fill the remainder with the batch without waiting
         while (batch.size() < batchSize) {
-            E next = buffer.poll();
+            PersistenceRunner.PersistenceEvent<E> next = buffer.poll();
             if (next == null) break;
             batch.add(next);
         }

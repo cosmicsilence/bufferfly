@@ -34,7 +34,7 @@ public class NaturalBatchingDispatcherTest {
         final List<Integer> flushes = new CopyOnWriteArrayList<>();
 
         @Override
-        public void run(List<String> batch) {
+        public void persistOnTransaction(List<String> batch) {
             int depth = concurrent.incrementAndGet();
             maxConcurrent.accumulateAndGet(depth, Math::max);
             flushed.addAndGet(batch.size());
@@ -50,9 +50,8 @@ public class NaturalBatchingDispatcherTest {
     static BatchingPersistenceRunner<String> runner(SpyOperations spy,
                                                     NaturalBatchingDispatcher<String> dispatcher,
                                                     int batchSize, long timeoutMs) {
-        var config = new BatchingPersistenceRunner.Config(batchSize, timeoutMs, 0);
-        return new BatchingPersistenceRunner<>(spy, config, () -> {
-        }, dispatcher);
+        var config = new PersistenceConfig<>(spy, batchSize, timeoutMs, 0, () -> {}, dispatcher);
+        return config.instantiate();
     }
 
 
@@ -66,7 +65,7 @@ public class NaturalBatchingDispatcherTest {
         BatchingPersistenceRunner<String> runner = runner(spy, dispatcher, BATCH_SIZE, 50);
 
         for (int t = 0; t < TOTAL_ELEMENTS; t++) {
-            runner.enqueue("e-" + t);
+            runner.enqueue(PersistenceRunner.newEvent("e-" + t));
         }
 
         await().atMost(Duration.ofSeconds(30))
@@ -101,7 +100,7 @@ public class NaturalBatchingDispatcherTest {
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                 }
-                for (int i = 0; i < EVENTS_EACH; i++) runner.enqueue("e-" + (base + i));
+                for (int i = 0; i < EVENTS_EACH; i++) runner.enqueue(PersistenceRunner.newEvent("e-" + (base + i)));
                 done.countDown();
             });
         }

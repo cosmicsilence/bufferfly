@@ -17,7 +17,7 @@ import java.util.List;
  *       halt the owning actor and let the Kafka consumer restart from the last
  *       committed offset, replaying messages from a known-good state.</li>
  *   <li>{@link TransientException} — entire batch is retried up to
- *       {@link Config#maxRetries} times with exponential back-off. After all
+ *       {@link PersistenceConfig#maxRetries} times with exponential back-off. After all
  *       retries are exhausted {@code onUnrecoverable} is invoked.</li>
  *   <li>{@link SingleItemException} — each element is re-submitted individually
  *       to isolate the poison pill:
@@ -46,41 +46,13 @@ import java.util.List;
 public final class BatchingPersistenceRunner<E> implements PersistenceRunner<E> {
 
     // -----------------------------------------------------------------------
-    // Config
-    // -----------------------------------------------------------------------
-
-    /**
-     * Immutable configuration for {@link BatchingPersistenceRunner}.
-     *
-     * @param batchSize  maximum events per batch (≥ 1)
-     * @param timeoutMs  max millis to wait for a batch to fill (≥ 1, ≤ 50)
-     * @param maxRetries max retries on {@link TransientException} (≥ 0)
-     */
-    public record Config(int batchSize, long timeoutMs, int maxRetries) {
-
-        public static final int  DEFAULT_BATCH_SIZE  = 1_000;
-        public static final long DEFAULT_TIMEOUT_MS  = 50L;
-        public static final int  DEFAULT_MAX_RETRIES = 3;
-
-        public Config {
-            if (batchSize  < 1)       throw new IllegalArgumentException("batchSize must be >= 1");
-            if (timeoutMs  < 1 || timeoutMs > 50)
-                                      throw new IllegalArgumentException("timeoutMs must be >= 1 AND <= 50");
-            if (maxRetries < 0)       throw new IllegalArgumentException("maxRetries must be >= 0");
-        }
-
-        public static Config defaults() {
-            return new Config(DEFAULT_BATCH_SIZE, DEFAULT_TIMEOUT_MS, DEFAULT_MAX_RETRIES);
-        }
-    }
-
-    // -----------------------------------------------------------------------
     // State
     // -----------------------------------------------------------------------
 
     private final TransactionalOperations<E> operations;
-    private final PersistenceDispatcher<E>   dispatcher;
-    private final Config                     config;
+    private final PersistenceDispatcher<E> dispatcher;
+    private final PersistenceConfig<E> config;
+    private final SideEffectProcessor sideEffectProcessor;
 
     /**
      * Called when a batch failure is unrecoverable (after retries are
@@ -92,18 +64,38 @@ public final class BatchingPersistenceRunner<E> implements PersistenceRunner<E> 
      */
     private final Runnable onUnrecoverable;
 
-    private volatile boolean stopped = false;
+    private volatile State state = State.STARTED;
 
     // -----------------------------------------------------------------------
     // Constructors
     // -----------------------------------------------------------------------
 
     public BatchingPersistenceRunner(TransactionalOperations<E> operations) {
-        this(operations, Config.defaults());
+        this(new PersistenceConfig<>(operations));
     }
 
-    public BatchingPersistenceRunner(TransactionalOperations<E> operations, Config config) {
-        this(operations, config, () -> {});
+    public BatchingPersistenceRunner(PersistenceConfig<E> config) {
+        this(config, (sf) -> {
+        });
+    }
+
+    public BatchingPersistenceRunner(PersistenceConfig<E> config, SideEffectProcessor processor) {
+        this(
+                config.operations(),
+                config,
+                config.onUnrecoverable(),
+                config.dispatcher() != null
+                        ? config.dispatcher()
+                        : new NaturalBatchingDispatcher<>(config.batchSize(), config.timeoutMs()),
+                processor
+        );
+    }
+
+    public BatchingPersistenceRunner(
+            TransactionalOperations<E> operations,
+            PersistenceConfig<E> config,
+            SideEffectProcessor processor) {
+        this(operations, config, config.onUnrecoverable(), processor);
     }
 
     /**
@@ -113,10 +105,14 @@ public final class BatchingPersistenceRunner<E> implements PersistenceRunner<E> 
      */
     public BatchingPersistenceRunner(
             TransactionalOperations<E> operations,
-            Config config,
-            Runnable onUnrecoverable) {
+            PersistenceConfig<E> config,
+            Runnable onUnrecoverable,
+            SideEffectProcessor processor) {
         this(operations, config, onUnrecoverable,
-            new NaturalBatchingDispatcher<>(config.batchSize(), config.timeoutMs()));
+                config.dispatcher() != null
+                        ? config.dispatcher()
+                        : new NaturalBatchingDispatcher<>(config.batchSize(), config.timeoutMs()),
+                processor);
     }
 
     /**
@@ -125,17 +121,24 @@ public final class BatchingPersistenceRunner<E> implements PersistenceRunner<E> 
      */
     public BatchingPersistenceRunner(
             TransactionalOperations<E> operations,
-            Config config,
+            PersistenceConfig<E> config,
             Runnable onUnrecoverable,
-            PersistenceDispatcher<E> dispatcher) {
-        if (operations      == null) throw new NullPointerException("operations must not be null");
-        if (config          == null) throw new NullPointerException("config must not be null");
+            PersistenceDispatcher<E> dispatcher,
+            SideEffectProcessor processor) {
+        if (operations == null) throw new NullPointerException("operations must not be null");
+        if (config == null) throw new NullPointerException("config must not be null");
         if (onUnrecoverable == null) throw new NullPointerException("onUnrecoverable must not be null");
-        if (dispatcher      == null) throw new NullPointerException("dispatcher must not be null");
-        this.operations      = operations;
-        this.config          = config;
+        if (dispatcher == null) throw new NullPointerException("dispatcher must not be null");
+        if (processor == null) throw new NullPointerException("processor must not be null");
+        this.operations = operations;
+        this.config = config;
         this.onUnrecoverable = onUnrecoverable;
-        this.dispatcher      = dispatcher;
+        this.dispatcher = dispatcher;
+        this.sideEffectProcessor = processor;
+    }
+
+    public PersistenceConfig<E> config() {
+        return config;
     }
 
     // -----------------------------------------------------------------------
@@ -149,10 +152,10 @@ public final class BatchingPersistenceRunner<E> implements PersistenceRunner<E> 
      * @throws IllegalStateException if {@link #stop()} has already been called
      */
     @Override
-    public void enqueue(E event) {
-        if (stopped) {
+    public void enqueue(PersistenceEvent<E> event) {
+        if (state == State.STOPPED) {
             throw new IllegalStateException(
-                "BatchingPersistenceRunner is stopped; cannot enqueue new events");
+                    "BatchingPersistenceRunner is stopped; cannot enqueue new events");
         }
         if (event == null) throw new NullPointerException("event must not be null");
         dispatcher.enqueue(event, this);
@@ -164,7 +167,7 @@ public final class BatchingPersistenceRunner<E> implements PersistenceRunner<E> 
      */
     @Override
     public void stop() {
-        stopped = true;
+        state = State.STOPPED;
         dispatcher.clear();
     }
 
@@ -176,22 +179,28 @@ public final class BatchingPersistenceRunner<E> implements PersistenceRunner<E> 
      * Flushes one batch through the error-handling pipeline.
      * Called exclusively by the {@link PersistenceDispatcher} on a virtual thread.
      */
-    void flush(List<E> batch) {
-        flushWithRetry(batch);
+    @Override
+    public void persistBatch(List<PersistenceEvent<E>> batch) {
+        persistWithRetry(batch);
     }
 
     // -----------------------------------------------------------------------
     // Error-handling internals
     // -----------------------------------------------------------------------
 
-    private void flushWithRetry(List<E> batch) {
+    private void persistWithRetry(List<PersistenceEvent<E>> batch) {
         int attempts = 0;
         while (true) {
             try {
-                operations.run(List.copyOf(batch));
+                operations.persistOnTransaction(List.copyOf(batch
+                        .stream()
+                        .map(PersistenceEvent::event)
+                        .toList()));
+                batch.forEach(e -> sideEffectProcessor.process(e.sideEffect()));
                 return; // success
             } catch (SingleItemException e) {
                 flushItemByItem(batch);
+                handleUnrecoverable();
                 return;
             } catch (TransientException e) {
                 attempts++;
@@ -224,17 +233,19 @@ public final class BatchingPersistenceRunner<E> implements PersistenceRunner<E> 
      *       the remainder of the batch.</li>
      * </ul>
      */
-    private void flushItemByItem(List<E> batch) {
-        for (E item : batch) {
+    private void flushItemByItem(List<PersistenceEvent<E>> batch) {
+        for (PersistenceEvent<E> item : batch) {
             try {
-                operations.run(List.of(item));
+                operations.persistOnTransaction(List.of(item.event()));
+                sideEffectProcessor.process(item.sideEffect());
             } catch (UnrecoverableException e) {
                 handleUnrecoverable();
                 return; // abandon remainder of batch
             } catch (PersistenceException e) {
                 // Poison pill — notify and continue with remaining items
                 try {
-                    operations.onPoisonPill(item, e);
+                    operations.onPoisonPill(item.event(), e);
+
                 } catch (Exception ignored) {
                     // onPoisonPill must not throw — swallow defensively
                 }
@@ -270,5 +281,11 @@ public final class BatchingPersistenceRunner<E> implements PersistenceRunner<E> 
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
+    }
+
+    private enum State {
+        STARTED,
+        PAUSED,
+        STOPPED
     }
 }

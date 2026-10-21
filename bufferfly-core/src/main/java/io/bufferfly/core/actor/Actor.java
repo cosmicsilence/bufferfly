@@ -14,6 +14,8 @@ public interface Actor<T> {
     /** Called by the dispatcher to deliver one message. */
     void receive(T message);
 
+    void setSelf(ActorReference<T> self);
+
     /** Unique name identifying this actor within an {@link ActorManager}. */
     String name();
 
@@ -26,6 +28,22 @@ public interface Actor<T> {
      */
     void start();
 
-    /** Returns {@code true} once {@link #start()} has been called successfully. */
-    boolean isStarted();
+    /**
+     * Stops the actor. Called when ActorReference.stop() is called
+     */
+    void stop();
+
+    AbstractActor.State currentState();
+
+    enum State {
+        NOT_STARTED,
+        PRE_STARTING,
+        STARTED,
+        STOPPED;
+
+        static boolean isStartingOrStartedState(State state) {
+            return State.STARTED == state|| State.NOT_STARTED == state || State.PRE_STARTING == state;
+        }
+    }
+
 }

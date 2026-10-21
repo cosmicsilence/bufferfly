@@ -7,11 +7,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
-import java.sql.Connection;
-import java.sql.DriverManager;
-import java.sql.PreparedStatement;
 import java.sql.SQLException;
-import java.sql.Statement;
 import java.time.Duration;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
@@ -49,7 +45,6 @@ class PersistenceActorBenchmarkTest {
     private String jdbcUrl;
 
     private ActorManager manager;
-    private BatchingPersistenceRunner<Tweet> runner;
     private TweeterActor actor;
     private ActorReference<Tweet> actorRef;
 
@@ -68,13 +63,13 @@ class PersistenceActorBenchmarkTest {
         actorOperations.createTableIfNotExists();
         directOperations.createTableIfNotExists();
 
-        BatchingPersistenceRunner.Config config = new BatchingPersistenceRunner.Config(
+        PersistenceConfig<Tweet> config = new PersistenceConfig<>(
+                actorOperations,
                 1_000, // batchSize
                 10L,   // timeoutMs
                 3      // maxRetries
         );
-        runner = new BatchingPersistenceRunner<>(actorOperations, config);
-        actor = new TweeterActor("tweeter-bench-" + UUID.randomUUID(), runner);
+        actor = new TweeterActor("tweeter-bench-" + UUID.randomUUID(), config);
         manager = new ActorManager();
         actorRef = manager.start(actor);
     }

@@ -4,6 +4,7 @@ import io.bufferfly.core.actor.Actor;
 import io.bufferfly.core.actor.BlockingMailbox;
 import io.bufferfly.core.actor.Dispatcher;
 import io.bufferfly.core.actor.Mailbox;
+import io.bufferfly.core.actor.PreStartBuffer;
 import net.openhft.affinity.Affinity;
 import net.openhft.affinity.AffinityLock;
 import org.slf4j.Logger;
@@ -67,6 +68,7 @@ public class SpinningActorDispatcher implements Dispatcher {
     }
 
     private final Config config;
+    private final PreStartBuffer preStartBuffer = new PreStartBuffer();
     private final Map<String, SpinningThread<?>> cpuBoundThreads = new ConcurrentHashMap<>();
     private final Map<String, Mailbox<?>> mailboxes = new ConcurrentHashMap<>();
 
@@ -98,6 +100,7 @@ public class SpinningActorDispatcher implements Dispatcher {
     }
 
     private <T> void consume(Actor<T> actor) {
+        if (preStartBuffer.bufferIfPreStarting(actor, () -> consume(actor))) return;
         cpuBoundThreads.computeIfAbsent(actor.name(), ignored -> {
             var t = new SpinningThread<>(actor);
             t.start();
@@ -118,6 +121,14 @@ public class SpinningActorDispatcher implements Dispatcher {
                 });
         Mailbox<?> mb = mailboxes.remove(actor.name());
         if (mb != null) mb.clear();
+    }
+
+    @Override
+    public void stop() {
+        cpuBoundThreads.values().forEach(SpinningThread::halt);
+        cpuBoundThreads.clear();
+        mailboxes.clear();
+        preStartBuffer.stop();
     }
 
     private <T> Mailbox<T> mailboxFor(Actor<T> actor) {

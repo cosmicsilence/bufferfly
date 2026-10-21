@@ -1,11 +1,11 @@
 package io.bufferfly.core.persistence;
 
 /**
- * Thrown by {@link TransactionalOperations#run} to signal a temporary failure
+ * Thrown by {@link TransactionalOperations#persistOnTransaction} to signal a temporary failure
  * that is expected to succeed on a subsequent attempt with the same batch.
  *
  * <p>{@link BatchingPersistenceRunner} will retry the entire batch up to
- * {@link BatchingPersistenceRunner.Config#maxRetries()} times with the
+ * {@link PersistenceConfig#maxRetries()} times with the
  * configured back-off before giving up and escalating to
  * {@link UnrecoverableException} handling.
  *

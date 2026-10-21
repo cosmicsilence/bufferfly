@@ -1,6 +1,6 @@
 package io.bufferfly.core.actor;
 
-import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Convenience base class for {@link Actor} implementations.
@@ -17,56 +17,51 @@ import java.util.concurrent.atomic.AtomicBoolean;
  */
 public abstract class AbstractActor<T> implements Actor<T> {
 
-    private final AtomicBoolean started = new AtomicBoolean(false);
-    private final AtomicBoolean stopped = new AtomicBoolean(false);
+    private final AtomicReference<State> state = new AtomicReference<>(State.NOT_STARTED);
 
     protected ActorReference<T> self;
 
+    @Override
     public void setSelf(ActorReference<T> self) {
         this.self = self;
     }
 
-    // -----------------------------------------------------------------------
-    // Lifecycle — called by ActorManager / DispatchingActor, not by callers
-    // -----------------------------------------------------------------------
-
     @Override
     public final void start() {
-        if (started.compareAndSet(false, true)) {
+        if (state.compareAndSet(State.NOT_STARTED, State.PRE_STARTING)) {
             preStart();
+            state.set(State.STARTED);
         }
     }
 
     @Override
-    public final boolean isStarted() {
-        return started.get();
-    }
-
-    /**
-     * Package-private stop hook invoked by {@link ActorManager.DispatchingActor}
-     * when {@link ActorReference#stop()} is called on the reference.
-     * Not part of the public {@link Actor} API — callers use {@link ActorReference#stop()}.
-     */
-    final void shutdown() {
-        started.set(false);
-        if (stopped.compareAndSet(false, true)) {
-            postStop();
+    public void stop() {
+        var current = state.get();
+        if (State.isStartingOrStartedState(current)) {
+            if (state.compareAndSet(current, State.STOPPED)) {
+                postStop();
+            }
         }
-    }
 
-    // -----------------------------------------------------------------------
-    // Extension points
-    // -----------------------------------------------------------------------
+    }
 
     /**
      * Called once when the actor is first started.
      * Override to initialise resources, subscribe to topics, etc.
      */
-    protected void preStart() {}
+    protected void preStart() {
+    }
 
     /**
      * Called once when the actor is stopped via {@link ActorReference#stop()}.
      * Override to release resources, flush state, etc.
      */
-    protected void postStop() {}
+    protected void postStop() {
+    }
+
+    public State currentState() {
+        return state.get();
+    }
+
 }
+

@@ -16,6 +16,18 @@ public class TweeterActor extends AbstractPersistentActor<Tweet, Tweet> {
     private final List<Tweet> received = Collections.synchronizedList(new ArrayList<>());
     private final List<Tweet> errorTweets = Collections.synchronizedList(new ArrayList<>());
     private final List<Exception> errorExceptions = Collections.synchronizedList(new ArrayList<>());
+    private final AtomicInteger counterSideEffects = new AtomicInteger();
+    private final List<TweetSideEffect> processedSideEffects = Collections.synchronizedList(new ArrayList<>());
+
+    public TweeterActor(String actorName, PersistenceConfig<Tweet> config) {
+        super(config);
+        if (actorName == null) throw new NullPointerException("actorName must not be null");
+        this.actorName = actorName;
+    }
+
+    public TweeterActor(PersistenceConfig<Tweet> config) {
+        this("tweeter-actor", config);
+    }
 
     public TweeterActor(String actorName, PersistenceRunner<Tweet> runner) {
         super(runner);
@@ -28,10 +40,31 @@ public class TweeterActor extends AbstractPersistentActor<Tweet, Tweet> {
     }
 
     @Override
-    public Tweet apply(Tweet message) {
+    public PersistenceRunner.SideEffectProcessor process() {
+        return sideEffect -> {
+            counterSideEffects.incrementAndGet();
+            if (sideEffect instanceof TweetSideEffect tse) {
+                processedSideEffects.add(tse);
+            }
+        };
+    }
+
+    @Override
+    public PersistenceRunner.PersistenceEvent<Tweet> apply(Tweet message) {
         receiveCount.incrementAndGet();
         received.add(message);
-        return message;
+        return PersistenceRunner.newEvent(message, new TweetSideEffect(message));
+    }
+
+    public int countSideEffects() {
+        return counterSideEffects.get();
+    }
+
+    public List<TweetSideEffect> getProcessedSideEffects() {
+        return Collections.unmodifiableList(processedSideEffects);
+    }
+
+    public record TweetSideEffect(Tweet tweet) implements PersistenceRunner.SideEffect {
     }
 
     @Override

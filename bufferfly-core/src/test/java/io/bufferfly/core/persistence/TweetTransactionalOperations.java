@@ -92,7 +92,7 @@ public class TweetTransactionalOperations implements TransactionalOperations<Twe
     }
 
     @Override
-    public void run(List<Tweet> batch) {
+    public void persistOnTransaction(List<Tweet> batch) {
         if (batch == null || batch.isEmpty()) {
             return;
         }
