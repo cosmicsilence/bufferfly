@@ -229,6 +229,91 @@ data), a paused-and-redelivered record is simply re-consumed, never lost and nev
 
 ---
 
+## Why this design — the principles it stands on
+
+BufferFly is not an arbitrary collection of tricks; every load-bearing decision is a direct
+application of a well-established principle. This section defends the architecture by naming those
+principles and linking to their canonical sources.
+
+### The actor is a single-writer, and that is the whole point
+
+An actor, in the [actor model](https://en.wikipedia.org/wiki/Actor_model), is a computational entity
+that, in response to a message, makes local decisions and **modifies only its own private state** —
+actors "can only affect each other indirectly through messaging (removing the need for lock-based
+synchronization)." BufferFly's per-partition actor is exactly this: one actor owns a partition's
+state, consumes messages from its mailbox, and never shares mutable state with another actor.
+
+That maps one-to-one onto the
+[**single-writer principle**](https://mechanical-sympathy.blogspot.com/2011/09/single-writer-principle.html)
+as described in the [HFT engineering writeup](https://hftengineer.com/posts/single-writer-principle/):
+
+> One thread mutates a piece of state. All other threads send messages to it via a queue. … It
+> sidesteps the lock-free / memory-ordering / cache-contention swamp by construction.
+
+The practical consequences the writeup lists are precisely the ones BufferFly relies on:
+
+- **No cache-line bouncing / no memory-ordering overhead.** A single writer uses plain stores; there
+  is no contended mutex and no CAS-retry loop on the hot path. (See also false sharing and cache
+  lines in Martin Fowler's
+  [Principles of Mechanical Sympathy](https://martinfowler.com/articles/mechanical-sympathy-principles.html).)
+- **Partition to scale.** "When the writer *is* the bottleneck, you partition: one writer per symbol,
+  one writer per shard, **one writer per partition key**." BufferFly runs **one actor per Kafka
+  partition** — the same move, applied to ingestion.
+- **Replay-determinism.** "A single writer with an ordered input stream is trivially deterministic."
+  That is what makes a crashed actor safe to restart and replay from its last durable offset.
+
+This is also why `bufferfly-cpu-bound` exists and why it is shaped the way it is: the LMAX Disruptor —
+a ring buffer feeding a single writer — is the canonical realization of the principle, and the
+spinning dispatcher is BufferFly's Disruptor-style variant for the few actors that need it.
+
+### Natural batching is a named technique, not a heuristic
+
+The `NaturalBatchingDispatcher` implements
+[**natural batching**](https://martinfowler.com/articles/mechanical-sympathy-principles.html#NaturalBatching)
+(Martin Thompson's "smart batching", since
+[renamed](https://martinfowler.com/articles/mechanical-sympathy-principles.html#NaturalVs.SmartBatching)):
+
+> The actor begins creating a batch as soon as requests are available in its queue, and completes the
+> batch as soon as the maximum batch size is reached or the queue is empty.
+
+Fowler's worked example shows why BufferFly drains *greedily up to `batchSize` or until the buffer
+empties* rather than waiting for a fixed timeout — natural batching roughly **halves** the per-request
+latency of a timeout strategy (best/worst `100/200 µs` vs. `200/400 µs`) while still coalescing writes
+under load. Our `drainBatch()` is that algorithm verbatim.
+
+### Backpressure is a first-class primitive because the alternative is collapse
+
+Treating backpressure as the core mechanism (not an add-on) follows Thompson's
+[**Apply Back Pressure When Overloaded**](https://mechanical-sympathy.blogspot.com/2012/05/apply-back-pressure-when-overloaded.html):
+an overloaded system that keeps accepting work degrades catastrophically; one that signals upstream to
+*wait* degrades gracefully. BufferFly's watermark/hysteresis machinery (see the
+[Backpressure spec](#-backpressure-spec) above) is the implementation of that principle, and pausing
+the Kafka partition is how the "wait" signal is delivered end-to-end.
+
+### The offset is a fencing token — the only safe way to use a lease across a rebalance
+
+A Kafka partition assignment is effectively a **lease**: after a rebalance a new consumer owns the
+partition, but an old ("zombie") instance may still be alive — paused by GC, delayed on the network —
+and about to write. Martin Kleppmann's
+[**How to do distributed locking**](https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html)
+shows that a lease alone cannot make this safe, because a process can pause *at any point* and act on
+an expired lease:
+
+> The fix … is actually pretty simple: you need to include a **fencing token** with every write
+> request to the storage service. … a number that increases every time a client acquires the lock …
+> the storage server remembers that it has already processed a write with a higher token number, and
+> so it rejects the request with [a lower one].
+
+BufferFly's `consumer_offset.latest_offset`, advanced with a compare-and-set
+(`WHERE latest_offset = :expected`) **in the same transaction as the data**, *is* that fencing token:
+monotonic, checked by the "storage server" (the DB), and rejecting any write whose offset went
+backwards. A failed CAS means a zombie is racing the new owner, so the batch is rejected as
+`UnrecoverableException` and the actor restarts clean. This is exactly the discipline Kleppmann
+prescribes — "enforce use of fencing tokens on all resource accesses under the lock" — rather than
+trusting the lease (the Kafka assignment) on its own.
+
+---
+
 ## Performance
 
 BufferFly is engineered with strict mechanical sympathy. There are two independent performance
