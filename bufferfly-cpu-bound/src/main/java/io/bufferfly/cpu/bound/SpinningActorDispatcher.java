@@ -3,6 +3,7 @@ package io.bufferfly.cpu.bound;
 import io.bufferfly.core.actor.Actor;
 import io.bufferfly.core.actor.BlockingMailbox;
 import io.bufferfly.core.actor.ActorDispatcher;
+import io.bufferfly.core.actor.MailBoxRefusedException;
 import io.bufferfly.core.actor.Mailbox;
 import io.bufferfly.core.actor.PreStartBuffer;
 import net.openhft.affinity.Affinity;
@@ -103,7 +104,7 @@ public class SpinningActorDispatcher implements ActorDispatcher {
         try {
             final var accepted = mailboxFor(actor).offer(t);
             if (!accepted) {
-                throw new IllegalStateException(
+                throw new MailBoxRefusedException(
                         "Mailbox refused for the actor.name=%s".formatted(actor.name()));
             }
         } finally {

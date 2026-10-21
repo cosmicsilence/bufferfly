@@ -102,7 +102,7 @@ public class VTDispatcher implements ActorDispatcher, CallerRunsCapable {
         // Always enqueue first so ordering is preserved regardless of mode.
         final var accepted = mailboxFor(actor).offer(t);
         if (!accepted) {
-            throw new IllegalStateException(
+            throw new MailBoxRefusedException(
                     "Mailbox refused for the actor.name=%s".formatted(actor.name()));
         }
         consume(actor);
