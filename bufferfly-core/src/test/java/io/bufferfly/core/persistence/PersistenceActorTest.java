@@ -163,14 +163,17 @@ class PersistenceActorTest {
                     assertFalse(operations.getPoisonPillCauses().isEmpty());
                 });
 
-        // Verify the actor and persistence runner continue operating normally after the poison pill
-        actorRef.tell(new Tweet("subsequent", "I am alive after the poison pill"));
+        // After isolating the poison pill the runner HALTS (unrecoverable mode):
+        // with a no-op onUnrecoverable hook it does not process further batches.
+        // In a real deployment the hook restarts the actor to resume cleanly.
+        actorRef.tell(new Tweet("subsequent", "sent after the poison pill"));
 
-        await().atMost(Duration.ofSeconds(5))
+        // The subsequent tweet is NOT persisted by this halted runner.
+        await().during(Duration.ofSeconds(2)).atMost(Duration.ofSeconds(5))
                 .untilAsserted(() -> {
-                    assertEquals(4, operations.countTweets());
-                    assertEquals(4, actor.countSideEffects());
-                    assertNotNull(operations.findTweetById("subsequent"));
+                    assertEquals(3, operations.countTweets(),
+                            "runner halted after the poison pill; no further inserts");
+                    assertNull(operations.findTweetById("subsequent"));
                 });
     }
 
@@ -194,14 +197,15 @@ class PersistenceActorTest {
                     assertEquals("alone-poison", operations.getPoisonPills().get(0).id());
                 });
 
-        // Verify actor can still accept and persist good messages
-        actorRef.tell(new Tweet("recovery", "Working after standalone poison pill"));
+        // After the standalone poison pill the runner HALTS (unrecoverable mode).
+        // With a no-op hook, a subsequent message is not processed.
+        actorRef.tell(new Tweet("recovery", "sent after standalone poison pill"));
 
-        await().atMost(Duration.ofSeconds(5))
+        await().during(Duration.ofSeconds(2)).atMost(Duration.ofSeconds(5))
                 .untilAsserted(() -> {
-                    assertEquals(1, operations.countTweets());
-                    assertEquals(1, actor.countSideEffects(), "Subsequent valid message must execute side effect");
-                    assertNotNull(operations.findTweetById("recovery"));
+                    assertEquals(0, operations.countTweets(),
+                            "runner halted after the poison pill; no further inserts");
+                    assertNull(operations.findTweetById("recovery"));
                 });
     }
 

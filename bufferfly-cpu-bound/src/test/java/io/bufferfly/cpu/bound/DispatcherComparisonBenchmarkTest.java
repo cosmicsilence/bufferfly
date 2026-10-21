@@ -6,8 +6,6 @@ import io.bufferfly.core.config.BufferflyConfig.ActorOverrideConfig;
 import io.bufferfly.core.config.BufferflyConfig.ActorsConfig;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 import java.util.LongSummaryStatistics;
 import java.util.concurrent.CountDownLatch;
@@ -19,7 +17,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 /**
  * Head-to-head microbenchmark: {@link SpinningActorDispatcher} vs {@link VTDispatcher}.
  *
- * <p>Both dispatchers expose the same {@link io.bufferfly.core.actor.Dispatcher} contract
+ * <p>Both dispatchers expose the same {@link ActorDispatcher} contract
  * but make opposite runtime tradeoffs:
  *
  * <ul>
@@ -205,7 +203,7 @@ class DispatcherComparisonBenchmarkTest {
      * Runs the ping benchmark for the given dispatcher.
      * Returns an array of {@value #PING_ROUNDS} nanosecond latency samples.
      */
-    private long[] runPing(io.bufferfly.core.actor.Dispatcher dispatcher) throws InterruptedException {
+    private long[] runPing(ActorDispatcher dispatcher) throws InterruptedException {
 
         PingActor actor = new PingActor(PING_CMP_ACTOR);
         actor.start();

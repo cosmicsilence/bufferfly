@@ -45,10 +45,6 @@ import java.util.List;
  */
 public final class BatchingPersistenceRunner<E> implements PersistenceRunner<E> {
 
-    // -----------------------------------------------------------------------
-    // State
-    // -----------------------------------------------------------------------
-
     private final TransactionalOperations<E> operations;
     private final PersistenceDispatcher<E> dispatcher;
     private final PersistenceConfig<E> config;
@@ -66,9 +62,6 @@ public final class BatchingPersistenceRunner<E> implements PersistenceRunner<E> 
 
     private volatile State state = State.STARTED;
 
-    // -----------------------------------------------------------------------
-    // Constructors
-    // -----------------------------------------------------------------------
 
     public BatchingPersistenceRunner(TransactionalOperations<E> operations) {
         this(new PersistenceConfig<>(operations));
@@ -141,10 +134,6 @@ public final class BatchingPersistenceRunner<E> implements PersistenceRunner<E> 
         return config;
     }
 
-    // -----------------------------------------------------------------------
-    // PersistenceRunner API
-    // -----------------------------------------------------------------------
-
     /**
      * Enqueues {@code event} and signals the dispatcher to schedule a consume
      * loop if one is not already running. Never blocks.
@@ -171,22 +160,23 @@ public final class BatchingPersistenceRunner<E> implements PersistenceRunner<E> 
         dispatcher.clear();
     }
 
-    // -----------------------------------------------------------------------
-    // Flush pipeline — called by NaturalBatchingDispatcher on its VT
-    // -----------------------------------------------------------------------
-
     /**
      * Flushes one batch through the error-handling pipeline.
      * Called exclusively by the {@link PersistenceDispatcher} on a virtual thread.
+     *
+     * <p>No-op once the runner is {@link State#STOPPED} — whether stopped
+     * explicitly via {@link #stop()} or halted by an unrecoverable failure
+     * (see {@link #handleUnrecoverable()}). This guarantees that once the actor
+     * is being restarted no further batches are processed by this (now defunct)
+     * runner instance, preventing duplicate work racing the fresh instance.
      */
     @Override
     public void persistBatch(List<PersistenceEvent<E>> batch) {
+        if (state == State.STOPPED) {
+            return;
+        }
         persistWithRetry(batch);
     }
-
-    // -----------------------------------------------------------------------
-    // Error-handling internals
-    // -----------------------------------------------------------------------
 
     private void persistWithRetry(List<PersistenceEvent<E>> batch) {
         int attempts = 0;
@@ -199,6 +189,11 @@ public final class BatchingPersistenceRunner<E> implements PersistenceRunner<E> 
                 batch.forEach(e -> sideEffectProcessor.process(e.sideEffect()));
                 return; // success
             } catch (SingleItemException e) {
+                // Poison pill(s): isolate item-by-item — good items persist and
+                // the bad one is dead-lettered via onPoisonPill — then halt and
+                // hand off to the unrecoverable hook. The hook (e.g. in a sharded
+                // Kafka setup) restarts the actor, which resumes from the last
+                // durably committed offset. This runner instance stops here.
                 flushItemByItem(batch);
                 handleUnrecoverable();
                 return;
@@ -263,6 +258,10 @@ public final class BatchingPersistenceRunner<E> implements PersistenceRunner<E> 
      * seek-to-committed-offset so the partition replays from a clean state.
      */
     private void handleUnrecoverable() {
+        // Halt first: no further batches will be processed by this runner. The
+        // hook typically restarts the actor, which brings up a fresh runner;
+        // this defunct one must not keep draining batches and racing it.
+        state = State.STOPPED;
         try {
             onUnrecoverable.run();
         } catch (Exception ignored) {

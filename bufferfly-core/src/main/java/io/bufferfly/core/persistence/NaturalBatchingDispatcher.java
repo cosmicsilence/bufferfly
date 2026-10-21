@@ -3,10 +3,10 @@ package io.bufferfly.core.persistence;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
-import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -34,15 +34,18 @@ import java.util.concurrent.atomic.AtomicReference;
  * only needed for interrupting the in-flight task during {@link #clear()}.
  *
  * <h2>Buffer</h2>
- * An unbounded {@link ConcurrentLinkedQueue} ensures {@link #enqueue} is
- * always non-blocking and never stalls the actor loop.
+ * An effectively unbounded {@link LinkedBlockingQueue} (capacity
+ * {@link Integer#MAX_VALUE}) ensures {@link #enqueue} is always non-blocking
+ * and never stalls the actor loop. Its {@link LinkedBlockingQueue#size()} is
+ * O(1) (backed by an internal counter), so {@link #size()} is cheap enough to
+ * be polled on every enqueue by a backpressure decorator.
  */
 public class NaturalBatchingDispatcher<E> implements PersistenceDispatcher<E> {
 
     private final int batchSize;
     private final long timeoutMs;
 
-    private final ConcurrentLinkedQueue<PersistenceRunner.PersistenceEvent<E>> buffer = new ConcurrentLinkedQueue<>();
+    private final LinkedBlockingQueue<PersistenceRunner.PersistenceEvent<E>> buffer = new LinkedBlockingQueue<>(Integer.MAX_VALUE);
     private final ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
     private final AtomicBoolean scheduled = new AtomicBoolean(false);
     private final AtomicReference<Future<?>> runningTask = new AtomicReference<>(null);
@@ -67,6 +70,11 @@ public class NaturalBatchingDispatcher<E> implements PersistenceDispatcher<E> {
                 .ofNullable(runningTask.getAndSet(null))
                 .ifPresent(f -> f.cancel(true));
         buffer.clear();
+    }
+
+    @Override
+    public int size() {
+        return buffer.size();
     }
 
     private void tryConsumeSafely(PersistenceRunner<E> runner) {

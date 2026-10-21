@@ -19,12 +19,12 @@ public class ActorManager {
      * Key = actor name, value = the Dispatcher instance to use for that actor.
      * Falls back to {@link #defaultDispatcher} for actors not in this map.
      */
-    private final Map<String, Dispatcher> configuredDispatchers;
+    private final Map<String, ActorDispatcher> configuredDispatchers;
 
     /**
      * The dispatcher used when no per-actor override is configured.
      */
-    private final Dispatcher defaultDispatcher;
+    private final ActorDispatcher defaultDispatcher;
 
     /**
      * Creates an ActorManager with default settings (VTDispatcher, capacity 20 000).
@@ -39,12 +39,12 @@ public class ActorManager {
      *
      * <p>Wiring rules:
      * <ol>
-     *   <li>A single shared default {@link Dispatcher} is instantiated from
+     *   <li>A single shared default {@link ActorDispatcher} is instantiated from
      *       {@code config.actors.defaultDispatcher} (FQN, no-arg constructor).
      *       It receives the global default mailbox capacity plus the full map of
      *       per-actor capacity overrides so it can size each mailbox correctly.</li>
      *   <li>For each actor that specifies a <em>different</em> dispatcher FQN in its
-     *       override, a dedicated {@link Dispatcher} instance is instantiated and
+     *       override, a dedicated {@link ActorDispatcher} instance is instantiated and
      *       registered in {@code configuredDispatchers}.</li>
      * </ol>
      */
@@ -64,7 +64,7 @@ public class ActorManager {
                 allCapacityOverrides
         );
 
-        Map<String, Dispatcher> perActor = new HashMap<>();
+        Map<String, ActorDispatcher> perActor = new HashMap<>();
         actors.getOverrides().forEach((actorName, override) -> {
             String fqn = override.getDispatcher();
             if (fqn != null && !fqn.equals(actors.getDefaultDispatcher())) {
@@ -89,7 +89,7 @@ public class ActorManager {
      */
     public <T> ActorReference<T> start(Actor<T> actor) {
         final var registered = startedActors.computeIfAbsent(actor.name(), ignored -> {
-            Dispatcher dispatcher = configuredDispatchers.getOrDefault(
+            ActorDispatcher dispatcher = configuredDispatchers.getOrDefault(
                     actor.name(), defaultDispatcher);
             DispatchingActor<T> dispatchingActor = new DispatchingActor<>(actor, dispatcher);
             callStartExecutor.execute(dispatchingActor::start);
@@ -98,7 +98,7 @@ public class ActorManager {
         return (ActorReference<T>) registered;
     }
 
-    private static Dispatcher instantiateDispatcher(
+    private static ActorDispatcher instantiateDispatcher(
             String fqn,
             int defaultCapacity,
             Map<String, Integer> capacityOverrides) {
@@ -108,11 +108,11 @@ public class ActorManager {
         }
         try {
             Class<?> cls = Class.forName(fqn);
-            if (!Dispatcher.class.isAssignableFrom(cls)) {
+            if (!ActorDispatcher.class.isAssignableFrom(cls)) {
                 throw new IllegalArgumentException(
                         "Class '%s' does not implement Dispatcher".formatted(fqn));
             }
-            return (Dispatcher) cls.getDeclaredConstructor().newInstance();
+            return (ActorDispatcher) cls.getDeclaredConstructor().newInstance();
         } catch (ClassNotFoundException e) {
             throw new IllegalArgumentException(
                     "Dispatcher class not found on classpath: " + fqn, e);
@@ -127,7 +127,7 @@ public class ActorManager {
      * outside world. Implements only {@link ActorReference} — callers never
      * see the underlying {@link Actor}.
      *
-     * <p>Routing: {@code tell()} → {@link Dispatcher#dispatch} → {@link Actor#receive}.
+     * <p>Routing: {@code tell()} → {@link ActorDispatcher#dispatch} → {@link Actor#receive}.
      * <p>Lifecycle: {@code start()} delegates to {@link Actor#start()};
      * {@code stop()} drains / clears the dispatcher and calls
      * {@link AbstractActor#stop()} if the delegate is an
@@ -136,9 +136,9 @@ public class ActorManager {
     private final class DispatchingActor<T> implements ActorReference<T> {
 
         private final Actor<T> delegate;
-        private final Dispatcher dispatcher;
+        private final ActorDispatcher dispatcher;
 
-        DispatchingActor(Actor<T> delegate, Dispatcher dispatcher) {
+        DispatchingActor(Actor<T> delegate, ActorDispatcher dispatcher) {
             this.delegate = delegate;
             this.dispatcher = dispatcher;
         }

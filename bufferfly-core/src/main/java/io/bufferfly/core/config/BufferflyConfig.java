@@ -1,5 +1,7 @@
 package io.bufferfly.core.config;
 
+import io.bufferfly.core.actor.ActorDispatcher;
+
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
@@ -90,7 +92,7 @@ public final class BufferflyConfig {
         private final int defaultMailboxCapacity;
 
         /**
-         * Fully-qualified class name of the default {@link io.bufferfly.core.actor.Dispatcher}
+         * Fully-qualified class name of the default {@link ActorDispatcher}
          * implementation to use when no per-actor override is present.
          * Must have a public no-arg constructor.
          */
@@ -159,7 +161,7 @@ public final class BufferflyConfig {
     public static final class ActorOverrideConfig {
 
         /**
-         * FQN of the {@link io.bufferfly.core.actor.Dispatcher} to use for this actor.
+         * FQN of the {@link ActorDispatcher} to use for this actor.
          * {@code null} means fall back to the pool default.
          */
         private final String dispatcher;
