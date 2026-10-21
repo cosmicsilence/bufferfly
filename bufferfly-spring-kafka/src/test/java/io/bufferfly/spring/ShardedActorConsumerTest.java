@@ -25,14 +25,14 @@ class ShardedActorConsumerTest {
 
     private static final TopicPartition TP = new TopicPartition("orders", 2);
 
-    static final class FakeActorRef implements ActorReference<String> {
-        final List<String> told = new ArrayList<>();
+    static final class FakeActorRef implements ActorReference<ConsumedRecord<String>> {
+        final List<ConsumedRecord<String>> told = new ArrayList<>();
         RuntimeException toThrow;
 
         @Override
-        public void tell(String s) {
+        public void tell(ConsumedRecord<String> r) {
             if (toThrow != null) throw toThrow;
-            told.add(s);
+            told.add(r);
         }
 
         @Override
@@ -60,10 +60,12 @@ class ShardedActorConsumerTest {
         var consumer = new ShardedActorConsumer<>(TP, actor, paused::add);
         CountingAck ack = new CountingAck();
 
-        boolean accepted = consumer.accept(record(10, "v1"), ack);
+        boolean accepted = consumer.tellActor(record(10, "v1"), ack);
 
         assertTrue(accepted);
-        assertEquals(List.of("v1"), actor.told);
+        assertEquals(1, actor.told.size());
+        assertEquals("v1", actor.told.get(0).value());
+        assertEquals(10L, actor.told.get(0).offset());
         assertEquals(1, ack.acks.get(), "offset acknowledged exactly once");
         assertTrue(paused.isEmpty(), "no pause when healthy");
     }
@@ -76,7 +78,7 @@ class ShardedActorConsumerTest {
         var consumer = new ShardedActorConsumer<>(TP, actor, paused::add);
         CountingAck ack = new CountingAck();
 
-        boolean accepted = consumer.accept(record(11, "v2"), ack);
+        boolean accepted = consumer.tellActor(record(11, "v2"), ack);
 
         assertFalse(accepted);
         assertEquals(0, ack.acks.get(), "no ack -> offset not committed -> will redeliver (no message loss)");
@@ -91,7 +93,7 @@ class ShardedActorConsumerTest {
         var consumer = new ShardedActorConsumer<>(TP, actor, paused::add);
         CountingAck ack = new CountingAck();
 
-        boolean accepted = consumer.accept(record(12, "v3"), ack);
+        boolean accepted = consumer.tellActor(record(12, "v3"), ack);
 
         assertFalse(accepted);
         assertEquals(0, ack.acks.get(), "mailbox refusal must not ack -> redelivery");

@@ -48,7 +48,7 @@ class EmbeddedKafkaShardedActorTest {
     }
 
     /** One actor per partition; records what it received and which partition it owns. */
-    static final class PartitionActor extends AbstractActor<String> {
+    static final class PartitionActor extends AbstractActor<ConsumedRecord<String>> {
         final List<String> received = new CopyOnWriteArrayList<>();
         private final String name;
 
@@ -57,8 +57,8 @@ class EmbeddedKafkaShardedActorTest {
         }
 
         @Override
-        public void receive(String message) {
-            received.add(message);
+        public void receive(ConsumedRecord<String> message) {
+            received.add(message.value());
         }
 
         @Override
@@ -67,7 +67,7 @@ class EmbeddedKafkaShardedActorTest {
         }
 
         @Override
-        public void onError(String message, Exception e) {
+        public void onError(ConsumedRecord<String> message, Exception e) {
         }
     }
 
@@ -76,7 +76,7 @@ class EmbeddedKafkaShardedActorTest {
         final Set<TopicPartition> assigned = ConcurrentHashMap.newKeySet();
 
         @Override
-        public Actor<String> createActor(TopicPartition tp, KafkaContext ctx) {
+        public Actor<ConsumedRecord<String>> createActor(TopicPartition tp, KafkaContext ctx) {
             assigned.add(tp);
             PartitionActor actor = new PartitionActor(actorName(tp));
             actors.put(tp, actor);

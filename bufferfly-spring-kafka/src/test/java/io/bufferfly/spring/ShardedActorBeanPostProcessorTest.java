@@ -24,7 +24,7 @@ class ShardedActorBeanPostProcessorTest {
             highWatermark = 1000, lowWatermark = 100)
     static class GoodFactory implements ShardedActorFactory<String> {
         @Override
-        public Actor<String> createActor(TopicPartition tp, KafkaContext ctx) {
+        public Actor<ConsumedRecord<String>> createActor(TopicPartition tp, KafkaContext ctx) {
             return null;
         }
     }
@@ -32,7 +32,7 @@ class ShardedActorBeanPostProcessorTest {
     @ShardedActor(name = "bad", topic = "t", highWatermark = 10, lowWatermark = 20)
     static class InvalidWatermarksFactory implements ShardedActorFactory<String> {
         @Override
-        public Actor<String> createActor(TopicPartition tp, KafkaContext ctx) {
+        public Actor<ConsumedRecord<String>> createActor(TopicPartition tp, KafkaContext ctx) {
             return null;
         }
     }

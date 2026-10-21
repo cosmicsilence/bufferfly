@@ -86,4 +86,22 @@ public interface KafkaContext {
      * once this actor's buffer recedes to its low watermark. Idempotent.
      */
     void resumePartition();
+
+    /**
+     * Stops the current actor for this partition and starts a fresh one,
+     * forcing an offset rewind.
+     *
+     * <p>This is the recovery action for an <em>unrecoverable</em> failure — for
+     * example a failed offset fence caused by a zombie actor racing the new
+     * owner after a rebalance. Stopping tears down the current (possibly
+     * contending) instance and its persistence runner; starting creates a new
+     * instance whose {@code preStart} re-seeks to the authoritative offset
+     * durably stored in the database, so processing resumes from a known-good
+     * position with no double counting and no loss.
+     *
+     * <p>Safe to call from the persistence thread (e.g. a runner's
+     * {@code onUnrecoverable} hook); the stop/start is performed off that thread
+     * so the failing callback is not restarting itself inline.
+     */
+    void restartActor();
 }

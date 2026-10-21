@@ -18,7 +18,7 @@ import java.util.function.Consumer;
  * {@link ActorReference}.
  *
  * <p>The Spring message listener does not talk to the actor directly; it calls
- * {@link #accept(ConsumerRecord, Acknowledgment)} here, keeping all
+ * {@link #tellActor(ConsumerRecord, Acknowledgment)} here, keeping all
  * actor-interaction and acknowledgement policy in one place.
  *
  * <h2>No message loss</h2>
@@ -49,7 +49,7 @@ public final class ShardedActorConsumer<V> {
     private static final Logger log = LoggerFactory.getLogger(ShardedActorConsumer.class);
 
     private final TopicPartition topicPartition;
-    private final ActorReference<V> actor;
+    private final ActorReference<ConsumedRecord<V>> actor;
     private final Consumer<TopicPartition> pauseSignal;
 
     /**
@@ -60,7 +60,7 @@ public final class ShardedActorConsumer<V> {
      *                       pause the partition
      */
     public ShardedActorConsumer(TopicPartition topicPartition,
-                                ActorReference<V> actor,
+                                ActorReference<ConsumedRecord<V>> actor,
                                 Consumer<TopicPartition> pauseSignal) {
         this.topicPartition = Objects.requireNonNull(topicPartition, "topicPartition");
         this.actor = Objects.requireNonNull(actor, "actor");
@@ -72,7 +72,8 @@ public final class ShardedActorConsumer<V> {
     }
 
     /**
-     * Delivers one record's value to the actor and acknowledges it on success.
+     * Delivers one record (value + offset envelope) to the actor and
+     * acknowledges it on success.
      *
      * @param record the polled record (its partition must match this consumer's)
      * @param ack    the manual acknowledgment handle
@@ -80,9 +81,11 @@ public final class ShardedActorConsumer<V> {
      *         {@code false} if it was rejected due to backpressure (not acked,
      *         partition pause requested, record will be redelivered)
      */
-    public boolean accept(ConsumerRecord<?, V> record, Acknowledgment ack) {
+    public boolean tellActor(ConsumerRecord<?, V> record, Acknowledgment ack) {
+        ConsumedRecord<V> envelope = new ConsumedRecord<>(
+                record.topic(), record.partition(), record.offset(), record.value());
         try {
-            actor.tell(record.value());
+            actor.tell(envelope);
         } catch (UnderPressureException | MailBoxRefusedException bp) {
             // Do NOT acknowledge: the record stays uncommitted and will be
             // redelivered once the partition is resumed. Ask the container to
@@ -96,8 +99,22 @@ public final class ShardedActorConsumer<V> {
             pauseSignal.accept(topicPartition);
             return false;
         }
-        // Accepted into the mailbox (and guaranteed to be persisted by the
-        // actor's persistence runner) -> safe to acknowledge the offset.
+        // Accepted into the mailbox. We acknowledge the Kafka offset here, but
+        // note this is NOT a guarantee that persistence succeeds: the record is
+        // processed asynchronously by the actor and its persistence runner.
+        //
+        // Durability is instead guaranteed by the actor persisting the consumed
+        // offset in the SAME transaction as the data (see the ledger showcase's
+        // optimistic-locking fencing token). The Kafka ack only governs where a
+        // fresh consumer would resume; on restart the actor seeks back to its
+        // DB-stored offset regardless, so nothing committed to Kafka but not to
+        // the DB is lost.
+        //
+        // If persistence rejects a record as a poison pill, the runner isolates
+        // it (TransactionalOperations.onPoisonPill) — e.g. writing it to a
+        // DEAD_MESSAGE(id, payload, topic, partition) table — and may then halt
+        // the actor; the container restarts it, and it resumes from the last
+        // durably stored offset, skipping the dead-lettered record without loss.
         ack.acknowledge();
         return true;
     }

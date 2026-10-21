@@ -78,6 +78,18 @@ public final class ShardedActorContainer<K, V> {
     private final ActorManager actorManager;
     private final ConcurrentMessageListenerContainer<K, V> container;
 
+    /**
+     * Runs actor stop+start restarts off the caller thread, so an
+     * {@code onUnrecoverable} hook (which fires on the persistence thread) does
+     * not restart its own actor inline. Single-threaded: restarts are serialized.
+     */
+    private final java.util.concurrent.ExecutorService restartExecutor =
+            java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
+                Thread t = new Thread(r, "bufferfly-sharded-restart");
+                t.setDaemon(true);
+                return t;
+            });
+
     /** Per-partition runtime state, created on assign, removed on revoke. */
     private final Map<TopicPartition, Shard<V>> shards = new ConcurrentHashMap<>();
 
@@ -92,7 +104,7 @@ public final class ShardedActorContainer<K, V> {
     private volatile java.util.function.Consumer<TopicPartition> pausePartitionAction;
     private volatile java.util.function.Consumer<TopicPartition> resumePartitionAction;
 
-    private record Shard<V>(ActorReference<V> actorRef, ShardedActorConsumer<V> consumer) {
+    private record Shard<V>(ActorReference<ConsumedRecord<V>> actorRef, ShardedActorConsumer<V> consumer) {
     }
 
     public ShardedActorContainer(String name,
@@ -111,6 +123,9 @@ public final class ShardedActorContainer<K, V> {
         ContainerProperties props = new ContainerProperties(topic);
         props.setGroupId(name);
         props.setAckMode(ContainerProperties.AckMode.MANUAL_IMMEDIATE);
+        // Fire onIdleContainer periodically so a seek signalled by an actor's
+        // asynchronous preStart is flushed even when no records are arriving.
+        props.setIdleEventInterval(200L);
         props.setMessageListener(new PartitionRoutingListener());
         props.setConsumerRebalanceListener(new ShardRebalanceListener());
 
@@ -134,6 +149,7 @@ public final class ShardedActorContainer<K, V> {
         shards.keySet().forEach(this::stopShard);
         shards.clear();
         seekStates.clear();
+        restartExecutor.shutdownNow();
     }
 
     public ConcurrentMessageListenerContainer<K, V> container() {
@@ -144,13 +160,15 @@ public final class ShardedActorContainer<K, V> {
         return name;
     }
 
-    // -- test / inspection helpers ------------------------------------------
+    // -- inspection helpers -------------------------------------------------
 
-    boolean hasShard(TopicPartition tp) {
+    /** @return {@code true} if an actor shard currently owns the given partition. */
+    public boolean hasShard(TopicPartition tp) {
         return shards.containsKey(tp);
     }
 
-    int shardCount() {
+    /** @return the number of partitions currently assigned and running an actor. */
+    public int shardCount() {
         return shards.size();
     }
 
@@ -160,8 +178,8 @@ public final class ShardedActorContainer<K, V> {
         shards.computeIfAbsent(tp, partition -> {
             SeekState seekState = seekStates.computeIfAbsent(partition, p -> new SeekState());
             KafkaContextImpl ctx = new KafkaContextImpl(partition, seekState);
-            Actor<V> actor = factory.createActor(partition, ctx);
-            ActorReference<V> ref = actorManager.start(actor);
+            Actor<ConsumedRecord<V>> actor = factory.createActor(partition, ctx);
+            ActorReference<ConsumedRecord<V>> ref = actorManager.start(actor);
             ShardedActorConsumer<V> consumerBridge =
                     new ShardedActorConsumer<>(partition, ref, this::pausePartition);
             log.info("Assigned partition {} -> started actor '{}'", partition, actor.name());
@@ -171,9 +189,13 @@ public final class ShardedActorContainer<K, V> {
 
     private void stopShard(TopicPartition tp) {
         Shard<V> shard = shards.remove(tp);
-        seekStates.remove(tp);
+        // NOTE: do NOT touch seekStates here. The ConsumerSeekCallback is bound
+        // to the Kafka *assignment*, which survives an internal actor restart
+        // (stopShard + startShard without a rebalance). The SeekState is cleared
+        // only on a genuine revoke/lost (see ShardRebalanceListener /
+        // PartitionRoutingListener.onPartitionsRevoked) or on container stop().
         if (shard != null) {
-            log.info("Revoked partition {} -> stopping actor", tp);
+            log.info("Stopping actor for partition {}", tp);
             shard.actorRef().stop();
         }
     }
@@ -184,6 +206,24 @@ public final class ShardedActorContainer<K, V> {
 
     private void resumePartition(TopicPartition tp) {
         resumePartitionAction.accept(tp);
+    }
+
+    /**
+     * Stops and re-starts the actor owning {@code tp}, forcing its new instance
+     * to re-seek to the DB-stored offset. Runs asynchronously on
+     * {@link #restartExecutor} so an {@code onUnrecoverable} hook firing on the
+     * persistence thread does not restart its own actor inline.
+     */
+    private void restartShard(TopicPartition tp) {
+        restartExecutor.execute(() -> {
+            if (!shards.containsKey(tp)) {
+                return; // partition no longer owned here (e.g. revoked meanwhile)
+            }
+            log.warn("Restarting actor for {} (unrecoverable failure) -> rewinding to stored offset", tp);
+            stopShard(tp);
+            startShard(tp);            // new preStart() re-seeks to the DB offset
+            resumePartition(tp);       // in case the partition was paused before the restart
+        });
     }
 
     /** Test seam: override how partitions are paused (no live container required). */
@@ -208,20 +248,34 @@ public final class ShardedActorContainer<K, V> {
 
         @Override
         public void onPartitionsAssigned(Map<TopicPartition, Long> assignments, ConsumerSeekCallback callback) {
-            // The seek callback is owned by the consumer thread; hand it to the
-            // partition's SeekState and flush any seek the actor already requested.
+            // Runs on the consumer thread. Give each assigned partition's
+            // SeekState the callback and flush any seek the actor already
+            // requested during its (possibly async) preStart.
             assignments.keySet().forEach(tp -> {
                 SeekState state = seekStates.computeIfAbsent(tp, p -> new SeekState());
-                state.bind(callback, tp);
+                state.bind(callback);
+            });
+        }
+
+        @Override
+        public void onIdleContainer(Map<TopicPartition, Long> assignments, ConsumerSeekCallback callback) {
+            // Runs on the consumer thread. Covers the race where the actor's
+            // async preStart signalled a seek AFTER onPartitionsAssigned fired
+            // and before any record arrived: flush it now.
+            assignments.keySet().forEach(tp -> {
+                SeekState state = seekStates.get(tp);
+                if (state != null) {
+                    state.bind(callback);
+                }
             });
         }
 
         @Override
         public void onPartitionsRevoked(Collection<TopicPartition> partitions) {
-            partitions.forEach(tp -> {
-                SeekState state = seekStates.get(tp);
-                if (state != null) state.unbind();
-            });
+            // Genuine revoke: the assignment (and thus the seek callback) is gone.
+            // Drop the SeekState entirely. (An internal actor restart does NOT go
+            // through here, so a restarted actor keeps its bound callback.)
+            partitions.forEach(seekStates::remove);
         }
     }
 
@@ -234,6 +288,20 @@ public final class ShardedActorContainer<K, V> {
      */
     boolean onRecord(ConsumerRecord<K, V> record, Acknowledgment ack) {
         TopicPartition tp = new TopicPartition(record.topic(), record.partition());
+        // Consumer thread: apply any seek the actor signalled (e.g. during
+        // preStart) before we hand this record over.
+        SeekState seekState = seekStates.get(tp);
+        if (seekState != null) {
+            seekState.flushPending();
+            // Discard records left over from a poll taken BEFORE a rewind-seek
+            // took effect. Without this, a stale record (e.g. a higher offset
+            // fetched pre-seek) could reach the actor out of order and advance
+            // persisted state past records that were never processed.
+            if (!seekState.shouldDeliver(record.offset())) {
+                log.debug("Discarding stale pre-seek record {} at offset {}", tp, record.offset());
+                return false;
+            }
+        }
         Shard<V> shard = shards.get(tp);
         if (shard == null) {
             // Partition not (yet) owned here — do not ack; it will be
@@ -241,7 +309,7 @@ public final class ShardedActorContainer<K, V> {
             log.warn("No shard for {} at offset {}; skipping (will redeliver)", tp, record.offset());
             return false;
         }
-        shard.consumer().accept(record, ack);
+        shard.consumer().tellActor(record, ack);
         return true;
     }
 
@@ -277,9 +345,9 @@ public final class ShardedActorContainer<K, V> {
         partitions.forEach(this::stopShard);
     }
 
-    /** Test seam: bind a seek callback to a partition as the consumer thread would. */
+    /** bind a seek callback to a partition as the consumer thread would. */
     void bindSeekCallback(TopicPartition tp, ConsumerSeekAware.ConsumerSeekCallback cb) {
-        seekStates.computeIfAbsent(tp, p -> new SeekState()).bind(cb, tp);
+        seekStates.computeIfAbsent(tp, p -> new SeekState()).bind(cb);
     }
 
     // -- seek state ---------------------------------------------------------
@@ -294,43 +362,94 @@ public final class ShardedActorContainer<K, V> {
      */
     private static final class SeekState {
         private ConsumerSeekAware.ConsumerSeekCallback callback;
-        private Runnable pending; // buffered seek if callback not yet bound
+        private java.util.function.Consumer<ConsumerSeekAware.ConsumerSeekCallback> pending; // buffered seek
 
-        synchronized void bind(ConsumerSeekAware.ConsumerSeekCallback cb, TopicPartition tp) {
+        /**
+         * The offset the next delivered record is expected to have. Set when a
+         * seek is signalled. {@code -1} means "no expectation" (accept whatever
+         * arrives — e.g. before any seek, or after seekToEnd). Used to DISCARD
+         * records left over from a poll that happened before a rewind-seek took
+         * effect, so a stale higher/earlier offset can never slip through.
+         */
+        private long expectedNextOffset = -1;
+
+        synchronized void bind(ConsumerSeekAware.ConsumerSeekCallback cb) {
             this.callback = cb;
-            if (pending != null) {
-                pending.run();
+            flushPending();
+        }
+
+        /**
+         * Decides whether a just-polled record should be delivered to the actor.
+         * Runs on the consumer thread (from {@code onRecord}).
+         *
+         * <ul>
+         *   <li>no expectation ({@code -1}) → deliver (steady state, no seek in
+         *       effect);</li>
+         *   <li>offset == expected → deliver and advance the expectation by one;</li>
+         *   <li>any other offset (lower = stale leftover from a pre-seek poll, or
+         *       higher = out-of-order ahead of the sought position) → discard.</li>
+         * </ul>
+         *
+         * <p>After a rewind-seek Kafka re-delivers strictly in order from the
+         * sought offset, so the expected sequence arrives contiguously; only
+         * records left over from the previous poll fail the {@code == expected}
+         * check and are dropped.
+         */
+        synchronized boolean shouldDeliver(long recordOffset) {
+            if (expectedNextOffset < 0) {
+                return true;
+            }
+            if (recordOffset == expectedNextOffset) {
+                expectedNextOffset++;
+                return true;
+            }
+            return false;
+        }
+
+        /**
+         * Called on the <b>consumer thread</b> (from {@code onPartitionsAssigned},
+         * {@code onRecord} or {@code onIdleContainer}). Applies any buffered seek
+         * via the callback. The callback performs the actual
+         * {@code KafkaConsumer} seek, so it must only ever run here — never on an
+         * actor thread.
+         */
+        synchronized void flushPending() {
+            if (callback != null && pending != null) {
+                pending.accept(callback);
                 pending = null;
             }
         }
 
-        synchronized void unbind() {
-            this.callback = null;
-        }
+        // The following are called from the ACTOR thread. They ONLY record the
+        // intent; they never touch the callback / consumer. The consumer thread
+        // later drains it via flushPending().
 
-        /** Called from the actor thread: signal a seek (never touches the consumer directly). */
         synchronized void signalSeek(TopicPartition tp, long offset) {
-            if (callback != null) {
-                callback.seek(tp.topic(), tp.partition(), offset);
-            } else {
-                pending = () -> callback.seek(tp.topic(), tp.partition(), offset);
-            }
+            expectedNextOffset = offset;
+            pending = cb -> cb.seek(tp.topic(), tp.partition(), offset);
+            flushIfOnConsumerThreadImpossible();
         }
 
         synchronized void signalSeekToBeginning(TopicPartition tp) {
-            if (callback != null) {
-                callback.seekToBeginning(tp.topic(), tp.partition());
-            } else {
-                pending = () -> callback.seekToBeginning(tp.topic(), tp.partition());
-            }
+            expectedNextOffset = 0;
+            pending = cb -> cb.seekToBeginning(tp.topic(), tp.partition());
+            flushIfOnConsumerThreadImpossible();
         }
 
         synchronized void signalSeekToEnd(TopicPartition tp) {
-            if (callback != null) {
-                callback.seekToEnd(tp.topic(), tp.partition());
-            } else {
-                pending = () -> callback.seekToEnd(tp.topic(), tp.partition());
-            }
+            expectedNextOffset = -1; // cannot predict the end offset; accept what arrives
+            pending = cb -> cb.seekToEnd(tp.topic(), tp.partition());
+            flushIfOnConsumerThreadImpossible();
+        }
+
+        /**
+         * Deliberately a no-op: a seek signalled from the actor thread is never
+         * flushed here (that would run the callback off the consumer thread and
+         * trip {@code KafkaConsumer}'s single-thread guard). It is flushed later
+         * by the consumer thread. This method documents that intent.
+         */
+        private void flushIfOnConsumerThreadImpossible() {
+            // no-op by design — see flushPending()
         }
     }
 
@@ -380,6 +499,11 @@ public final class ShardedActorContainer<K, V> {
         @Override
         public void resumePartition() {
             ShardedActorContainer.this.resumePartition(tp);
+        }
+
+        @Override
+        public void restartActor() {
+            ShardedActorContainer.this.restartShard(tp);
         }
     }
 }

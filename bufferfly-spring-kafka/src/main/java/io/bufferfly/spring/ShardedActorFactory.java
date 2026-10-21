@@ -19,9 +19,10 @@ import org.apache.kafka.common.TopicPartition;
  * {@link KafkaContext#seek(long) seek} back to it, guaranteeing no message loss
  * across restarts.
  *
- * <p>Actors returned here consume the Kafka <em>value</em> type {@code V}; the
- * framework unwraps each {@code ConsumerRecord} and {@code tell}s the value to
- * the actor. Each actor's {@link Actor#name()} must be unique per partition —
+ * <p>Actors returned here consume a {@link ConsumedRecord} wrapping the Kafka
+ * <em>value</em> type {@code V} together with its offset; the framework builds
+ * the envelope from each {@code ConsumerRecord} and {@code tell}s it to the
+ * actor. Each actor's {@link Actor#name()} must be unique per partition —
  * implementations should derive it from the topic-partition (see
  * {@link #actorName(TopicPartition)}).
  *
@@ -37,7 +38,7 @@ public interface ShardedActorFactory<V> {
      * @param kafkaContext   handle to rewind/seek the partition's offset
      * @return a fresh, not-yet-started actor; the framework calls {@code start()}
      */
-    Actor<V> createActor(TopicPartition topicPartition, KafkaContext kafkaContext);
+    Actor<ConsumedRecord<V>> createActor(TopicPartition topicPartition, KafkaContext kafkaContext);
 
     /**
      * Derives a unique, stable actor name for a partition. Used by the framework

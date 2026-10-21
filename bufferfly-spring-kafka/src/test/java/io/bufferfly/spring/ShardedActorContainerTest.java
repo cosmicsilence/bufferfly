@@ -33,7 +33,7 @@ class ShardedActorContainerTest {
     private static final TopicPartition TP1 = new TopicPartition(TOPIC, 1);
 
     /** Records every value it receives; signals a seek to a stored offset on start. */
-    static final class CountingActor extends AbstractActor<String> {
+    static final class CountingActor extends AbstractActor<ConsumedRecord<String>> {
         final List<String> received = new CopyOnWriteArrayList<>();
         private final String name;
         final KafkaContext ctx;
@@ -51,8 +51,8 @@ class ShardedActorContainerTest {
         }
 
         @Override
-        public void receive(String message) {
-            received.add(message);
+        public void receive(ConsumedRecord<String> message) {
+            received.add(message.value());
         }
 
         @Override
@@ -61,7 +61,7 @@ class ShardedActorContainerTest {
         }
 
         @Override
-        public void onError(String message, Exception e) {
+        public void onError(ConsumedRecord<String> message, Exception e) {
         }
     }
 
@@ -74,7 +74,7 @@ class ShardedActorContainerTest {
         }
 
         @Override
-        public Actor<String> createActor(TopicPartition tp, KafkaContext ctx) {
+        public Actor<ConsumedRecord<String>> createActor(TopicPartition tp, KafkaContext ctx) {
             CountingActor actor = new CountingActor(actorName(tp), ctx, storedOffset);
             created.add(actor);
             return actor;
@@ -153,14 +153,45 @@ class ShardedActorContainerTest {
 
         // partition assigned -> actor created and (async) preStart signals seek(42)
         container.onAssigned(List.of(TP0));
-        // consumer thread binds its seek callback for the partition
         RecordingSeekCallback cb = new RecordingSeekCallback();
-        container.bindSeekCallback(TP0, cb);
 
-        // the buffered seek is flushed to the callback on bind (or on signal if already bound)
+        // The consumer thread repeatedly binds/flushes (as onPartitionsAssigned /
+        // onIdleContainer / onRecord would). The actor's async preStart signal is
+        // buffered and relayed to the callback on the next consumer-thread flush.
         await().untilAsserted(() -> {
+            container.bindSeekCallback(TP0, cb); // re-flush on "consumer thread"
             assertEquals(1, cb.seeks.size(), "exactly one seek relayed");
             assertEquals(new RecordingSeekCallback.Seek(TOPIC, 0, 42L), cb.seeks.get(0));
+        });
+    }
+
+    @Test
+    void should_preserveSeekCallbackAcrossRestart_soRestartedActorRewinds() {
+        CapturingFactory factory = new CapturingFactory(42L);
+        ShardedActorContainer<String, String> container = newContainer(factory);
+
+        container.onAssigned(List.of(TP0));
+        RecordingSeekCallback cb = new RecordingSeekCallback();
+
+        // First actor's preStart seek(42) is relayed.
+        await().untilAsserted(() -> {
+            container.bindSeekCallback(TP0, cb);
+            assertEquals(1, cb.seeks.size());
+        });
+
+        CountingActor first = factory.created.get(0);
+
+        // Trigger an actor restart (as onUnrecoverable would). stopShard must NOT
+        // discard the SeekState, so the callback bound above survives and the
+        // NEW actor's preStart seek is still relayed.
+        first.ctx.restartActor();
+
+        await().untilAsserted(() -> {
+            container.bindSeekCallback(TP0, cb); // consumer-thread flush
+            // a second actor was created and its rewind seek reached the callback
+            assertTrue(factory.created.size() >= 2, "restart created a fresh actor");
+            assertEquals(2, cb.seeks.size(), "restarted actor's rewind seek must be relayed");
+            assertEquals(new RecordingSeekCallback.Seek(TOPIC, 0, 42L), cb.seeks.get(1));
         });
     }
 
@@ -186,7 +217,7 @@ class ShardedActorContainerTest {
 
         RecordingAck ack = new RecordingAck();
         boolean handled = container.onRecord(
-                new ConsumerRecord<>(TOPIC, 0, 5L, "k", "hello"), ack);
+                new ConsumerRecord<>(TOPIC, 0, 0L, "k", "hello"), ack);
 
         assertTrue(handled);
         await().untilAsserted(() -> assertEquals(1, ack.acks.get()));
