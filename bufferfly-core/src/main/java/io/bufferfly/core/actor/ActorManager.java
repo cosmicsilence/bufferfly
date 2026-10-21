@@ -1,5 +1,6 @@
 package io.bufferfly.core.actor;
 
+import io.bufferfly.core.actor.Actor.State;
 import io.bufferfly.core.config.BufferflyConfig;
 
 import java.util.HashMap;
@@ -149,9 +150,10 @@ public class ActorManager {
 
         @Override
         public void tell(T message) {
-            if (!delegate.isStarted() && !delegate.isPreStarting()) {
+            final var state = delegate.currentState();
+            if (!State.isStartingOrStartedState(state)) {
                 throw new ActorNotStartedException(
-                        "Actor='%s' is not started, state=%s".formatted(delegate.name(), delegate.currentState()));
+                        "Actor='%s' is not started, state=%s".formatted(delegate.name(), state));
             }
             dispatcher.dispatch(message, delegate);
         }

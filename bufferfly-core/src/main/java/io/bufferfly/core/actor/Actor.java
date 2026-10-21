@@ -33,12 +33,17 @@ public interface Actor<T> {
      */
     void stop();
 
-    /** Returns {@code true} once {@link #start()} has been called successfully. */
-    boolean isStarted();
-
-    boolean isPreStarting();
-
     AbstractActor.State currentState();
 
+    enum State {
+        NOT_STARTED,
+        PRE_STARTING,
+        STARTED,
+        STOPPED;
+
+        static boolean isStartingOrStartedState(State state) {
+            return State.STARTED == state|| State.NOT_STARTED == state || State.PRE_STARTING == state;
+        }
+    }
 
 }

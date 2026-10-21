@@ -333,7 +333,7 @@ class ActorManagerTest {
         DummyCountingActor actor = new DummyCountingActor("not-started");
         // actor.tell("msg");  // would not compile — tell() does not exist on Actor
         // The actor itself has no tell(); only the ActorReference wrapper does.
-        assertFalse(actor.isStarted(), "Actor must not be started before manager.start()");
+        assertEquals(actor.currentState(), Actor.State.NOT_STARTED);
     }
 
     // -----------------------------------------------------------------------
@@ -373,7 +373,7 @@ class ActorManagerTest {
 
             @Override
             protected void preStart() {
-                wasPreStarting = isPreStarting();
+                wasPreStarting = currentState() == State.PRE_STARTING;
                 self.tell("pre-start-message");
                 preStartCountDown.countDown();
             }
@@ -442,8 +442,7 @@ class ActorManagerTest {
         Thread.ofVirtual().start(() -> manager.start(actor));
 
         assertTrue(inPreStart.await(5, TimeUnit.SECONDS), "Actor did not enter preStart in time");
-        assertTrue(actor.isPreStarting(), "Actor should be in preStarting state");
-        assertFalse(actor.isStarted(), "Actor should not be marked fully started yet");
+        assertEquals(actor.currentState(), Actor.State.PRE_STARTING);
 
         // External caller tells actor while it is still starting
         actor.getSelf().tell("external-msg-during-prestart");
@@ -453,7 +452,7 @@ class ActorManagerTest {
 
         await().atMost(Duration.ofSeconds(5))
                .untilAsserted(() -> {
-                   assertTrue(actor.isStarted(), "Actor should now be started");
+                   assertEquals(actor.currentState(), Actor.State.STARTED);
                    assertEquals(2, actor.received.size(), "Both messages should be delivered");
                    assertTrue(actor.received.contains("actor-msg-during-prestart"));
                    assertTrue(actor.received.contains("external-msg-during-prestart"));
@@ -470,7 +469,7 @@ class ActorManagerTest {
                .untilAsserted(() -> assertEquals(1, actor.getReceiveCount()));
 
         ref.stop();
-        assertFalse(actor.isStarted(), "Actor should not be started after stop()");
+        assertEquals(actor.currentState(), Actor.State.STOPPED);
 
         ActorNotStartedException ex = assertThrows(
                 ActorNotStartedException.class,

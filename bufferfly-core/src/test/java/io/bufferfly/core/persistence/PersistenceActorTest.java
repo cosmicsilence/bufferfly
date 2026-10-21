@@ -1,5 +1,6 @@
 package io.bufferfly.core.persistence;
 
+import io.bufferfly.core.actor.Actor;
 import io.bufferfly.core.actor.ActorManager;
 import io.bufferfly.core.actor.ActorReference;
 import org.junit.jupiter.api.AfterEach;
@@ -260,7 +261,7 @@ class PersistenceActorTest {
 
         actorRef.stop();
 
-        assertFalse(actor.isStarted(), "Actor should be marked stopped");
+        assertEquals(actor.currentState(), Actor.State.STOPPED);
         // Verify runner throws IllegalStateException if new items are enqueued after stop
         assertThrows(IllegalStateException.class, () -> runner.enqueue(PersistenceRunner.newEvent(new Tweet("illegal", "test"))));
     }
@@ -294,7 +295,6 @@ class PersistenceActorTest {
         TweeterActor failingActor = new TweeterActor("fatal-actor-" + UUID.randomUUID(), failingConfig);
         ActorReference<Tweet> ref = manager.start(failingActor);
 
-        await().until(failingActor::isStarted);
         ref.tell(new Tweet("fatal-1", "This will fail unrecoverably"));
 
         await().atMost(Duration.ofSeconds(5))
@@ -335,7 +335,7 @@ class PersistenceActorTest {
         TweeterActor failingActor = new TweeterActor("exhaust-retries-actor-" + UUID.randomUUID(), failingConfig);
         ActorReference<Tweet> ref = manager.start(failingActor);
 
-        await().until(failingActor::isStarted);
+        await().until(() -> failingActor.currentState() == Actor.State.STARTED);
         ref.tell(new Tweet("transient-1", "This will fail and exhaust retries"));
 
         await().atMost(Duration.ofSeconds(5))
@@ -376,7 +376,6 @@ class PersistenceActorTest {
         TweeterActor failingActor = new TweeterActor("unexpected-error-actor-" + UUID.randomUUID(), failingConfig);
         ActorReference<Tweet> ref = manager.start(failingActor);
 
-        await().until(failingActor::isStarted);
         ref.tell(new Tweet("unexpected-1", "This will fail with unexpected runtime exception"));
 
         await().atMost(Duration.ofSeconds(5))
@@ -464,7 +463,6 @@ class PersistenceActorTest {
         TweeterActor partialActor = new TweeterActor("partial-actor-" + UUID.randomUUID(), config);
         ActorReference<Tweet> ref = manager.start(partialActor);
 
-        await().until(partialActor::isStarted);
         ref.tell(new Tweet("item-1", "First item"));
         ref.tell(new Tweet("item-2", "Second item"));
         ref.tell(new Tweet("item-3", "Third item"));

@@ -35,21 +35,14 @@ public abstract class AbstractActor<T> implements Actor<T> {
     }
 
     @Override
-    public final boolean isStarted() {
-        return State.STARTED == state.get();
-    }
-
-    @Override
     public void stop() {
-        if (state.compareAndSet(State.STARTED, State.STOPPED)) {
-            postStop();
+        var current = state.get();
+        if (State.isStartingOrStartedState(current)) {
+            if (state.compareAndSet(current, State.STOPPED)) {
+                postStop();
+            }
         }
-    }
 
-    @Override
-    public boolean isPreStarting() {
-        return State.PRE_STARTING == state.get()
-                || State.NOT_STARTED == state.get();
     }
 
     /**
@@ -70,11 +63,5 @@ public abstract class AbstractActor<T> implements Actor<T> {
         return state.get();
     }
 
-     public enum State {
-        NOT_STARTED,
-        PRE_STARTING,
-        STARTED,
-        STOPPED
-    }
 }
 

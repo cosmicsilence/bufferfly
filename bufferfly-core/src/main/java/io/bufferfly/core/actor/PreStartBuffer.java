@@ -26,7 +26,7 @@ public class PreStartBuffer {
      * the caller should proceed normally.
      */
     public boolean bufferIfPreStarting(Actor<?> actor, Runnable action) {
-        if (!actor.isPreStarting()) return false;
+        if (actor.currentState() == Actor.State.STARTED) return false;
         pending.putIfAbsent(actor.name(), scheduler.schedule(() -> {
             pending.remove(actor.name());
             action.run();
