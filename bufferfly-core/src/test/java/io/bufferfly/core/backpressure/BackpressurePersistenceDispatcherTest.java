@@ -191,4 +191,89 @@ class BackpressurePersistenceDispatcherTest {
         assertThrows(IllegalArgumentException.class,
                 () -> new BackpressurePersistenceDispatcher<>(fake, 10, -1, BackpressureCallback.NO_OP));
     }
+
+    // -- periodic evaluator (scheduler) -------------------------------------
+
+    /**
+     * The whole point of the scheduler: after the high watermark engages
+     * backpressure, upstream stops enqueueing — so without a periodic evaluator
+     * the buffer draining back below the low watermark would NEVER be observed
+     * and the falling edge (release) would never fire. With a configured tick,
+     * the release fires on a scheduler tick even though no further enqueue
+     * happens.
+     */
+    @Test
+    void should_fireReleaseOnSchedulerTick_when_bufferDrainsWithoutEnqueue() throws InterruptedException {
+        FakeDispatcher fake = new FakeDispatcher();
+        CountingCallback cb = new CountingCallback();
+        // tiny 5 ms tick for a fast, deterministic test window
+        var bp = new BackpressurePersistenceDispatcher<>(fake, 10, 2, cb, 5L);
+        try {
+            // engage pressure via an enqueue at/above the high watermark
+            fake.size = 12;
+            bp.enqueue(event(), null);
+            assertTrue(bp.isUnderPressure());
+            assertEquals(1, cb.onPressure.get());
+
+            // now the buffer drains below the low watermark WITHOUT any enqueue;
+            // only the periodic evaluator can observe it and release.
+            fake.size = 1;
+
+            long deadline = System.currentTimeMillis() + 2_000L;
+            while (cb.onReleased.get() == 0 && System.currentTimeMillis() < deadline) {
+                Thread.sleep(5);
+            }
+
+            assertEquals(1, cb.onReleased.get(),
+                    "the periodic evaluator must fire the falling edge as the buffer drains");
+            assertFalse(bp.isUnderPressure());
+        } finally {
+            bp.clear(); // shuts the scheduler down
+        }
+    }
+
+    @Test
+    void should_notFireReleaseOnTick_when_bufferStaysAboveLowWatermark() throws InterruptedException {
+        FakeDispatcher fake = new FakeDispatcher();
+        CountingCallback cb = new CountingCallback();
+        var bp = new BackpressurePersistenceDispatcher<>(fake, 10, 2, cb, 5L);
+        try {
+            fake.size = 12;
+            bp.enqueue(event(), null);
+            assertTrue(bp.isUnderPressure());
+
+            // stays in the dead-band (above low) — ticks must NOT release
+            fake.size = 5;
+            Thread.sleep(100); // many ticks elapse
+
+            assertEquals(0, cb.onReleased.get(), "no release while above the low watermark");
+            assertTrue(bp.isUnderPressure());
+        } finally {
+            bp.clear();
+        }
+    }
+
+    @Test
+    void should_shutDownScheduler_onClear() throws InterruptedException {
+        FakeDispatcher fake = new FakeDispatcher();
+        CountingCallback cb = new CountingCallback();
+        var bp = new BackpressurePersistenceDispatcher<>(fake, 10, 2, cb, 5L);
+
+        fake.size = 12;
+        bp.enqueue(event(), null);
+        assertTrue(bp.isUnderPressure());
+
+        bp.clear(); // cancels the task, shuts the scheduler down, releases pressure
+        assertEquals(1, cb.onReleased.get(), "clear releases pressure");
+        assertFalse(bp.isUnderPressure());
+
+        // after clear the evaluator is gone: dropping size low and waiting must
+        // NOT fire another release (the scheduler is dead, and we are no longer
+        // under pressure anyway).
+        int releasedAfterClear = cb.onReleased.get();
+        fake.size = 0;
+        Thread.sleep(50);
+        assertEquals(releasedAfterClear, cb.onReleased.get(),
+                "no further callbacks after the scheduler is shut down");
+    }
 }

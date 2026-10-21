@@ -60,9 +60,33 @@ public final class LedgerOperations implements TransactionalOperations<LedgerCha
     private final JdbcTemplate jdbc;
     private final TransactionTemplate tx;
 
+    /**
+     * Test-only artificial delay (ms) applied at the start of each
+     * {@link #persistOnTransaction} call. In-memory HSQLDB is so fast that a
+     * batch is drained almost as soon as it is enqueued, so the persistence
+     * buffer never accumulates and backpressure never engages. Slowing each
+     * bulk write lets a backlog build against a (deliberately small) high
+     * watermark, which is exactly what the backpressure test needs to observe.
+     * Defaults to 0 (no delay) so production/other tests are unaffected.
+     */
+    private volatile long persistDelayMs = 0L;
+
     public LedgerOperations(DataSource dataSource) {
         this.jdbc = new JdbcTemplate(dataSource);
         this.tx = new TransactionTemplate(new DataSourceTransactionManager(dataSource));
+    }
+
+    /**
+     * Test hook: throttle each bulk persist by {@code delayMs} milliseconds so a
+     * backlog can build in the persistence buffer. Pass {@code 0} to disable.
+     *
+     * @param delayMs artificial per-batch delay in milliseconds ({@code >= 0})
+     * @return this, for chaining
+     */
+    public LedgerOperations withPersistDelay(long delayMs) {
+        if (delayMs < 0) throw new IllegalArgumentException("delayMs must be >= 0, got " + delayMs);
+        this.persistDelayMs = delayMs;
+        return this;
     }
 
     public void createSchema() {
@@ -103,6 +127,19 @@ public final class LedgerOperations implements TransactionalOperations<LedgerCha
     @Override
     public void persistOnTransaction(List<LedgerChange> batch) {
         if (batch == null || batch.isEmpty()) return;
+
+        // Test-only throttle: slow the bulk write so the persistence buffer can
+        // back up and engage backpressure (no-op when persistDelayMs == 0).
+        long delay = persistDelayMs;
+        if (delay > 0) {
+            try {
+                Thread.sleep(delay);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new io.bufferfly.core.persistence.TransientException(
+                        "interrupted while throttling persist", e);
+            }
+        }
 
         String topic = batch.get(0).topic();
         int partition = batch.get(0).partition();

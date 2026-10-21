@@ -104,6 +104,131 @@ public final class LedgerActor extends AbstractPersistentActor<ConsumedRecord<Ad
 
 ---
 
+## 🛑 Backpressure spec
+
+Backpressure is a **first-class primitive**, not an afterthought. It is the mechanism that turns the
+in-memory buffer from a liability (an unbounded queue that grows until `OutOfMemoryError`) into a
+genuine shock absorber: when the database falls behind, BufferFly stops pulling work in rather than
+piling it up. This section is the normative description of how it behaves.
+
+### The contract
+
+> **A full buffer must never drop data and must never grow without bound. When the persistence
+> buffer saturates, BufferFly signals upstream to _wait_; when it drains, BufferFly signals upstream
+> to _resume_. Every signal is edge-triggered and fires exactly once per transition.**
+
+### Watermarks and hysteresis
+
+Backpressure is governed by two watermarks on the persistence buffer depth:
+
+| Watermark | Meaning |
+| :--- | :--- |
+| `highWatermark` | Buffer depth at which pressure is **engaged** (the *rising edge*). Must be `> lowWatermark`. |
+| `lowWatermark`  | Buffer depth at which pressure is **released** (the *falling edge*). Must be `>= 0`. |
+
+Two distinct watermarks (high **strictly greater than** low) create a **hysteresis dead-band**. A
+single threshold would thrash — pausing and resuming on every event as the depth jittered around it.
+With a dead-band the system engages at `high`, stays engaged while the depth falls through the band,
+and only releases once it recedes all the way to `low`. One clean pause, one clean resume.
+
+```
+buffer depth
+   ▲
+   │        ╭─── engage (rising edge → onBackpressure) ───╮
+high┤───────●────────────────────────────────────────────┼─────────
+   │       ╱ \                                             │
+   │      ╱   \        (dead-band: no new edge)            │
+low ┤────●─────\──────────────────────────────────────────●──────── release
+   │   ╱        \____                                     ╱ (falling edge → onReleasedPressure)
+   └──┴───────────────────────────────────────────────────────────▶ time
+```
+
+### Edge-triggering: `BackpressurePersistenceDispatcher`
+
+`BackpressurePersistenceDispatcher<E>` is a **decorator** over any `PersistenceDispatcher`. It owns
+no buffer of its own; it watches the delegate's `size()` and fires a `BackpressureCallback` on each
+transition:
+
+- `onBackpressure()` — fired **once** when the depth first reaches `highWatermark`;
+- `onReleasedPressure()` — fired **once** when the depth, having been under pressure, recedes to
+  `lowWatermark`.
+
+State is a single `AtomicBoolean` (`underPressure`) flipped with compare-and-set, so each edge fires
+exactly once even under concurrent enqueues, and the callback is idempotent to re-evaluation.
+
+### The falling-edge problem — and the periodic evaluator
+
+There is a subtlety that the design must handle explicitly. Watermarks are evaluated on **enqueue**.
+That is sufficient for the rising edge (the buffer can only grow *because* events are being
+enqueued). But it is **not** sufficient for the falling edge:
+
+> Once `highWatermark` engages backpressure, upstream is paused and **stops enqueuing**. With no
+> further enqueues, nothing observes the buffer draining back below `lowWatermark` — so the release
+> would never fire and the partition would stay paused **forever**.
+
+BufferFly closes this gap with a **configurable periodic evaluator**. When constructed with a
+positive `evaluateIntervalMs`, the dispatcher runs a single daemon-threaded
+`ScheduledExecutorService` that re-evaluates the buffer depth on a fixed tick:
+
+```java
+new BackpressurePersistenceDispatcher<>(
+        delegate,            // the NaturalBatchingDispatcher being monitored
+        highWatermark,       // engage here
+        lowWatermark,        // release here
+        callback,            // pause/resume the partition
+        evaluateIntervalMs); // 0 = enqueue-only (legacy); > 0 = also tick in the background
+```
+
+- The tick calls the same `evaluate(size)` the enqueue path uses. Because `evaluate` is guarded by
+  the `AtomicBoolean`, a tick fires a callback **only on an actual edge crossing** — ticks in the
+  dead-band or while idle are no-ops.
+- The scheduler is **owned by the dispatcher** and shut down in `clear()` (invoked by
+  `PersistenceRunner.stop()` when the actor stops), so it shares the actor's lifetime and leaks no
+  threads.
+- The interval is **caller-configurable** and is a latency/overhead trade-off: a smaller interval
+  releases pressure sooner at the cost of more frequent wake-ups. Tests use a tiny window for
+  deterministic transitions; **in production the user chooses the value**. Passing `0` disables the
+  evaluator entirely (enqueue-only evaluation — only safe when upstream keeps enqueuing while the
+  buffer drains).
+
+### Wiring on Spring + Kafka: pause the partition, never drop the record
+
+In `bufferfly-spring-kafka` the callback is wired to the Kafka partition through `KafkaContext`:
+
+- `onBackpressure()` → `KafkaContext.pausePartition()` — fetching stops for **this partition only**,
+  not the whole container, not other actors.
+- `onReleasedPressure()` → `KafkaContext.resumePartition()` — fetching resumes once the buffer has
+  drained to `lowWatermark` (fired by the periodic evaluator described above).
+
+Two cooperating layers guarantee the contract:
+
+1. **Proactive (buffer-driven).** The watermark crossings pause/resume the partition before the
+   buffer can grow without bound. This is the primary path.
+2. **Reactive (safety net).** If a record is delivered while already saturated and `tell` throws
+   `UnderPressureException` or `MailBoxRefusedException`, the consumer pauses the partition and
+   leaves the record **un-acked** — Kafka redelivers it after resume.
+
+Because durability is anchored to the **DB-stored offset** (committed in the same transaction as the
+data), a paused-and-redelivered record is simply re-consumed, never lost and never double-written.
+**Under pressure the broker is told to wait; no message is ever dropped.**
+
+### Invariants (what the tests pin down)
+
+- Each edge (`onBackpressure` / `onReleasedPressure`) fires **exactly once** per transition.
+- No release while the depth is in the dead-band (`low < depth < high`).
+- The falling edge fires **from a scheduler tick** as the buffer drains, even with **zero** further
+  enqueues (the whole reason the evaluator exists).
+- `clear()` releases pressure if held and **shuts the scheduler down** — no further callbacks, no
+  thread leak.
+- End-to-end on embedded Kafka + HSQLDB: a flood pushes the buffer past `high` (pause engages), the
+  buffer drains (resume fires), and **every** flooded record is persisted exactly once with the
+  correct final balance.
+
+> See `BackpressurePersistenceDispatcherTest` (core, the edge/hysteresis/scheduler unit spec) and
+> `LedgerBackpressureTest` (spring-kafka, the end-to-end pause→resume→no-loss showcase).
+
+---
+
 ## Performance
 
 BufferFly is engineered with strict mechanical sympathy. There are two independent performance

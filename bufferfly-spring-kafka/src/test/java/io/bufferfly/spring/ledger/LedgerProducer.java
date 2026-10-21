@@ -80,5 +80,23 @@ public final class LedgerProducer implements AutoCloseable {
             template.send(topic, accountNumber, new AddToAccount(accountNumber, signedAmount, reason));
             return this;
         }
+
+        /**
+         * Floods this account's partition with {@code count} identical credits.
+         * Because all events share the account key, they land on one partition
+         * and are processed in order by a single {@code LedgerActor} — the way
+         * to build a backlog against one actor's persistence buffer.
+         *
+         * @param count        how many events to publish
+         * @param signedAmount the signed delta for each event
+         * @param reason       the reason stamped on each event
+         * @return this, for chaining
+         */
+        public Account flood(int count, long signedAmount, String reason) {
+            for (int i = 0; i < count; i++) {
+                template.send(topic, accountNumber, new AddToAccount(accountNumber, signedAmount, reason));
+            }
+            return this;
+        }
     }
 }
