@@ -3,9 +3,11 @@ description = 'Spring Boot auto-configuration wiring BufferFly actors to Apache 
 dependencies {
     api project(':bufferfly-core')
 
-    implementation platform('org.springframework.boot:spring-boot-dependencies:3.4.4')
+    implementation platform('org.springframework.boot:spring-boot-dependencies:4.0.8')
     implementation 'org.springframework.boot:spring-boot-autoconfigure'
+    implementation 'org.springframework.boot:spring-boot-starter-kafka'
     implementation 'org.springframework:spring-context'
 
     testImplementation 'org.springframework.boot:spring-boot-starter-test'
+    testImplementation 'org.springframework.kafka:spring-kafka-test'
 }

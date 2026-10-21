@@ -2,7 +2,7 @@ package io.bufferfly.cpu.bound;
 
 import io.bufferfly.core.actor.Actor;
 import io.bufferfly.core.actor.BlockingMailbox;
-import io.bufferfly.core.actor.Dispatcher;
+import io.bufferfly.core.actor.ActorDispatcher;
 import io.bufferfly.core.actor.Mailbox;
 import io.bufferfly.core.actor.PreStartBuffer;
 import net.openhft.affinity.Affinity;
@@ -39,8 +39,20 @@ import java.util.concurrent.ConcurrentHashMap;
  * number of ultra-high-volume partition actors where processing latency requirements
  * are strictly deterministic (sub-microsecond) and the host machine has ample, isolated
  * physical cores.
+ *
+ * <h2>Backpressure</h2>
+ * This dispatcher deliberately does <b>not</b> implement
+ * {@link io.bufferfly.core.actor.CallerRunsCapable}, so it supports only the
+ * {@code THROW} backpressure strategy — never {@code CALLER_RUNS}. Running actor
+ * work on the producer's thread would defeat the whole point of a hardware-pinned
+ * spinning core: it would drag arbitrary producer threads onto the hot path and
+ * destroy the deterministic, cache-resident latency profile this engine exists to
+ * provide. Under pressure the correct action is to fail fast and let the upstream
+ * (e.g. a Kafka partition) stop producing. Wrapping it in a
+ * {@code BackpressureActorDispatcher} with {@code CALLER_RUNS} throws
+ * {@link IllegalArgumentException} at construction time.
  */
-public class SpinningActorDispatcher implements Dispatcher {
+public class SpinningActorDispatcher implements ActorDispatcher {
 
     private static final Logger log = LoggerFactory.getLogger(SpinningActorDispatcher.class);
 

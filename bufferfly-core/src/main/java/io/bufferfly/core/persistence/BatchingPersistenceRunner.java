@@ -45,10 +45,6 @@ import java.util.List;
  */
 public final class BatchingPersistenceRunner<E> implements PersistenceRunner<E> {
 
-    // -----------------------------------------------------------------------
-    // State
-    // -----------------------------------------------------------------------
-
     private final TransactionalOperations<E> operations;
     private final PersistenceDispatcher<E> dispatcher;
     private final PersistenceConfig<E> config;
@@ -66,9 +62,6 @@ public final class BatchingPersistenceRunner<E> implements PersistenceRunner<E> 
 
     private volatile State state = State.STARTED;
 
-    // -----------------------------------------------------------------------
-    // Constructors
-    // -----------------------------------------------------------------------
 
     public BatchingPersistenceRunner(TransactionalOperations<E> operations) {
         this(new PersistenceConfig<>(operations));
@@ -141,10 +134,6 @@ public final class BatchingPersistenceRunner<E> implements PersistenceRunner<E> 
         return config;
     }
 
-    // -----------------------------------------------------------------------
-    // PersistenceRunner API
-    // -----------------------------------------------------------------------
-
     /**
      * Enqueues {@code event} and signals the dispatcher to schedule a consume
      * loop if one is not already running. Never blocks.
@@ -171,10 +160,6 @@ public final class BatchingPersistenceRunner<E> implements PersistenceRunner<E> 
         dispatcher.clear();
     }
 
-    // -----------------------------------------------------------------------
-    // Flush pipeline — called by NaturalBatchingDispatcher on its VT
-    // -----------------------------------------------------------------------
-
     /**
      * Flushes one batch through the error-handling pipeline.
      * Called exclusively by the {@link PersistenceDispatcher} on a virtual thread.
@@ -183,10 +168,6 @@ public final class BatchingPersistenceRunner<E> implements PersistenceRunner<E> 
     public void persistBatch(List<PersistenceEvent<E>> batch) {
         persistWithRetry(batch);
     }
-
-    // -----------------------------------------------------------------------
-    // Error-handling internals
-    // -----------------------------------------------------------------------
 
     private void persistWithRetry(List<PersistenceEvent<E>> batch) {
         int attempts = 0;

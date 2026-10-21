@@ -1,6 +1,6 @@
 package io.bufferfly.core.actor;
 
-public interface Dispatcher {
+public interface ActorDispatcher {
 
    <T> void dispatch(T t, Actor<T> actor);
 
