@@ -17,6 +17,21 @@ dependencies {
     testImplementation platform('org.springframework.boot:spring-boot-dependencies:3.4.4')
     testImplementation 'org.springframework:spring-jdbc'
 
+    // PersistenceActorBenchmarkTest runs against a real Postgres (not in-memory
+    // HSQLDB) via Testcontainers, writing both the actor-batching and the
+    // direct-insert paths through a shared HikariCP pool, and reads Postgres's
+    // own xact_commit / wal_* counters. Testcontainers 2.x is pinned explicitly
+    // (the Boot 3.4.4 BOM manages the older 1.20.x, whose bundled docker-java
+    // negotiates Docker API 1.32 — rejected by Docker Engine 29+, which requires
+    // >= 1.44); 2.x negotiates a modern API. The benchmark skips cleanly when
+    // Docker is absent. postgresql driver and HikariCP come from the Boot BOM.
+    testImplementation platform('org.testcontainers:testcontainers-bom:2.0.5')
+    testImplementation 'org.testcontainers:testcontainers'
+    testImplementation 'org.testcontainers:testcontainers-junit-jupiter'
+    testImplementation 'org.testcontainers:testcontainers-postgresql'
+    testImplementation 'org.postgresql:postgresql'
+    testImplementation 'com.zaxxer:HikariCP'
+
     // Use testRuntimeOnly and force it to adhere strictly to the wildcard
     testRuntimeOnly('org.slf4j:slf4j-simple:2.0.+') {
         because "Spring Boot BOM strips out wildcards for SLF4J modules"

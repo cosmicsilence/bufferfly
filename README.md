@@ -317,33 +317,40 @@ trusting the lease (the Kafka assignment) on its own.
 ## Performance
 
 BufferFly is engineered with strict mechanical sympathy. There are two independent performance
-stories: **batching throughput to the database** — measured both against an in-memory HSQLDB (core)
-and against a real, networked Postgres driven over Kafka (spring-kafka) — and **raw actor dispatch
-throughput** (core vs. cpu-bound).
+stories: **batching throughput to the database** — measured against a real, throwaway Postgres both
+directly (core) and end-to-end over Kafka (spring-kafka) — and **raw actor dispatch throughput**
+(core vs. cpu-bound).
 
-### 📊 Batching vs. one-transaction-per-message
+### 📊 Batching vs. one-transaction-per-row
 
 `PersistenceActorBenchmarkTest` compares a BufferFly persistent actor (natural batching) against the
-naive approach of N virtual threads each doing one `INSERT` per message, over 100,000 rows into
-HSQLDB. The actor coalesces those writes into a handful of bulk transactions, turning per-message
-transaction overhead into a near-constant cost — exactly the pain described above, measured.
+naive approach of 15 virtual threads each doing one `INSERT` per row, over 100,000 rows into a
+**real Postgres** (a throwaway Docker container via Testcontainers). Both paths write through the
+**same HikariCP pool** and the same table/SQL, so the only variable is *how* each drives the database;
+beyond wall-clock it captures Postgres's own `pg_stat_database.xact_commit` and `pg_stat_wal` counters,
+so the commit/WAL cost of the per-row path is visible next to the actor's bulk transactions.
 
-| Approach | Time for 100,000 rows | Throughput | Transactions |
-| :--- | :---: | :---: | :--- |
-| **Actor + natural batching** | **~240 ms** | **~400,000 rows/s** | ~101 bulk transactions (≈990 rows each) |
-| 15 virtual threads, one INSERT per row | ~820 ms | ~120,000 rows/s | 100,000 tiny transactions |
-| | | | **≈ 3.2–3.5× faster** |
+| Metric | Actor + natural batching | 15 virtual threads, one INSERT per row | Advantage |
+| :--- | :---: | :---: | :---: |
+| **time for 100,000 rows** | **~1,035 ms** | ~12,210 ms | **~11.8× faster** |
+| **throughput** | **~96,650 rows/s** | ~8,190 rows/s | **~11.8×** |
+| **pg `xact_commit`** | **485** (101 bulk tx) | 98,999 | **~204× fewer commits** |
+| pg `wal_records` | 87,476 | 413,598 | ~4.7× fewer |
+| **pg `wal_bytes`** | **8,529,030** | 33,903,210 | **~3.98× less WAL** |
 
-> ⚠️ **About these numbers.** The benchmark runs against an **in-memory HSQLDB in the same JVM** — so
-> there is **no network round-trip and no connection-pool contention**. That deliberately *understates*
-> BufferFly's real-world advantage: the pain it removes (per-message round-trips, transaction
-> begin/commit, WAL flush, connection-pool exhaustion) is largely absent in a local in-memory DB. Over
-> a network to a real database (Postgres, etc.), where each transaction costs a round-trip and holds a
-> pooled connection, collapsing 100,000 transactions into ~100 bulk writes is far more dramatic than
-> the ~3.3× seen here. Treat this as a conservative lower bound that isolates the batching effect
-> itself. Absolute figures vary with hardware and JVM warmup.
+The actor coalesces the 100,000 writes into ~101 bulk transactions, turning per-row transaction
+overhead (begin/commit + WAL flush) into a near-constant cost — exactly the pain described above,
+measured against a real database.
 
-> Run it yourself: `./gradlew :bufferfly-core:test --tests '*PersistenceActorBenchmarkTest*'`
+> ⚠️ **About these numbers.** Postgres runs on the **same machine** as the test, so the network
+> round-trip per transaction is near-zero — which *understates* the advantage. Over a network to a
+> managed database, where each commit costs a real round-trip and holds a pooled connection,
+> collapsing ~99k commits into ~485 is far more dramatic than the ~11.8× seen here. Treat this as a
+> conservative lower bound that isolates the batching effect itself. Absolute figures vary with
+> hardware, JVM warmup, and Docker overhead.
+
+> Run it yourself (requires Docker; skips cleanly without it):
+> `./gradlew :bufferfly-core:test --tests '*PersistenceActorBenchmarkTest*'`
 
 ### 📊 Real Postgres + Kafka: actor vs. a classic locking consumer
 
