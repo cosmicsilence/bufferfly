@@ -11,37 +11,28 @@ import java.util.Map;
  *
  * <p>Property prefix: {@code bufferfly}
  *
- * <p>This class is intentionally framework-agnostic so it can be populated:
+ * <p>This class is a plain-Java, framework-agnostic POJO. Populate it:
  * <ul>
- *   <li>Programmatically via the fluent builder.</li>
- *   <li>From a {@code bufferfly.properties} or {@code bufferfly.yml} file via
- *       {@link io.bufferfly.core.config.BufferflyConfigLoader}.</li>
+ *   <li>Programmatically via the fluent {@link #builder()} — the canonical way
+ *       to configure BufferFly in core.</li>
  *   <li>From Spring Boot's {@code application.properties} / {@code application.yml}
  *       by annotating a subclass or wrapper with
  *       {@code @ConfigurationProperties("bufferfly")} — the field names and nesting
- *       deliberately mirror Spring's relaxed-binding conventions.</li>
+ *       deliberately mirror Spring's relaxed-binding conventions — and passing the
+ *       result to {@link io.bufferfly.core.actor.ActorManager#ActorManager(BufferflyConfig)}.</li>
  * </ul>
  *
- * <h2>Example {@code bufferfly.properties}</h2>
+ * <h2>Example (builder)</h2>
  * <pre>
- * bufferfly.actors.default-mailbox-capacity=20000
- * bufferfly.actors.default-dispatcher=io.bufferfly.core.actor.VTDispatcher
- *
- * # Per-actor overrides (actor name used as key)
- * bufferfly.actors.overrides.payment-actor.dispatcher=io.bufferfly.core.actor.VTDispatcher
- * bufferfly.actors.overrides.payment-actor.mailbox-capacity=5000
- * </pre>
- *
- * <h2>Example {@code bufferfly.yml}</h2>
- * <pre>
- * bufferfly:
- *   actors:
- *     default-mailbox-capacity: 20000
- *     default-dispatcher: io.bufferfly.core.actor.VTDispatcher
- *     overrides:
- *       payment-actor:
- *         dispatcher: io.bufferfly.core.actor.VTDispatcher
- *         mailbox-capacity: 5000
+ * BufferflyConfig config = BufferflyConfig.builder()
+ *     .actors(BufferflyConfig.ActorsConfig.builder()
+ *         .defaultMailboxCapacity(20_000)
+ *         .defaultDispatcher("io.bufferfly.core.actor.VTDispatcher")
+ *         .addOverride("payment-actor", BufferflyConfig.ActorOverrideConfig.builder()
+ *             .mailboxCapacity(5_000)
+ *             .build())
+ *         .build())
+ *     .build();
  * </pre>
  */
 public final class BufferflyConfig {
@@ -126,7 +117,7 @@ public final class BufferflyConfig {
         }
 
         public static final class Builder {
-            private int defaultMailboxCapacity = 20_000;
+            private int defaultMailboxCapacity = 100_000;
             private String defaultDispatcher = "io.bufferfly.core.actor.VTDispatcher";
             private final Map<String, ActorOverrideConfig> overrides = new HashMap<>();
 

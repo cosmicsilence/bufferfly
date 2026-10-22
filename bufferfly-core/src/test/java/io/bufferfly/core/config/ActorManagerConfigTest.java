@@ -5,11 +5,7 @@ import io.bufferfly.core.actor.ActorReference;
 import io.bufferfly.core.actor.DummyCountingActor;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
-import org.junit.jupiter.api.io.TempDir;
 
-import java.io.IOException;
-import java.nio.file.Files;
-import java.nio.file.Path;
 import java.time.Duration;
 
 import static org.awaitility.Awaitility.await;
@@ -45,7 +41,7 @@ class ActorManagerConfigTest {
 
     @Test
     void should_deliverMessage_when_actorManagerWiredWithDefaultConfig() {
-        BufferflyConfig config = BufferflyConfigLoader.defaults();
+        BufferflyConfig config = BufferflyConfig.builder().build();
         ActorManager manager  = new ActorManager(config);
         DummyCountingActor actor = new DummyCountingActor("config-default-actor");
 
@@ -57,19 +53,17 @@ class ActorManagerConfigTest {
     }
 
     // -----------------------------------------------------------------------
-    // Config from properties file
+    // Programmatic config — custom default capacity
     // -----------------------------------------------------------------------
 
     @Test
-    void should_respectCustomDefaultCapacity_when_configLoadedFromPropertiesFile(@TempDir Path tmp)
-            throws IOException {
-        Path file = tmp.resolve("bufferfly.properties");
-        Files.writeString(file, """
-            bufferfly.actors.default-mailbox-capacity=10
-            bufferfly.actors.default-dispatcher=io.bufferfly.core.actor.VTDispatcher
-            """);
-
-        BufferflyConfig config = BufferflyConfigLoader.fromPath(file);
+    void should_respectCustomDefaultCapacity_when_configBuiltWithCustomCapacity() {
+        BufferflyConfig config = BufferflyConfig.builder()
+            .actors(BufferflyConfig.ActorsConfig.builder()
+                .defaultMailboxCapacity(10)
+                .defaultDispatcher("io.bufferfly.core.actor.VTDispatcher")
+                .build())
+            .build();
         assertEquals(10, config.getActors().getDefaultMailboxCapacity());
 
         ActorManager manager = new ActorManager(config);
@@ -83,19 +77,20 @@ class ActorManagerConfigTest {
     }
 
     @Test
-    void should_wirePerActorCapacityOverride_when_configContainsOverrideForActor(@TempDir Path tmp)
-            throws IOException {
-        Path file = tmp.resolve("bufferfly.properties");
-        Files.writeString(file, """
-            bufferfly.actors.default-mailbox-capacity=20000
-            bufferfly.actors.default-dispatcher=io.bufferfly.core.actor.VTDispatcher
-            bufferfly.actors.overrides.special-actor.mailbox-capacity=50
-            """);
+    void should_wirePerActorCapacityOverride_when_configContainsOverrideForActor() {
+        BufferflyConfig config = BufferflyConfig.builder()
+            .actors(BufferflyConfig.ActorsConfig.builder()
+                .defaultMailboxCapacity(20_000)
+                .defaultDispatcher("io.bufferfly.core.actor.VTDispatcher")
+                .addOverride("special-actor", BufferflyConfig.ActorOverrideConfig.builder()
+                    .mailboxCapacity(50)
+                    .build())
+                .build())
+            .build();
 
-        BufferflyConfig config = BufferflyConfigLoader.fromPath(file);
         ActorManager manager = new ActorManager(config);
 
-        // Verify the override was parsed
+        // Verify the override is present
         assertEquals(50,
             config.getActors().getOverrides().get("special-actor").getMailboxCapacity());
 
@@ -107,70 +102,6 @@ class ActorManagerConfigTest {
 
         await().atMost(Duration.ofSeconds(5))
                .untilAsserted(() -> assertEquals(10, actor.getReceiveCount()));
-    }
-
-    // -----------------------------------------------------------------------
-    // Config from YAML file
-    // -----------------------------------------------------------------------
-
-    @Test
-    void should_respectCustomDefaultCapacity_when_configLoadedFromYamlFile(@TempDir Path tmp)
-            throws IOException {
-        Path file = tmp.resolve("bufferfly.yml");
-        Files.writeString(file, """
-            bufferfly:
-              actors:
-                default-mailbox-capacity: 100
-                default-dispatcher: io.bufferfly.core.actor.VTDispatcher
-            """);
-
-        BufferflyConfig config = BufferflyConfigLoader.fromPath(file);
-        assertEquals(100, config.getActors().getDefaultMailboxCapacity());
-
-        ActorManager manager = new ActorManager(config);
-        DummyCountingActor actor = new DummyCountingActor("yaml-actor");
-        ActorReference<String> ref = manager.start(actor);
-
-        ref.tell("from-yaml-config");
-
-        await().atMost(Duration.ofSeconds(5))
-               .untilAsserted(() -> assertEquals(1, actor.getReceiveCount()));
-    }
-
-    @Test
-    void should_wirePerActorOverride_when_yamlConfigContainsOverrides(@TempDir Path tmp)
-            throws IOException {
-        Path file = tmp.resolve("bufferfly.yml");
-        Files.writeString(file, """
-            bufferfly:
-              actors:
-                default-mailbox-capacity: 20000
-                overrides:
-                  priority-actor:
-                    mailbox-capacity: 500
-                  bulk-actor:
-                    mailbox-capacity: 5000
-            """);
-
-        BufferflyConfig config = BufferflyConfigLoader.fromPath(file);
-        ActorManager manager  = new ActorManager(config);
-
-        DummyCountingActor priority = new DummyCountingActor("priority-actor");
-        DummyCountingActor bulk     = new DummyCountingActor("bulk-actor");
-
-        ActorReference<String> refP = manager.start(priority);
-        ActorReference<String> refB = manager.start(bulk);
-
-        for (int i = 0; i < 20; i++) {
-            refP.tell("p-" + i);
-            refB.tell("b-" + i);
-        }
-
-        await().atMost(Duration.ofSeconds(10))
-               .untilAsserted(() -> {
-                   assertEquals(20, priority.getReceiveCount());
-                   assertEquals(20, bulk.getReceiveCount());
-               });
     }
 
     // -----------------------------------------------------------------------
