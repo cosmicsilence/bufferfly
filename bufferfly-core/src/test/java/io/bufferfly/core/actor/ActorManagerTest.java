@@ -374,7 +374,7 @@ class ActorManagerTest {
             @Override
             protected void preStart() {
                 wasPreStarting = currentState() == State.PRE_STARTING;
-                self.tell("pre-start-message");
+                context.self().tell("pre-start-message");
                 preStartCountDown.countDown();
             }
 
@@ -415,7 +415,7 @@ class ActorManagerTest {
 
             @Override
             protected void preStart() {
-                self.tell("actor-msg-during-prestart");
+                context.self().tell("actor-msg-during-prestart");
                 inPreStart.countDown();
                 try {
                     allowPreStartToFinish.await(5, TimeUnit.SECONDS);
@@ -434,7 +434,7 @@ class ActorManagerTest {
             }
 
             public ActorReference<String> getSelf() {
-                return self;
+                return context.self();
             }
         }
 
