@@ -55,8 +55,8 @@ import java.util.function.Consumer;
  * Override {@link #classify(RuntimeException)} to recognise additional
  * transient/poison-pill conditions for your database.
  *
- * <p>Implementors supply exactly two hooks: {@link #persistBatch(List)} (the
- * bulk data write) and {@link #deadLetter(Object, Exception)} (the dead-letter
+ * <p>Implementors supply exactly two hooks: {@link #persistBatch} (the
+ * bulk data write) and {@link #deadLetter} (the dead-letter
  * sink). All transaction and fencing-token coordination is handled here.
  *
  * @param <E> the persistence event type; must expose its Kafka coordinates via
@@ -203,7 +203,7 @@ public abstract class AbstractJdbcTransactionalOperations<E extends OffsetBearin
      * re-delivering (and re-inserting) the surrounding good records, which would
      * duplicate data and loop the restart.
      *
-     * <p>Implementors supply only {@link #deadLetter(Object, Exception)}; the
+     * <p>Implementors supply only {@link #deadLetter}; the
      * dead-letter write and the offset advance share one transaction, so either
      * both happen or neither does.
      *

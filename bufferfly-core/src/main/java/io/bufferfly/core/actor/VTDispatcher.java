@@ -52,7 +52,7 @@ public class VTDispatcher implements ActorDispatcher, CallerRunsCapable {
      * Creates a dispatcher with the built-in default capacity (20 000).
      */
     public VTDispatcher() {
-        this(20_000, Map.of());
+        this(100_000, Map.of());
     }
 
     /**

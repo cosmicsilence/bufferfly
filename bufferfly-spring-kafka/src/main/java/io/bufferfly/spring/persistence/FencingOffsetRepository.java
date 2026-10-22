@@ -22,12 +22,14 @@ import org.springframework.jdbc.core.JdbcTemplate;
  * <h2>Schema</h2>
  * By default this targets:
  * <pre>
- *   consumer_offset(topic VARCHAR, partition INT, latest_offset BIGINT,
- *                   PRIMARY KEY(topic, partition))
+ *   FENCE_OFFSET(NAM_TOPIC VARCHAR, NUM_PARTITION INT, NUM_OFFSET BIGINT,
+ *                DAT_CREATED TIMESTAMP, PRIMARY KEY(NAM_TOPIC, NUM_PARTITION))
  * </pre>
  * The table and column names are configurable via
- * {@link #FencingOffsetRepository(JdbcTemplate, String, String, String, String)}
- * so the repository can be reused against an existing schema.
+ * {@link #FencingOffsetRepository(JdbcTemplate, String, String, String, String, String)}
+ * so the repository can be reused against an existing schema. Ready-to-run DDL
+ * for Postgres, MySQL (InnoDB) and Oracle lives under
+ * {@code src/test/resources/db/fence_offset/}.
  *
  * <p>All methods MUST be called inside an active transaction (the caller owns
  * the transaction boundary); they use the supplied {@link JdbcTemplate} and do
@@ -36,13 +38,15 @@ import org.springframework.jdbc.core.JdbcTemplate;
 public final class FencingOffsetRepository {
 
     /** Default offset table name. */
-    public static final String DEFAULT_TABLE = "consumer_offset";
+    public static final String DEFAULT_TABLE = "FENCE_OFFSET";
     /** Default topic column name. */
-    public static final String DEFAULT_TOPIC_COLUMN = "topic";
+    public static final String DEFAULT_TOPIC_COLUMN = "NAM_TOPIC";
     /** Default partition column name. */
-    public static final String DEFAULT_PARTITION_COLUMN = "partition";
+    public static final String DEFAULT_PARTITION_COLUMN = "NUM_PARTITION";
     /** Default latest-offset column name. */
-    public static final String DEFAULT_OFFSET_COLUMN = "latest_offset";
+    public static final String DEFAULT_OFFSET_COLUMN = "NUM_OFFSET";
+    /** Default created-timestamp column name. */
+    public static final String DEFAULT_CREATED_COLUMN = "DAT_CREATED";
 
     private final JdbcTemplate jdbc;
     private final String selectSql;
@@ -50,16 +54,18 @@ public final class FencingOffsetRepository {
     private final String updateSql;
 
     /**
-     * Creates a repository targeting the default {@code consumer_offset} schema.
+     * Creates a repository targeting the default {@code FENCE_OFFSET} schema.
      *
      * @param jdbc the JDBC template (shares the caller's DataSource/transaction)
      */
     public FencingOffsetRepository(JdbcTemplate jdbc) {
-        this(jdbc, DEFAULT_TABLE, DEFAULT_TOPIC_COLUMN, DEFAULT_PARTITION_COLUMN, DEFAULT_OFFSET_COLUMN);
+        this(jdbc, DEFAULT_TABLE, DEFAULT_TOPIC_COLUMN, DEFAULT_PARTITION_COLUMN,
+                DEFAULT_OFFSET_COLUMN, DEFAULT_CREATED_COLUMN);
     }
 
     /**
-     * Creates a repository targeting a custom table/column layout.
+     * Creates a repository targeting a custom table/column layout, using the
+     * default {@code DAT_CREATED} timestamp column name.
      *
      * @param jdbc            the JDBC template (shares the caller's DataSource/transaction)
      * @param table           the offset table name
@@ -72,11 +78,31 @@ public final class FencingOffsetRepository {
                                    String topicColumn,
                                    String partitionColumn,
                                    String offsetColumn) {
+        this(jdbc, table, topicColumn, partitionColumn, offsetColumn, DEFAULT_CREATED_COLUMN);
+    }
+
+    /**
+     * Creates a repository targeting a fully custom table/column layout.
+     *
+     * @param jdbc            the JDBC template (shares the caller's DataSource/transaction)
+     * @param table           the offset table name
+     * @param topicColumn     the topic column name
+     * @param partitionColumn the partition column name
+     * @param offsetColumn    the latest-offset column name
+     * @param createdColumn   the created-timestamp column name (set once on insert)
+     */
+    public FencingOffsetRepository(JdbcTemplate jdbc,
+                                   String table,
+                                   String topicColumn,
+                                   String partitionColumn,
+                                   String offsetColumn,
+                                   String createdColumn) {
         this.jdbc = jdbc;
         this.selectSql = "SELECT %s FROM %s WHERE %s = ? AND %s = ?"
                 .formatted(offsetColumn, table, topicColumn, partitionColumn);
-        this.insertSql = "INSERT INTO %s (%s, %s, %s) VALUES (?, ?, ?)"
-                .formatted(table, topicColumn, partitionColumn, offsetColumn);
+        // DAT_CREATED is stamped once, at insert time, with the DB clock.
+        this.insertSql = "INSERT INTO %s (%s, %s, %s, %s) VALUES (?, ?, ?, CURRENT_TIMESTAMP)"
+                .formatted(table, topicColumn, partitionColumn, offsetColumn, createdColumn);
         this.updateSql = "UPDATE %s SET %s = ? WHERE %s = ? AND %s = ? AND %s = ?"
                 .formatted(table, offsetColumn, topicColumn, partitionColumn, offsetColumn);
     }

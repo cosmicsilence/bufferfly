@@ -15,6 +15,21 @@ dependencies {
     testImplementation 'org.springframework.kafka:spring-kafka-test'
     testImplementation 'com.fasterxml.jackson.core:jackson-databind'
     testImplementation 'org.hsqldb:hsqldb:2.7.4'
+    // Benchmark (PostgresKafkaLedgerBenchmarkTest): a real Postgres + a real
+    // Kafka broker via Testcontainers, so the actor's natural batching can be
+    // compared against a classic locking consumer over a networked DB. Versions
+    // come from the Spring Boot BOM above; the test skips when Docker is absent.
+    testImplementation platform('org.springframework.boot:spring-boot-dependencies:4.0.8')
+    testImplementation 'org.testcontainers:testcontainers'
+    testImplementation 'org.testcontainers:testcontainers-junit-jupiter'
+    testImplementation 'org.testcontainers:testcontainers-postgresql'
+    testImplementation 'org.testcontainers:testcontainers-kafka'
+    testImplementation 'org.postgresql:postgresql'
+    // A real connection pool for the benchmark's shared DataSource. Without
+    // pooling (e.g. DriverManagerDataSource) the classic per-message path pays a
+    // fresh TCP connect + auth on every tiny transaction, so the run is dominated
+    // by connection setup/teardown instead of the batching difference under test.
+    testImplementation 'com.zaxxer:HikariCP'
     testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
 }
 

@@ -6,7 +6,7 @@ import java.util.concurrent.TimeUnit;
 
 public class BlockingMailbox<T> implements Mailbox<T> {
     private final BlockingQueue<T> mailbox;
-    private static final long WAIT_MS = 10_000L;
+    private static final long WAIT_MS = 500;
 
     public BlockingMailbox(int capacity) {
         this.mailbox = new LinkedBlockingQueue<>(capacity);

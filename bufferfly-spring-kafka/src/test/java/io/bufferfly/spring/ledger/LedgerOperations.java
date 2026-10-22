@@ -14,7 +14,7 @@ import java.util.stream.Collectors;
  * consumer offset acting as an optimistic-locking fencing token.
  *
  * <p>All of the transaction/fencing boilerplate — opening one transaction per
- * natural batch, advancing {@code consumer_offset.latest_offset} to the
+ * natural batch, advancing {@code FENCE_OFFSET.NUM_OFFSET} to the
  * batch's highest offset as a compare-and-set fencing token, and classifying a
  * {@code DataIntegrityViolationException} as a poison pill — lives in the shared
  * {@link AbstractJdbcTransactionalOperations} base class. This class supplies
@@ -26,7 +26,7 @@ import java.util.stream.Collectors;
  *   account_balance(account_number PK, balance BIGINT)
  *   account_change (id IDENTITY PK, account_number, amount, reason,
  *                   resulting_balance, topic, partition, offset_value)
- *   consumer_offset(topic, partition, latest_offset, PRIMARY KEY(topic,partition))
+ *   FENCE_OFFSET(NAM_TOPIC, NUM_PARTITION, NUM_OFFSET, DAT_CREATED, PRIMARY KEY(NAM_TOPIC,NUM_PARTITION))
  *   dead_message  (id IDENTITY PK, payload, topic, partition, offset_value, cause)
  * </pre>
  *
@@ -97,11 +97,12 @@ public final class LedgerOperations extends AbstractJdbcTransactionalOperations<
                     offset_value BIGINT NOT NULL
                 )""");
         jdbc().execute("""
-                CREATE TABLE consumer_offset (
-                    topic VARCHAR(128) NOT NULL,
-                    partition INTEGER NOT NULL,
-                    latest_offset BIGINT NOT NULL,
-                    PRIMARY KEY (topic, partition)
+                CREATE TABLE FENCE_OFFSET (
+                    NAM_TOPIC VARCHAR(128) NOT NULL,
+                    NUM_PARTITION INTEGER NOT NULL,
+                    NUM_OFFSET BIGINT NOT NULL,
+                    DAT_CREATED TIMESTAMP NOT NULL,
+                    PRIMARY KEY (NAM_TOPIC, NUM_PARTITION)
                 )""");
         jdbc().execute("""
                 CREATE TABLE dead_message (
