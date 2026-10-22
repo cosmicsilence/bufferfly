@@ -1,5 +1,8 @@
 package io.bufferfly.core.persistence;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.util.List;
 
 /**
@@ -44,6 +47,8 @@ import java.util.List;
  * @param <E> the persistence event type
  */
 public final class BatchingPersistenceRunner<E> implements PersistenceRunner<E> {
+
+    private static final Logger log = LoggerFactory.getLogger(BatchingPersistenceRunner.class);
 
     private final TransactionalOperations<E> operations;
     private final PersistenceDispatcher<E> dispatcher;
@@ -194,21 +199,31 @@ public final class BatchingPersistenceRunner<E> implements PersistenceRunner<E> 
                 // hand off to the unrecoverable hook. The hook (e.g. in a sharded
                 // Kafka setup) restarts the actor, which resumes from the last
                 // durably committed offset. This runner instance stops here.
+                log.warn("Batch of {} flagged a poison pill ({}); isolating item-by-item",
+                        batch.size(), e.getMessage());
                 flushItemByItem(batch);
                 handleUnrecoverable();
                 return;
             } catch (TransientException e) {
                 attempts++;
                 if (attempts > config.maxRetries()) {
+                    log.error("Transient failure persisting batch of {} not resolved after {} retries; treating as unrecoverable",
+                            batch.size(), config.maxRetries(), e);
                     handleUnrecoverable();
                     return;
                 }
+                log.warn("Transient failure persisting batch of {} (attempt {}/{}): {}; retrying with back-off",
+                        batch.size(), attempts, config.maxRetries(), e.getMessage());
                 backOff(attempts);
             } catch (UnrecoverableException e) {
+                log.error("Unrecoverable failure persisting batch of {}; halting runner and invoking recovery hook",
+                        batch.size(), e);
                 handleUnrecoverable();
                 return;
             } catch (Exception e) {
                 // Unexpected exception → treat as unrecoverable
+                log.error("Unexpected {} persisting batch of {}; treating as unrecoverable",
+                        e.getClass().getSimpleName(), batch.size(), e);
                 handleUnrecoverable();
                 return;
             }
@@ -234,18 +249,25 @@ public final class BatchingPersistenceRunner<E> implements PersistenceRunner<E> 
                 operations.persistOnTransaction(List.of(item.event()));
                 sideEffectProcessor.process(item.sideEffect());
             } catch (UnrecoverableException e) {
+                log.error("Unrecoverable failure while isolating batch item-by-item; abandoning remaining items", e);
                 handleUnrecoverable();
                 return; // abandon remainder of batch
             } catch (PersistenceException e) {
                 // Poison pill — notify and continue with remaining items
+                log.warn("Poison pill detected ({}); dead-lettering via onPoisonPill and continuing with remaining items",
+                        e.getMessage());
                 try {
                     operations.onPoisonPill(item.event(), e);
 
-                } catch (Exception ignored) {
+                } catch (Exception swallowed) {
                     // onPoisonPill must not throw — swallow defensively
+                    log.error("onPoisonPill threw while dead-lettering a poison pill; swallowing to keep the runner alive",
+                            swallowed);
                 }
             } catch (Exception e) {
                 // Unexpected exception on a single item → unrecoverable
+                log.error("Unexpected {} while isolating batch item-by-item; treating as unrecoverable",
+                        e.getClass().getSimpleName(), e);
                 handleUnrecoverable();
                 return; // abandon remainder of batch
             }
@@ -264,8 +286,9 @@ public final class BatchingPersistenceRunner<E> implements PersistenceRunner<E> 
         state = State.STOPPED;
         try {
             onUnrecoverable.run();
-        } catch (Exception ignored) {
+        } catch (Exception swallowed) {
             // The hook itself must not throw — swallow defensively.
+            log.error("onUnrecoverable hook threw; swallowing so the halt completes cleanly", swallowed);
         }
     }
 
@@ -278,6 +301,7 @@ public final class BatchingPersistenceRunner<E> implements PersistenceRunner<E> 
         try {
             Thread.sleep(delayMs);
         } catch (InterruptedException e) {
+            log.warn("Interrupted during {} ms transient-retry back-off; re-setting interrupt flag", delayMs);
             Thread.currentThread().interrupt();
         }
     }

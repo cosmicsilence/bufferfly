@@ -39,54 +39,40 @@ public class ActorManager {
     private final ActorDispatcher defaultDispatcher;
 
     /**
-     * Creates an ActorManager with default settings (VTDispatcher, capacity 20 000).
+     * Creates an ActorManager with default settings: a single {@link VTDispatcher}
+     * (virtual-thread, default mailbox capacity 100 000) shared by every actor,
+     * and no per-actor overrides.
      */
     public ActorManager() {
-        this.defaultDispatcher = new VTDispatcher();
-        this.configuredDispatchers = new ConcurrentHashMap<>();
+        this(new VTDispatcher(), Map.of());
     }
 
     /**
      * Creates an ActorManager wired from a {@link BufferflyConfig}.
      *
-     * <p>Wiring rules:
-     * <ol>
-     *   <li>A single shared default {@link ActorDispatcher} is instantiated from
-     *       {@code config.actors.defaultDispatcher} (FQN, no-arg constructor).
-     *       It receives the global default mailbox capacity plus the full map of
-     *       per-actor capacity overrides so it can size each mailbox correctly.</li>
-     *   <li>For each actor that specifies a <em>different</em> dispatcher FQN in its
-     *       override, a dedicated {@link ActorDispatcher} instance is instantiated and
-     *       registered in {@code configuredDispatchers}.</li>
-     * </ol>
+     * <p>The config is resolved into a shared default dispatcher plus any
+     * per-actor dispatcher overrides by {@link DispatcherWiring#from}; see that
+     * method for the wiring rules. Invalid dispatcher class names surface as
+     * {@link IllegalArgumentException} here, at construction time.
      */
     public ActorManager(BufferflyConfig config) {
-        BufferflyConfig.ActorsConfig actors = config.getActors();
+        this(DispatcherWiring.from(config));
+    }
 
-        Map<String, Integer> allCapacityOverrides = new HashMap<>();
-        actors.getOverrides().forEach((actorName, override) -> {
-            if (override.getMailboxCapacity() > 0) {
-                allCapacityOverrides.put(actorName, override.getMailboxCapacity());
-            }
-        });
+    private ActorManager(DispatcherWiring wiring) {
+        this(wiring.defaultDispatcher(), wiring.perActorDispatchers());
+    }
 
-        this.defaultDispatcher = instantiateDispatcher(
-                actors.getDefaultDispatcher(),
-                actors.getDefaultMailboxCapacity(),
-                allCapacityOverrides
-        );
-
-        Map<String, ActorDispatcher> perActor = new HashMap<>();
-        actors.getOverrides().forEach((actorName, override) -> {
-            String fqn = override.getDispatcher();
-            if (fqn != null && !fqn.equals(actors.getDefaultDispatcher())) {
-                int capacity = override.getMailboxCapacity() > 0
-                        ? override.getMailboxCapacity()
-                        : actors.getDefaultMailboxCapacity();
-                perActor.put(actorName, instantiateDispatcher(fqn, capacity, Map.of()));
-            }
-        });
-        this.configuredDispatchers = new ConcurrentHashMap<>(perActor);
+    /**
+     * Canonical constructor: every other constructor funnels here with a fully
+     * resolved default dispatcher and per-actor dispatcher map.
+     *
+     * @param defaultDispatcher   dispatcher used for actors without an override
+     * @param perActorDispatchers per-actor dispatcher overrides, keyed by actor name
+     */
+    private ActorManager(ActorDispatcher defaultDispatcher, Map<String, ActorDispatcher> perActorDispatchers) {
+        this.defaultDispatcher = defaultDispatcher;
+        this.configuredDispatchers = new ConcurrentHashMap<>(perActorDispatchers);
     }
 
     /**
@@ -141,6 +127,71 @@ public class ActorManager {
         } catch (ReflectiveOperationException e) {
             throw new IllegalArgumentException(
                     "Failed to instantiate dispatcher '%s' via no-arg constructor".formatted(fqn), e);
+        }
+    }
+
+    /**
+     * The dispatchers resolved from a {@link BufferflyConfig}: one shared default
+     * plus any per-actor overrides. Isolating this derivation keeps
+     * {@link ActorManager} focused on its real job — the actor registry and
+     * lifecycle — while the config-to-dispatcher mapping lives in one cohesive,
+     * independently testable place.
+     *
+     * @param defaultDispatcher   dispatcher for actors without a dispatcher override
+     * @param perActorDispatchers dedicated dispatchers keyed by actor name
+     */
+    private record DispatcherWiring(ActorDispatcher defaultDispatcher,
+                                    Map<String, ActorDispatcher> perActorDispatchers) {
+
+        /**
+         * Resolves a {@link BufferflyConfig} into its dispatchers.
+         *
+         * <ol>
+         *   <li>A single shared default dispatcher is instantiated from
+         *       {@code actors.defaultDispatcher} (FQN, no-arg constructor), given
+         *       the global default mailbox capacity plus every per-actor capacity
+         *       override so it can size each mailbox correctly.</li>
+         *   <li>Each actor whose override names a <em>different</em> dispatcher FQN
+         *       gets its own dedicated dispatcher, sized by its own capacity
+         *       override (falling back to the global default).</li>
+         * </ol>
+         */
+        static DispatcherWiring from(BufferflyConfig config) {
+            BufferflyConfig.ActorsConfig actors = config.getActors();
+            String defaultFqn = actors.getDefaultDispatcher();
+            int defaultCapacity = actors.getDefaultMailboxCapacity();
+            Map<String, BufferflyConfig.ActorOverrideConfig> overrides = actors.getOverrides();
+
+            ActorDispatcher defaultDispatcher =
+                    instantiateDispatcher(defaultFqn, defaultCapacity, capacityOverrides(overrides));
+
+            Map<String, ActorDispatcher> perActor = new HashMap<>();
+            overrides.forEach((actorName, override) -> {
+                String fqn = override.getDispatcher();
+                if (fqn != null && !fqn.equals(defaultFqn)) {
+                    perActor.put(actorName,
+                            instantiateDispatcher(fqn, resolveCapacity(override, defaultCapacity), Map.of()));
+                }
+            });
+
+            return new DispatcherWiring(defaultDispatcher, perActor);
+        }
+
+        /** The subset of overrides that specify a positive mailbox capacity. */
+        private static Map<String, Integer> capacityOverrides(
+                Map<String, BufferflyConfig.ActorOverrideConfig> overrides) {
+            Map<String, Integer> capacities = new HashMap<>();
+            overrides.forEach((actorName, override) -> {
+                if (override.getMailboxCapacity() > 0) {
+                    capacities.put(actorName, override.getMailboxCapacity());
+                }
+            });
+            return capacities;
+        }
+
+        /** The override's capacity if set (&gt; 0), otherwise the global default. */
+        private static int resolveCapacity(BufferflyConfig.ActorOverrideConfig override, int defaultCapacity) {
+            return override.getMailboxCapacity() > 0 ? override.getMailboxCapacity() : defaultCapacity;
         }
     }
 

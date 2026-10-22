@@ -1,10 +1,15 @@
 package io.bufferfly.core.actor;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 
 public class BlockingMailbox<T> implements Mailbox<T> {
+    private static final Logger log = LoggerFactory.getLogger(BlockingMailbox.class);
+
     private final BlockingQueue<T> mailbox;
     private static final long WAIT_MS = 500;
 
@@ -41,6 +46,7 @@ public class BlockingMailbox<T> implements Mailbox<T> {
         try {
             return command.run();
         } catch (InterruptedException e) {
+            log.warn("Mailbox operation interrupted while blocked (capacity wait); propagating as MailBoxInterrupted");
             Thread.currentThread().interrupt();
             throw new MailBoxInterrupted();
         }

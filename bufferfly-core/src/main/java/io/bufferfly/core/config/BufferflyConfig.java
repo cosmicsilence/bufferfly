@@ -26,7 +26,7 @@ import java.util.Map;
  * <pre>
  * BufferflyConfig config = BufferflyConfig.builder()
  *     .actors(BufferflyConfig.ActorsConfig.builder()
- *         .defaultMailboxCapacity(20_000)
+ *         .defaultMailboxCapacity(100_000)   // the built-in default
  *         .defaultDispatcher("io.bufferfly.core.actor.VTDispatcher")
  *         .addOverride("payment-actor", BufferflyConfig.ActorOverrideConfig.builder()
  *             .mailboxCapacity(5_000)

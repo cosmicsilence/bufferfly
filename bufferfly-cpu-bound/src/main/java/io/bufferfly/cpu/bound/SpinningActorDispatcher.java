@@ -129,6 +129,8 @@ public class SpinningActorDispatcher implements ActorDispatcher {
                     try {
                         t.join();
                     } catch (InterruptedException e) {
+                        log.warn("Interrupted while joining spinning thread for actor '{}' during clear()", actor.name());
+                        Thread.currentThread().interrupt();
                         throw new RuntimeException(e);
                     }
                 });
@@ -182,6 +184,8 @@ public class SpinningActorDispatcher implements ActorDispatcher {
                             if (message != null)
                                 actor.receive(message);
                         } catch (Exception e) {
+                            log.warn("Actor '{}' receive() threw {} on spinning core; routing to onError",
+                                    actor.name(), e.getClass().getSimpleName());
                             actor.onError(message, e);
                         }
                         onSpinWait();
@@ -190,6 +194,8 @@ public class SpinningActorDispatcher implements ActorDispatcher {
                     stopped = true;
                 }
             } catch (Exception e) {
+                log.error("Spinning thread for actor '{}' failed to bind to a CPU core; stopping this actor's thread",
+                        actor.name(), e);
                 actor.onError(null, new IllegalStateException("Failed to bind dispatcher to CPU core architecture", e));
             } finally {
                 cpuBoundThreads.remove(actor.name());
