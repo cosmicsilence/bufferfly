@@ -1,12 +1,7 @@
 package io.bufferfly.spring.ledger;
 
-import io.bufferfly.core.persistence.SingleItemException;
-import io.bufferfly.core.persistence.TransactionalOperations;
-import io.bufferfly.core.persistence.UnrecoverableException;
-import org.springframework.dao.DataIntegrityViolationException;
-import org.springframework.jdbc.core.JdbcTemplate;
-import org.springframework.jdbc.datasource.DataSourceTransactionManager;
-import org.springframework.transaction.support.TransactionTemplate;
+import io.bufferfly.core.persistence.TransientException;
+import io.bufferfly.spring.persistence.AbstractJdbcTransactionalOperations;
 
 import javax.sql.DataSource;
 import java.util.ArrayList;
@@ -18,62 +13,57 @@ import java.util.stream.Collectors;
  * Persists {@link LedgerChange} batches to HSQLDB, atomically, with the stored
  * consumer offset acting as an optimistic-locking fencing token.
  *
+ * <p>All of the transaction/fencing boilerplate — opening one transaction per
+ * natural batch, advancing {@code consumer_offset.latest_offset} to the
+ * batch's highest offset as a compare-and-set fencing token, and classifying a
+ * {@code DataIntegrityViolationException} as a poison pill — lives in the shared
+ * {@link AbstractJdbcTransactionalOperations} base class. This class supplies
+ * only the schema, the data writes ({@link #persistBatch}), and the
+ * dead-letter + offset-advance on a poison pill ({@link #onPoisonPill}).
+ *
  * <h2>Schema</h2>
  * <pre>
  *   account_balance(account_number PK, balance BIGINT)
  *   account_change (id IDENTITY PK, account_number, amount, reason,
  *                   resulting_balance, topic, partition, offset_value)
  *   consumer_offset(topic, partition, latest_offset, PRIMARY KEY(topic,partition))
+ *   dead_message  (id IDENTITY PK, payload, topic, partition, offset_value, cause)
  * </pre>
  *
- * <h2>One transaction per natural batch</h2>
+ * <h2>One transaction per natural batch (done by the base class)</h2>
  * For each batch (all records belong to the same partition — one actor per
- * partition) we, in a single transaction:
+ * partition) the base class, in a single transaction, fences+advances the
+ * offset (the batch max) and then calls {@link #persistBatch}, which:
  * <ol>
- *   <li><b>Fence the offset.</b> Read the currently stored {@code latest_offset}
- *       for the partition and compare it to the batch's highest offset. We then
- *       advance it with a guarded update
- *       ({@code UPDATE ... SET latest_offset = :newMax WHERE topic/partition
- *       AND latest_offset = :expected}). If zero rows are updated, another
- *       writer advanced the offset concurrently — i.e. a <b>zombie actor</b>
- *       (an old instance still running after a rebalance reassigned the
- *       partition) is racing the new owner. That cannot be safely retried, so we
- *       abort the transaction with an {@link UnrecoverableException}: the runner
- *       invokes its {@code onUnrecoverable} hook to halt the actor and restart
- *       clean from the authoritative committed offset. We store the offset
- *       <em>once per batch</em> (the max), not per event.</li>
- *   <li><b>Insert</b> every {@link LedgerChange} into {@code account_change}
- *       (append-only audit of each balance movement).</li>
- *   <li><b>Upsert</b> each account's running balance into
- *       {@code account_balance} (the latest resulting balance in the batch for
- *       that account wins, since they are applied in offset order).</li>
+ *   <li><b>Inserts</b> every {@link LedgerChange} into {@code account_change}
+ *       idempotently by {@code (topic, partition, offset)} (append-only audit of
+ *       each balance movement).</li>
+ *   <li><b>Upserts</b> each account's running balance into
+ *       {@code account_balance}; only newly-inserted rows contribute, so a
+ *       replay that inserts nothing also changes no balance.</li>
  * </ol>
  * If any step fails the transaction rolls back, so the offset never advances
- * past data that was not durably written — guaranteeing no message loss and no
- * double counting.
+ * past data that was not durably written — no message loss and no double
+ * counting.
  */
-public final class LedgerOperations implements TransactionalOperations<LedgerChange> {
+public final class LedgerOperations extends AbstractJdbcTransactionalOperations<LedgerChange> {
 
     /** Max length of the {@code reason} column; a longer reason is a bad message. */
     public static final int REASON_MAX_LENGTH = 256;
 
-    private final JdbcTemplate jdbc;
-    private final TransactionTemplate tx;
-
     /**
-     * Test-only artificial delay (ms) applied at the start of each
-     * {@link #persistOnTransaction} call. In-memory HSQLDB is so fast that a
-     * batch is drained almost as soon as it is enqueued, so the persistence
-     * buffer never accumulates and backpressure never engages. Slowing each
-     * bulk write lets a backlog build against a (deliberately small) high
-     * watermark, which is exactly what the backpressure test needs to observe.
-     * Defaults to 0 (no delay) so production/other tests are unaffected.
+     * Test-only artificial delay (ms) applied at the start of each persist call.
+     * In-memory HSQLDB is so fast that a batch is drained almost as soon as it is
+     * enqueued, so the persistence buffer never accumulates and backpressure
+     * never engages. Slowing each bulk write lets a backlog build against a
+     * (deliberately small) high watermark, which is exactly what the backpressure
+     * test needs to observe. Defaults to 0 (no delay) so production/other tests
+     * are unaffected.
      */
     private volatile long persistDelayMs = 0L;
 
     public LedgerOperations(DataSource dataSource) {
-        this.jdbc = new JdbcTemplate(dataSource);
-        this.tx = new TransactionTemplate(new DataSourceTransactionManager(dataSource));
+        super(dataSource);
     }
 
     /**
@@ -90,12 +80,12 @@ public final class LedgerOperations implements TransactionalOperations<LedgerCha
     }
 
     public void createSchema() {
-        jdbc.execute("""
+        jdbc().execute("""
                 CREATE TABLE account_balance (
                     account_number VARCHAR(64) PRIMARY KEY,
                     balance BIGINT NOT NULL
                 )""");
-        jdbc.execute("""
+        jdbc().execute("""
                 CREATE TABLE account_change (
                     id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
                     account_number VARCHAR(64) NOT NULL,
@@ -106,14 +96,14 @@ public final class LedgerOperations implements TransactionalOperations<LedgerCha
                     partition INTEGER NOT NULL,
                     offset_value BIGINT NOT NULL
                 )""");
-        jdbc.execute("""
+        jdbc().execute("""
                 CREATE TABLE consumer_offset (
                     topic VARCHAR(128) NOT NULL,
                     partition INTEGER NOT NULL,
                     latest_offset BIGINT NOT NULL,
                     PRIMARY KEY (topic, partition)
                 )""");
-        jdbc.execute("""
+        jdbc().execute("""
                 CREATE TABLE dead_message (
                     id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
                     payload CLOB NOT NULL,
@@ -124,194 +114,105 @@ public final class LedgerOperations implements TransactionalOperations<LedgerCha
                 )""");
     }
 
+    /**
+     * Test-only throttle: slow the bulk write so the persistence buffer can back
+     * up and engage backpressure (no-op when {@code persistDelayMs == 0}). Runs
+     * before the transaction opens.
+     */
     @Override
-    public void persistOnTransaction(List<LedgerChange> batch) {
-        if (batch == null || batch.isEmpty()) return;
-
-        // Test-only throttle: slow the bulk write so the persistence buffer can
-        // back up and engage backpressure (no-op when persistDelayMs == 0).
+    protected void beforePersist(List<LedgerChange> batch) {
         long delay = persistDelayMs;
         if (delay > 0) {
             try {
                 Thread.sleep(delay);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
-                throw new io.bufferfly.core.persistence.TransientException(
-                        "interrupted while throttling persist", e);
+                throw new TransientException("interrupted while throttling persist", e);
             }
-        }
-
-        String topic = batch.get(0).topic();
-        int partition = batch.get(0).partition();
-        long maxOffset = batch.stream().mapToLong(LedgerChange::offset).max().orElseThrow();
-        List<LedgerChange> toPersist = batch;
-
-        try {
-            tx.executeWithoutResult(status -> {
-                // 1) fence + advance the offset (optimistic lock). Fails the whole
-                //    transaction on a zombie race or an at/behind-offset batch. The
-                //    container's SeekState already discards pre-seek/stale records,
-                //    so batches arrive in-order starting at stored+1.
-                fenceAndAdvanceOffset(topic, partition, maxOffset);
-
-                // 2) insert each change (append-only ledger), IDEMPOTENTLY: skip
-                //    any record whose (topic, partition, offset) is already
-                //    persisted. This makes the sink exactly-once regardless of
-                //    restart/rewind replays. If a record's reason is longer than
-                //    the column allows, HSQLDB (strict size) rejects the INSERT —
-                //    we do NOT pre-check length; the real DB constraint is the
-                //    source of truth and is caught below as a poison pill.
-                List<LedgerChange> inserted = new ArrayList<>(toPersist.size());
-                for (LedgerChange c : toPersist) {
-                    int rows = jdbc.update("""
-                                    INSERT INTO account_change
-                                        (account_number, amount, reason, resulting_balance, topic, partition, offset_value)
-                                    SELECT ?, ?, ?, ?, ?, ?, ?
-                                    FROM (VALUES(0)) t
-                                    WHERE NOT EXISTS (
-                                        SELECT 1 FROM account_change
-                                         WHERE topic = ? AND partition = ? AND offset_value = ?)""",
-                            c.accountNumber(), c.amount(), c.reason(), c.resultingBalance(),
-                            c.topic(), c.partition(), c.offset(),
-                            c.topic(), c.partition(), c.offset());
-                    if (rows > 0) {
-                        inserted.add(c);
-                    }
-                }
-
-                // 3) update the running balance for each account. Only records
-                //    that were NEWLY inserted contribute, so a replay that
-                //    inserted nothing also changes no balance. New ABSOLUTE
-                //    balance = current-DB-balance + net-delta-of-newly-inserted.
-                //    Reading the current DB balance makes this restart-safe. A
-                //    delta-in-SQL MERGE ({@code SET balance = balance + delta}) is
-                //    avoided — this HSQLDB version rejects it ("cardinality
-                //    violation").
-                Map<String, Long> deltas = inserted.stream()
-                        .collect(Collectors.toMap(
-                                LedgerChange::accountNumber,
-                                LedgerChange::amount,
-                                Long::sum));
-                deltas.forEach((account, delta) -> {
-                    long current = balanceOf(account);
-                    long updated = current + delta;
-                    jdbc.update("""
-                                    MERGE INTO account_balance AS b
-                                    USING (VALUES(?, ?)) AS incoming(account_number, balance)
-                                    ON b.account_number = incoming.account_number
-                                    WHEN MATCHED THEN UPDATE SET b.balance = incoming.balance
-                                    WHEN NOT MATCHED THEN INSERT (account_number, balance)
-                                        VALUES (incoming.account_number, incoming.balance)""",
-                            account, updated);
-                });
-            });
-        } catch (UnrecoverableException e) {
-            throw e; // fence failures stay unrecoverable
-        } catch (DataIntegrityViolationException e) {
-            // A real DB data violation (e.g. reason too long for the column).
-            // Signal SingleItemException so the runner isolates the batch item-by-
-            // item: good records persist, and the offending one is routed to
-            // onPoisonPill (dead-lettered). No loss of the good messages, no dups.
-            throw new SingleItemException(
-                    "DB rejected a record in the batch (data violation): " + e.getMessage(), e);
         }
     }
 
     /**
-     * Advances {@code consumer_offset.latest_offset} from its current value to
-     * {@code newMax} using a guarded (compare-and-set) update. Returns normally
-     * only if this writer held the authoritative token; otherwise throws
-     * {@link UnrecoverableException} so the whole batch transaction rolls back
-     * and the actor is halted/restarted.
-     *
-     * <p>A failed fence means a <b>zombie actor</b> — an old instance still
-     * running after a rebalance reassigned this partition — raced with the new
-     * owner. Retrying would be wrong (both writers would keep fighting and could
-     * double-write), so this is unrecoverable: the right cure is to halt and let
-     * everything restart clean, resuming from the authoritative committed offset.
+     * Writes one natural batch inside the base class's transaction (the offset
+     * has already been fenced + advanced to the batch max by the base class).
      */
-    private void fenceAndAdvanceOffset(String topic, int partition, long newMax) {
-        Long stored = jdbc.query(
-                "SELECT latest_offset FROM consumer_offset WHERE topic = ? AND partition = ?",
-                rs -> rs.next() ? rs.getLong(1) : null,
-                topic, partition);
-
-        if (stored == null) {
-            // first batch ever for this partition — insert the token
-            int inserted = jdbc.update(
-                    "INSERT INTO consumer_offset (topic, partition, latest_offset) VALUES (?, ?, ?)",
-                    topic, partition, newMax);
-            if (inserted != 1) {
-                throw new UnrecoverableException(
-                        "Zombie race inserting offset token for " + topic + "-" + partition
-                                + "; halting to restart clean");
-            }
-            return;
-        }
-
-        if (newMax <= stored) {
-            // At/behind the committed offset: a benign replay (e.g. redelivery
-            // after a restart/rewind). The append-only insert is idempotent by
-            // offset, so this is a safe no-op — no re-insert, no advance, and
-            // crucially NOT treated as a zombie. A real zombie is detected by the
-            // compare-and-set UPDATE below instead.
-            return;
-        }
-
-        int updated = jdbc.update("""
-                        UPDATE consumer_offset
-                           SET latest_offset = ?
-                         WHERE topic = ? AND partition = ? AND latest_offset = ?""",
-                newMax, topic, partition, stored);
-        if (updated != 1) {
-            throw new UnrecoverableException(
-                    ("Offset fence failed for %s-%d: expected latest_offset=%d but it was advanced "
-                            + "concurrently — a zombie actor is racing the new owner. Halting to restart clean.")
-                            .formatted(topic, partition, stored));
-        }
-    }
-
     @Override
-    public void onPoisonPill(LedgerChange event, Exception cause) {
-        // A change that can never be persisted is dead-lettered so it is not
-        // lost. Crucially we also ADVANCE the stored consumer offset past this
-        // record — in the same transaction — so that when the runner restarts
-        // the actor (handleUnrecoverable fires after flushItemByItem), the
-        // actor's preStart rewinds to storedOffset+1 and resumes AFTER the
-        // poison pill. Without this the rewind would land on the poison pill
-        // again and re-deliver (and re-insert) the surrounding good records,
-        // producing duplicates and a restart loop.
-        String payload = "%s amount=%d reason=%s".formatted(
-                event.accountNumber(), event.amount(), event.reason());
-        tx.executeWithoutResult(status -> {
-            jdbc.update("""
-                            INSERT INTO dead_message (payload, topic, partition, offset_value, cause)
-                            VALUES (?, ?, ?, ?, ?)""",
-                    payload, event.topic(), event.partition(), event.offset(),
-                    cause == null ? null : cause.getClass().getSimpleName() + ": " + cause.getMessage());
-            // advance the fencing token past the dead-lettered offset
-            fenceAndAdvanceOffset(event.topic(), event.partition(), event.offset());
+    protected void persistBatch(List<LedgerChange> batch) {
+        // 1) insert each change (append-only ledger), IDEMPOTENTLY: skip any
+        //    record whose (topic, partition, offset) is already persisted. This
+        //    makes the sink exactly-once regardless of restart/rewind replays. If
+        //    a record's reason is longer than the column allows, HSQLDB (strict
+        //    size) rejects the INSERT — we do NOT pre-check length; the real DB
+        //    constraint is the source of truth and is caught by the base class's
+        //    classify() as a poison pill.
+        List<LedgerChange> inserted = new ArrayList<>(batch.size());
+        for (LedgerChange c : batch) {
+            int rows = jdbc().update("""
+                            INSERT INTO account_change
+                                (account_number, amount, reason, resulting_balance, topic, partition, offset_value)
+                            SELECT ?, ?, ?, ?, ?, ?, ?
+                            FROM (VALUES(0)) t
+                            WHERE NOT EXISTS (
+                                SELECT 1 FROM account_change
+                                 WHERE topic = ? AND partition = ? AND offset_value = ?)""",
+                    c.accountNumber(), c.amount(), c.reason(), c.resultingBalance(),
+                    c.topic(), c.partition(), c.offset(),
+                    c.topic(), c.partition(), c.offset());
+            if (rows > 0) {
+                inserted.add(c);
+            }
+        }
+
+        // 2) update the running balance for each account. Only records that were
+        //    NEWLY inserted contribute, so a replay that inserted nothing also
+        //    changes no balance. New ABSOLUTE balance = current-DB-balance +
+        //    net-delta-of-newly-inserted. Reading the current DB balance makes
+        //    this restart-safe. A delta-in-SQL MERGE is avoided — this HSQLDB
+        //    version rejects it ("cardinality violation").
+        Map<String, Long> deltas = inserted.stream()
+                .collect(Collectors.toMap(
+                        LedgerChange::accountNumber,
+                        LedgerChange::amount,
+                        Long::sum));
+        deltas.forEach((account, delta) -> {
+            long current = balanceOf(account);
+            long updated = current + delta;
+            jdbc().update("""
+                            MERGE INTO account_balance AS b
+                            USING (VALUES(?, ?)) AS incoming(account_number, balance)
+                            ON b.account_number = incoming.account_number
+                            WHEN MATCHED THEN UPDATE SET b.balance = incoming.balance
+                            WHEN NOT MATCHED THEN INSERT (account_number, balance)
+                                VALUES (incoming.account_number, incoming.balance)""",
+                    account, updated);
         });
     }
 
+    @Override
+    protected void deadLetter(LedgerChange event, Exception cause) {
+        // A change that can never be persisted is dead-lettered so it is not
+        // lost. Runs inside the base class's poison-pill transaction, which also
+        // advances the stored consumer offset past this record — so that when the
+        // runner restarts the actor, preStart rewinds to storedOffset+1 and
+        // resumes AFTER the poison pill rather than landing on it again.
+        String payload = "%s amount=%d reason=%s".formatted(
+                event.accountNumber(), event.amount(), event.reason());
+        jdbc().update("""
+                        INSERT INTO dead_message (payload, topic, partition, offset_value, cause)
+                        VALUES (?, ?, ?, ?, ?)""",
+                payload, event.topic(), event.partition(), event.offset(),
+                cause == null ? null : cause.getClass().getSimpleName() + ": " + cause.getMessage());
+    }
+
     public int countDeadMessages() {
-        Integer n = jdbc.queryForObject("SELECT COUNT(*) FROM dead_message", Integer.class);
+        Integer n = jdbc().queryForObject("SELECT COUNT(*) FROM dead_message", Integer.class);
         return n == null ? 0 : n;
     }
 
     // -- query helpers (used by the actor on restart and by the test) --------
 
-    /** @return the stored latest offset for the partition, or -1 if none stored yet. */
-    public long loadStoredOffset(String topic, int partition) {
-        Long stored = jdbc.query(
-                "SELECT latest_offset FROM consumer_offset WHERE topic = ? AND partition = ?",
-                rs -> rs.next() ? rs.getLong(1) : null,
-                topic, partition);
-        return stored == null ? -1L : stored;
-    }
-
     public long balanceOf(String accountNumber) {
-        Long balance = jdbc.query(
+        Long balance = jdbc().query(
                 "SELECT balance FROM account_balance WHERE account_number = ?",
                 rs -> rs.next() ? rs.getLong(1) : null,
                 accountNumber);
@@ -321,25 +222,21 @@ public final class LedgerOperations implements TransactionalOperations<LedgerCha
     /** Loads all currently stored account balances (used by an actor to rehydrate on preStart). */
     public Map<String, Long> loadAllBalances() {
         Map<String, Long> out = new java.util.HashMap<>();
-        jdbc.query("SELECT account_number, balance FROM account_balance", rs -> {
+        jdbc().query("SELECT account_number, balance FROM account_balance", rs -> {
             out.put(rs.getString(1), rs.getLong(2));
         });
         return out;
     }
 
     public int countChanges(String accountNumber) {
-        Integer n = jdbc.queryForObject(
+        Integer n = jdbc().queryForObject(
                 "SELECT COUNT(*) FROM account_change WHERE account_number = ?",
                 Integer.class, accountNumber);
         return n == null ? 0 : n;
     }
 
     public int totalChanges() {
-        Integer n = jdbc.queryForObject("SELECT COUNT(*) FROM account_change", Integer.class);
+        Integer n = jdbc().queryForObject("SELECT COUNT(*) FROM account_change", Integer.class);
         return n == null ? 0 : n;
-    }
-
-    public JdbcTemplate jdbc() {
-        return jdbc;
     }
 }

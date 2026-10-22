@@ -1,5 +1,7 @@
 package io.bufferfly.spring.ledger;
 
+import io.bufferfly.spring.persistence.OffsetBearing;
+
 /**
  * One persistence event produced by the {@code LedgerActor} for each processed
  * message. It carries the account change <em>and</em> the Kafka offset that
@@ -25,5 +27,5 @@ public record LedgerChange(
         String accountNumber,
         long amount,
         String reason,
-        long resultingBalance) {
+        long resultingBalance) implements OffsetBearing {
 }

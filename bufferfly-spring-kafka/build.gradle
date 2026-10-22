@@ -7,10 +7,12 @@ dependencies {
     implementation 'org.springframework.boot:spring-boot-autoconfigure'
     implementation 'org.springframework.boot:spring-boot-starter-kafka'
     implementation 'org.springframework:spring-context'
+    // spring-jdbc is used by the main-source AbstractJdbcTransactionalOperations /
+    // FencingOffsetRepository (JdbcTemplate + programmatic TransactionTemplate).
+    implementation 'org.springframework:spring-jdbc'
 
     testImplementation 'org.springframework.boot:spring-boot-starter-test'
     testImplementation 'org.springframework.kafka:spring-kafka-test'
-    testImplementation 'org.springframework:spring-jdbc'
     testImplementation 'com.fasterxml.jackson.core:jackson-databind'
     testImplementation 'org.hsqldb:hsqldb:2.7.4'
     testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
