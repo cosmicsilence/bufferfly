@@ -14,6 +14,18 @@ public class ActorManager {
     private final Map<String, DispatchingActor<?>> startedActors = new ConcurrentHashMap<>();
 
     private final ExecutorService callStartExecutor = Executors.newVirtualThreadPerTaskExecutor();
+
+    /**
+     * Shared scheduler backing every actor's {@link Scheduler} capability. A
+     * small daemon pool; each scheduled task does nothing but a cheap
+     * {@code self.tell} hand-off, so a handful of threads serve all actors.
+     */
+    private final java.util.concurrent.ScheduledExecutorService scheduledExecutor =
+            java.util.concurrent.Executors.newScheduledThreadPool(2, r -> {
+                Thread t = new Thread(r, "bufferfly-actor-scheduler");
+                t.setDaemon(true);
+                return t;
+            });
     /**
      * Per-actor dispatcher registry.
      * Key = actor name, value = the Dispatcher instance to use for that actor.
@@ -98,6 +110,16 @@ public class ActorManager {
         return (ActorReference<T>) registered;
     }
 
+    /**
+     * Releases the manager's shared executors. The scheduler pool is daemon so
+     * it never blocks JVM exit; call this for a clean shutdown (e.g. in tests or
+     * a container stop) to stop the scheduler threads promptly.
+     */
+    public void shutdown() {
+        scheduledExecutor.shutdownNow();
+        callStartExecutor.shutdownNow();
+    }
+
     private static ActorDispatcher instantiateDispatcher(
             String fqn,
             int defaultCapacity,
@@ -144,7 +166,9 @@ public class ActorManager {
         }
 
         void start() {
-            delegate.setSelf(this); //this is the ActorReference
+            // Inject the actor's context: its own reference (this) plus a
+            // one-shot self-scheduler backed by the shared scheduled executor.
+            delegate.setContext(new ActorContext<>(this, new SelfTellScheduler<>(this, scheduledExecutor)));
             delegate.start();
         }
 

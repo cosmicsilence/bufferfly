@@ -14,7 +14,12 @@ public interface Actor<T> {
     /** Called by the dispatcher to deliver one message. */
     void receive(T message);
 
-    void setSelf(ActorReference<T> self);
+    /**
+     * Injects this actor's {@link ActorContext} — its {@code self} reference and
+     * its one-shot {@link Scheduler}. Called exactly once by
+     * {@link ActorManager#start(Actor)} before {@link #start()}.
+     */
+    void setContext(ActorContext<T> context);
 
     /** Unique name identifying this actor within an {@link ActorManager}. */
     String name();

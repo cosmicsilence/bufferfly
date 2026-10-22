@@ -19,11 +19,17 @@ public abstract class AbstractActor<T> implements Actor<T> {
 
     private final AtomicReference<State> state = new AtomicReference<>(State.NOT_STARTED);
 
-    protected ActorReference<T> self;
+    /**
+     * The capabilities injected at start: this actor's {@code self} reference and
+     * its one-shot {@link Scheduler}. Reach them via {@code context.self()},
+     * {@code context.scheduler()} or {@code context.schedule(...)}. {@code null}
+     * until {@link #setContext} is called by the {@link ActorManager}.
+     */
+    protected ActorContext<T> context;
 
     @Override
-    public void setSelf(ActorReference<T> self) {
-        this.self = self;
+    public void setContext(ActorContext<T> context) {
+        this.context = context;
     }
 
     @Override
