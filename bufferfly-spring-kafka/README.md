@@ -123,6 +123,62 @@ public final class LedgerActor extends AbstractPersistentActor<ConsumedRecord<Ad
 See `src/test/java/io/bufferfly/spring/ledger/` for a complete, runnable showcase
 on embedded Kafka + HSQLDB.
 
+### Wiring it with Spring configuration
+
+Everything is ordinary Spring. You provide a `@Configuration` that declares your
+collaborator beans (the `DataSource`, your `TransactionalOperations`, any read
+models) and the Kafka `ConsumerFactory`; Spring injects those into the
+`@ShardedActor` factory, and BufferFly's auto-configuration (`ActorManager` +
+`ShardedActorBeanPostProcessor`) does the rest — one bean per annotated factory,
+one actor per partition.
+
+```java
+@Configuration
+@Import(BufferflySpringAutoConfiguration.class)   // ActorManager + the @ShardedActor post-processor
+@ComponentScan("com.acme.ledger")                 // picks up the @Component @ShardedActor factory
+public class LedgerConfig {
+
+    @Bean
+    DataSource dataSource(DataSourceProperties props) {
+        return props.initializeDataSourceBuilder().build();
+    }
+
+    /** Your bulk-write + fencing logic — injected into the @ShardedActor factory. */
+    @Bean
+    LedgerOperations ledgerOperations(DataSource dataSource) {
+        return new LedgerOperations(dataSource);
+    }
+
+    /** Any collaborator the actor needs (read model, notifier, ...). */
+    @Bean
+    BalanceConfirmationService balanceConfirmationService() {
+        return new BalanceConfirmationService();
+    }
+
+    /**
+     * The Kafka ConsumerFactory the post-processor injects to build consumers.
+     * In a plain Spring Boot app this bean is provided automatically from your
+     * spring.kafka.* properties — declare it explicitly only to customize it
+     * (e.g. a specific value deserializer).
+     */
+    @Bean
+    ConsumerFactory<Object, Object> consumerFactory(KafkaProperties kafka) {
+        var value = new JsonDeserializer<>(AddToAccount.class);
+        value.addTrustedPackages("com.acme.ledger");
+        return new DefaultKafkaConsumerFactory<>(
+                kafka.buildConsumerProperties(null), new StringDeserializer(), value);
+    }
+}
+```
+
+With that in place the `@ShardedActor` factory bean shown above has its
+`LedgerOperations` and `BalanceConfirmationService` injected by Spring, and the
+post-processor stands up the sharded consumer at startup and tears it down on
+context shutdown. (In a Spring Boot application `BufferflySpringAutoConfiguration`
+is picked up automatically, so the `@Import` is only needed outside Boot's
+auto-configuration — e.g. in a plain `@SpringJUnitConfig` test; see
+`LedgerShowcaseTest`.)
+
 ---
 
 ## What you get, wired for free
