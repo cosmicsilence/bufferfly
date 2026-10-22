@@ -85,6 +85,18 @@ public class TweetTransactionalOperations implements TransactionalOperations<Twe
     }
 
     /**
+     * Creates the tweet table using standard Postgres types. Kept separate from
+     * {@link #createTableIfNotExists()} (which uses the Oracle/HSQLDB
+     * {@code VARCHAR2} type) so the HSQLDB-based tests are unaffected while the
+     * benchmark can target a real Postgres. Drops first so a fresh run starts
+     * from a clean, empty table.
+     */
+    public void createTablePostgres() {
+        jdbcTemplate.execute("DROP TABLE IF EXISTS " + tableName);
+        jdbcTemplate.execute("CREATE TABLE " + tableName + " (id VARCHAR(50) PRIMARY KEY, text VARCHAR(100))");
+    }
+
+    /**
      * Truncates the table.
      */
     public void truncateTable() {
