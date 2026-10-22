@@ -2,8 +2,13 @@ description = '''\
 Virtual-thread-native actor framework for Java 25+ that acts as an in-memory \
 shock absorber and natural batching engine in front of high-volume databases.'''
 
+// Pinned (not a dynamic '2.0.+' range): Reckon / Maven Central publishing
+// rejects dynamic version ranges because they do not produce reproducible,
+// resolvable published POM metadata.
+ext.slf4jVersion = '2.0.20'
+
 dependencies {
-    implementation 'org.slf4j:slf4j-api:2.0.+'
+    implementation "org.slf4j:slf4j-api:${slf4jVersion}"
 
     testImplementation platform('org.junit:junit-bom:5.11.4')
     testImplementation 'org.junit.jupiter:junit-jupiter'
@@ -31,9 +36,10 @@ dependencies {
     testImplementation 'org.postgresql:postgresql'
     testImplementation 'com.zaxxer:HikariCP'
 
-    // Use testRuntimeOnly and force it to adhere strictly to the wildcard
-    testRuntimeOnly('org.slf4j:slf4j-simple:2.0.+') {
-        because "Spring Boot BOM strips out wildcards for SLF4J modules"
+    // Console SLF4J binding for tests. Pinned (see slf4jVersion above); the
+    // Spring Boot BOM would otherwise manage this to a different version.
+    testRuntimeOnly("org.slf4j:slf4j-simple:${slf4jVersion}") {
+        because "Keep the test console binding aligned with the pinned slf4j-api"
     }
 
     testCompileOnly 'org.projectlombok:lombok:1.18.48'
@@ -44,7 +50,7 @@ configurations.all {
     resolutionStrategy {
         eachDependency { DependencyResolveDetails details ->
             if (details.requested.group == 'org.slf4j') {
-                details.useVersion '2.0.+'
+                details.useVersion slf4jVersion
             }
         }
     }
