@@ -10,6 +10,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -113,28 +114,13 @@ public class NaturalBatchingDispatcher<E> implements PersistenceDispatcher<E> {
 
     private List<PersistenceRunner.PersistenceEvent<E>> drainBatch() throws InterruptedException {
         List<PersistenceRunner.PersistenceEvent<E>> batch = new ArrayList<>(batchSize);
-
-        // Wait for the first event up to timeoutMs
         long deadline = System.currentTimeMillis() + timeoutMs;
-
-        int counter = 0 ;
-        while (counter < batchSize) {
-            PersistenceRunner.PersistenceEvent<E> head = buffer.poll();
+        while (System.currentTimeMillis() < deadline && batch.size() < batchSize) {
+            long nextTimeout = Math.max(deadline - System.currentTimeMillis(), 0L);
+            PersistenceRunner.PersistenceEvent<E> head = buffer.poll(nextTimeout, TimeUnit.MILLISECONDS);
             if (head != null) {
-                counter = counter + 1;
                 batch.add(head);
-            } else {
-                Thread.sleep(5);
             }
-            if (System.currentTimeMillis() >= deadline) {
-                break; // nothing arrived within the window
-            }
-        }
-        // Greedily fill the remainder with the batch without waiting
-        while (batch.size() < batchSize) {
-            PersistenceRunner.PersistenceEvent<E> next = buffer.poll();
-            if (next == null) break;
-            batch.add(next);
         }
         return batch;
     }
