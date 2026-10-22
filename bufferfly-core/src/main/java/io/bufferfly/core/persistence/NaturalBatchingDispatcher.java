@@ -1,5 +1,8 @@
 package io.bufferfly.core.persistence;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
@@ -41,6 +44,8 @@ import java.util.concurrent.atomic.AtomicReference;
  * be polled on every enqueue by a backpressure decorator.
  */
 public class NaturalBatchingDispatcher<E> implements PersistenceDispatcher<E> {
+
+    private static final Logger log = LoggerFactory.getLogger(NaturalBatchingDispatcher.class);
 
     private final int batchSize;
     private final long timeoutMs;
@@ -92,6 +97,7 @@ public class NaturalBatchingDispatcher<E> implements PersistenceDispatcher<E> {
                 runner.persistBatch(batch);
             }
         } catch (InterruptedException e) {
+            log.warn("Natural-batching consume loop interrupted while draining; stopping this drain cycle");
             Thread.currentThread().interrupt();
             return;
         } finally {

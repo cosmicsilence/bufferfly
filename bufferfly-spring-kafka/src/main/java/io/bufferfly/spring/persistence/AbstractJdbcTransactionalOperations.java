@@ -3,6 +3,8 @@ package io.bufferfly.spring.persistence;
 import io.bufferfly.core.persistence.SingleItemException;
 import io.bufferfly.core.persistence.TransactionalOperations;
 import io.bufferfly.core.persistence.UnrecoverableException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.DataSourceTransactionManager;
@@ -65,6 +67,8 @@ import java.util.function.Consumer;
 public abstract class AbstractJdbcTransactionalOperations<E extends OffsetBearing>
         implements TransactionalOperations<E> {
 
+    private static final Logger log = LoggerFactory.getLogger(AbstractJdbcTransactionalOperations.class);
+
     private final JdbcTemplate jdbc;
     private final TransactionTemplate tx;
     private final FencingOffsetRepository offsets;
@@ -124,9 +128,19 @@ public abstract class AbstractJdbcTransactionalOperations<E extends OffsetBearin
                 persistBatch(batch);
             });
         } catch (UnrecoverableException e) {
+            log.error("Unrecoverable failure persisting batch for {}-{} up to offset {} (likely a failed offset fence / zombie actor); propagating",
+                    topic, partition, maxOffset, e);
             throw e; // fence failures stay unrecoverable
         } catch (RuntimeException e) {
-            throw classify(e);
+            RuntimeException classified = classify(e);
+            if (classified instanceof SingleItemException) {
+                log.warn("DB rejected a record in batch for {}-{} up to offset {} ({}); classifying as poison pill for item-by-item isolation",
+                        topic, partition, maxOffset, e.getClass().getSimpleName());
+            } else {
+                log.error("Failure persisting batch for {}-{} up to offset {} classified as {}",
+                        topic, partition, maxOffset, classified.getClass().getSimpleName(), e);
+            }
+            throw classified;
         }
     }
 
@@ -212,6 +226,9 @@ public abstract class AbstractJdbcTransactionalOperations<E extends OffsetBearin
      */
     @Override
     public final void onPoisonPill(E event, Exception cause) {
+        log.warn("Dead-lettering poison pill at {}-{} offset {} ({}) and advancing fencing offset past it",
+                event.topic(), event.partition(), event.offset(),
+                cause == null ? "unknown cause" : cause.getClass().getSimpleName());
         tx.executeWithoutResult(status -> {
             deadLetter(event, cause);
             // step the fencing token over the dead-lettered offset (same tx)

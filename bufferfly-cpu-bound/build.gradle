@@ -10,6 +10,9 @@ dependencies {
     testImplementation 'org.junit.jupiter:junit-jupiter'
     testRuntimeOnly   'org.junit.platform:junit-platform-launcher'
     testImplementation 'org.awaitility:awaitility:4.3.0'
+    // Console SLF4J binding for tests so framework logs (SpinningActorDispatcher,
+    // and the bufferfly-core classes it exercises) are visible when running tests.
+    testRuntimeOnly   'org.slf4j:slf4j-simple:2.0.+'
 }
 
 test {

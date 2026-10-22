@@ -2,6 +2,8 @@ package io.bufferfly.core.backpressure;
 
 import io.bufferfly.core.persistence.PersistenceDispatcher;
 import io.bufferfly.core.persistence.PersistenceRunner;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.util.Objects;
 import java.util.concurrent.Executors;
@@ -57,6 +59,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * @param <E> the persistence event type
  */
 public final class BackpressurePersistenceDispatcher<E> implements PersistenceDispatcher<E> {
+
+    private static final Logger log = LoggerFactory.getLogger(BackpressurePersistenceDispatcher.class);
 
     private final PersistenceDispatcher<E> delegate;
     private final int highWatermark;
@@ -127,8 +131,10 @@ public final class BackpressurePersistenceDispatcher<E> implements PersistenceDi
             this.evaluatorTask = scheduler.scheduleAtFixedRate(() -> {
                 try {
                     evaluate(delegate.size());
-                } catch (RuntimeException ignored) {
+                } catch (RuntimeException e) {
                     // never let the periodic evaluator die
+                    log.warn("Periodic backpressure evaluator threw {}; swallowing to keep the evaluator alive",
+                            e.getClass().getSimpleName(), e);
                 }
             }, evaluateIntervalMs, evaluateIntervalMs, TimeUnit.MILLISECONDS);
         } else {
@@ -156,6 +162,7 @@ public final class BackpressurePersistenceDispatcher<E> implements PersistenceDi
         }
         // The buffer is now empty; relieve pressure if we were holding it.
         if (underPressure.compareAndSet(true, false)) {
+            log.debug("Backpressure released on clear()/stop() while still engaged");
             callback.onReleasedPressure();
         }
     }
@@ -177,10 +184,12 @@ public final class BackpressurePersistenceDispatcher<E> implements PersistenceDi
     void evaluate(int currentSize) {
         if (currentSize >= highWatermark) {
             if (underPressure.compareAndSet(false, true)) {
+                log.info("Backpressure ENGAGED: buffer depth {} reached high watermark {}", currentSize, highWatermark);
                 callback.onBackpressure();
             }
         } else if (currentSize <= lowWatermark) {
             if (underPressure.compareAndSet(true, false)) {
+                log.info("Backpressure RELEASED: buffer depth {} receded to low watermark {}", currentSize, lowWatermark);
                 callback.onReleasedPressure();
             }
         }

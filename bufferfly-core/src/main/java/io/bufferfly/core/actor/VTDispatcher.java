@@ -1,10 +1,15 @@
 package io.bufferfly.core.actor;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.*;
 
 public class VTDispatcher implements ActorDispatcher, CallerRunsCapable {
+
+    private static final Logger log = LoggerFactory.getLogger(VTDispatcher.class);
 
     /**
      * Default mailbox capacity used when no per-actor override is present.
@@ -160,6 +165,8 @@ public class VTDispatcher implements ActorDispatcher, CallerRunsCapable {
                 try {
                     actor.receive(message);
                 } catch (Exception e) {
+                    log.warn("Actor '{}' receive() threw {}; routing to onError", actor.name(),
+                            e.getClass().getSimpleName());
                     actor.onError(message, e);
                 }
                 // protection against greedy actors, letting others be scheduled
@@ -169,6 +176,7 @@ public class VTDispatcher implements ActorDispatcher, CallerRunsCapable {
                 }
             }
         } catch (BlockingMailbox.MailBoxInterrupted e) {
+            log.warn("Drain loop for actor '{}' interrupted; stopping drain", actor.name());
             interrupted = true;
         }
         runningActors.remove(actor);
