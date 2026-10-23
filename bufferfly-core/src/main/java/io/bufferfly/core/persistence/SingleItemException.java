@@ -10,7 +10,7 @@ package io.bufferfly.core.persistence;
  * <p>{@link BatchingPersistenceRunner} reacts by re-submitting each item in
  * the failed batch individually to {@link TransactionalOperations#persistOnTransaction} as a
  * single-element list. The first element that causes another exception is the
- * poison pill; {@link TransactionalOperations#onPoisonPill(Object, Exception)}
+ * poison pill; {@link TransactionalOperations#onPoisonPill(Object, long, Exception)}
  * is called for it, and processing continues with the remaining elements.
  * Elements that succeed individually are committed normally.
  */

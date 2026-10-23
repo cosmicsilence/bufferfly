@@ -109,8 +109,8 @@ public abstract class AbstractJdbcTransactionalOperations<E extends OffsetBearin
     }
 
     @Override
-    public final void persistOnTransaction(List<E> batch) {
-        if (batch == null || batch.isEmpty()) return;
+    public final long persistOnTransaction(List<E> batch, long currentToken) {
+        if (batch == null || batch.isEmpty()) return currentToken;
 
         beforePersist(batch);
 
@@ -121,9 +121,11 @@ public abstract class AbstractJdbcTransactionalOperations<E extends OffsetBearin
         try {
             tx.executeWithoutResult(status -> {
                 // 1) fence + advance the offset (optimistic lock / zombie guard),
-                //    using the highest offset in the batch. We store the offset
-                //    ONCE per batch (the max), not per event.
-                offsets.fenceAndAdvance(topic, partition, maxOffset);
+                //    CAS from the authoritative token the runner holds to the
+                //    batch max. No read of the stored offset — the token (here the
+                //    Kafka offset) IS the lock, so a zombie holding a stale token
+                //    is rejected.
+                offsets.fenceAndAdvance(topic, partition, currentToken, maxOffset);
                 // 2) implementor writes the data within this same transaction.
                 persistBatch(batch);
             });
@@ -142,6 +144,12 @@ public abstract class AbstractJdbcTransactionalOperations<E extends OffsetBearin
             }
             throw classified;
         }
+
+        // Commit succeeded: the token we now hold for this partition is the batch
+        // max (unless the fence was a benign replay no-op at/behind currentToken,
+        // in which case the token is unchanged). Return it so the runner adopts it
+        // for the next batch — and so it can hand it back to onPoisonPill.
+        return Math.max(currentToken, maxOffset);
     }
 
     /**
@@ -221,19 +229,27 @@ public abstract class AbstractJdbcTransactionalOperations<E extends OffsetBearin
      * dead-letter write and the offset advance share one transaction, so either
      * both happen or neither does.
      *
-     * @param event the poison-pill event
-     * @param cause the exception thrown when attempting to persist it alone
+     * @param event        the poison-pill event
+     * @param currentToken the authoritative fencing token held when the pill was
+     *                     isolated (passed in by the runner — never re-read)
+     * @param cause        the exception thrown when attempting to persist it alone
+     * @return the fencing token after the advance (the pill's offset) so the
+     *         runner adopts it for the next isolated item
      */
     @Override
-    public final void onPoisonPill(E event, Exception cause) {
+    public final long onPoisonPill(E event, long currentToken, Exception cause) {
         log.warn("Dead-lettering poison pill at {}-{} offset {} ({}) and advancing fencing offset past it",
                 event.topic(), event.partition(), event.offset(),
                 cause == null ? "unknown cause" : cause.getClass().getSimpleName());
         tx.executeWithoutResult(status -> {
             deadLetter(event, cause);
-            // step the fencing token over the dead-lettered offset (same tx)
-            offsets.fenceAndAdvance(event.topic(), event.partition(), event.offset());
+            // step the fencing token over the dead-lettered offset (same tx),
+            // CAS from the token the runner handed us — no read.
+            offsets.fenceAndAdvance(event.topic(), event.partition(), currentToken, event.offset());
         });
+        // The fence now sits at the pill's offset; hand that back so the runner's
+        // currentToken is not left stale for the next isolated item.
+        return Math.max(currentToken, event.offset());
     }
 
     /**

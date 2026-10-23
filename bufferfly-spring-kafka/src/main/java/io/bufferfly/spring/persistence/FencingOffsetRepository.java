@@ -108,35 +108,47 @@ public final class FencingOffsetRepository {
     }
 
     /**
-     * Advances the stored offset for {@code (topic, partition)} from its current
-     * value to {@code newMax} using a guarded (compare-and-set) update. Returns
-     * normally only if this writer held the authoritative token; otherwise
-     * throws {@link UnrecoverableException} so the enclosing transaction rolls
-     * back and the actor is halted/restarted.
+     * Advances the stored offset for {@code (topic, partition)} from the
+     * authoritative {@code currentOffset} the caller holds to {@code newMax}
+     * using a single guarded (compare-and-set) write — <b>without reading the
+     * stored value first</b>. {@code currentOffset} <em>is</em> the optimistic
+     * lock: the caller (the persistence runner) seeded it from the durable store
+     * when the actor (re)started and has advanced it after every committed batch,
+     * so it is the token this writer provably holds. Returns normally only if the
+     * CAS matched; otherwise throws {@link UnrecoverableException} so the
+     * enclosing transaction rolls back and the actor is halted/restarted.
+     *
+     * <p>Reading the stored offset here (the previous design) reintroduced the
+     * very race a fencing token exists to close: between the read and the write a
+     * zombie could advance the token, yet the CAS would still be issued against
+     * the stale read. By taking the token as a parameter instead, a zombie actor
+     * — which holds an <em>older</em> {@code currentOffset} — can never match the
+     * row a live owner already advanced, so its write is rejected.
      *
      * <ul>
-     *   <li>No row yet — insert the token (first batch ever for the partition).
-     *       If the insert does not affect exactly one row, a concurrent writer
-     *       inserted first: zombie race → {@link UnrecoverableException}.</li>
-     *   <li>{@code newMax <= stored} — a benign replay (e.g. redelivery after a
-     *       restart/rewind). Idempotent sinks make this a safe no-op; it is
-     *       <em>not</em> a zombie and the token is not advanced.</li>
-     *   <li>{@code newMax > stored} — compare-and-set from {@code stored} to
-     *       {@code newMax}. Zero rows updated means the token was advanced
-     *       concurrently by a zombie → {@link UnrecoverableException}.</li>
+     *   <li>{@code currentOffset < 0} — no token held yet (first batch ever for
+     *       the partition): insert the row. If the insert does not affect exactly
+     *       one row, a concurrent writer inserted first → zombie race →
+     *       {@link UnrecoverableException}.</li>
+     *   <li>{@code newMax <= currentOffset} — a benign replay at/behind the token
+     *       we already hold (e.g. a redelivery whose data the idempotent sink has
+     *       already absorbed). Not a zombie and not a backwards CAS: a safe no-op,
+     *       the token is left unchanged.</li>
+     *   <li>otherwise — compare-and-set from {@code currentOffset} to
+     *       {@code newMax} ({@code WHERE latest_offset = currentOffset}). Zero
+     *       rows updated means a zombie advanced the token concurrently →
+     *       {@link UnrecoverableException}.</li>
      * </ul>
      *
-     * @param topic     the partition's topic
-     * @param partition the partition
-     * @param newMax    the highest offset in the batch being persisted
+     * @param topic         the partition's topic
+     * @param partition     the partition
+     * @param currentOffset the authoritative token the caller holds
+     *                      ({@code < 0} when nothing has been committed yet)
+     * @param newMax        the highest offset in the batch being persisted
      * @throws UnrecoverableException on a zombie race (failed fence)
      */
-    public void fenceAndAdvance(String topic, int partition, long newMax) {
-        Long stored = jdbc.query(selectSql,
-                rs -> rs.next() ? rs.getLong(1) : null,
-                topic, partition);
-
-        if (stored == null) {
+    public void fenceAndAdvance(String topic, int partition, long currentOffset, long newMax) {
+        if (currentOffset < 0) {
             int inserted = jdbc.update(insertSql, topic, partition, newMax);
             if (inserted != 1) {
                 throw new UnrecoverableException(
@@ -146,20 +158,19 @@ public final class FencingOffsetRepository {
             return;
         }
 
-        if (newMax <= stored) {
-            // At/behind the committed offset: a benign replay. The sink is
+        if (newMax <= currentOffset) {
+            // At/behind the token we already hold: a benign replay. The sink is
             // idempotent by (topic, partition, offset), so this is a safe no-op —
-            // no advance, and crucially NOT treated as a zombie. A real zombie is
-            // detected by the compare-and-set UPDATE below.
+            // no CAS (which would be a no-op or a backwards move) and NOT a zombie.
             return;
         }
 
-        int updated = jdbc.update(updateSql, newMax, topic, partition, stored);
+        int updated = jdbc.update(updateSql, newMax, topic, partition, currentOffset);
         if (updated != 1) {
             throw new UnrecoverableException(
                     ("Offset fence failed for %s-%d: expected latest_offset=%d but it was advanced "
                             + "concurrently — a zombie actor is racing the new owner. Halting to restart clean.")
-                            .formatted(topic, partition, stored));
+                            .formatted(topic, partition, currentOffset));
         }
     }
 

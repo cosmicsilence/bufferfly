@@ -30,10 +30,60 @@ public interface TransactionalOperations<E> {
     /**
      * Persists {@code batch} atomically.
      *
+     * <p>Kept for implementations that do not participate in the fencing-token
+     * protocol (e.g. stores without a per-partition fencing token). Token-backed
+     * implementations should override {@link #persistOnTransaction(List, long)}
+     * instead; the default of this method is unused once that overload is
+     * implemented.
+     *
      * @param batch a non-empty, immutable snapshot of events to persist
      * @throws PersistenceException to signal how the runner should handle a failure
      */
-    void persistOnTransaction(List<E> batch);
+    default void persistOnTransaction(List<E> batch) {
+        throw new UnsupportedOperationException(
+                "persistOnTransaction(batch) is not implemented; implement "
+                        + "persistOnTransaction(batch, currentToken) or override this method");
+    }
+
+    /**
+     * Persists {@code batch} atomically and advances the per-partition
+     * optimistic-locking <b>fencing token</b> from the authoritative
+     * {@code currentToken} the caller holds to the batch's new high-water value,
+     * <em>in the same transaction</em>.
+     *
+     * <p>The token is any monotonically increasing number the storage layer can
+     * compare-and-set on — a Kafka offset, a WAL position, a DB sequence. The
+     * core engine never interprets it; it only carries it through so the store
+     * can fence zombie writers. (In the Kafka adapter the token <em>is</em> the
+     * consumed offset.)
+     *
+     * <p>{@code currentToken} is the token this writer believes it holds: the
+     * value the owning actor loaded from the store when it (re)started, then
+     * advanced by this runner after each successful batch. The implementation
+     * MUST advance the stored token with a compare-and-set guarded by this exact
+     * value ({@code WHERE token = currentToken}) and MUST NOT re-read the stored
+     * token to decide what to write — a stale read is precisely the race this
+     * protocol removes. If the CAS matches zero rows a zombie actor advanced the
+     * token concurrently; throw {@link UnrecoverableException} so the transaction
+     * rolls back and the actor restarts clean.
+     *
+     * <p>The returned value becomes the caller's {@code currentToken} for the
+     * next batch. On success this is the highest token just committed; an empty
+     * batch returns {@code currentToken} unchanged.
+     *
+     * <p>The default implementation delegates to {@link #persistOnTransaction(List)}
+     * and returns {@code currentToken} unchanged, for stores that do not fence.
+     *
+     * @param batch        a non-empty, immutable snapshot of events to persist
+     * @param currentToken the authoritative fencing token this writer holds
+     *                     ({@code < 0} when nothing has been committed yet)
+     * @return the new authoritative fencing token to use for the next batch
+     * @throws PersistenceException to signal how the runner should handle a failure
+     */
+    default long persistOnTransaction(List<E> batch, long currentToken) {
+        persistOnTransaction(batch);
+        return currentToken;
+    }
 
     /**
      * Called when an individual element in a batch is identified as a poison
@@ -43,8 +93,25 @@ public interface TransactionalOperations<E> {
      * <p>This method must not throw. Implementations should log, dead-letter,
      * or metric-alert as appropriate for the use case.
      *
-     * @param event     the poison-pill event
-     * @param cause     the exception thrown when attempting to persist it alone
+     * <p>{@code currentToken} is the authoritative fencing token the runner
+     * holds at the point the pill was isolated — the value advanced by the good
+     * items persisted before it in the same item-by-item pass. A token-backed
+     * implementation that steps the stored token past the dead-lettered record
+     * MUST compare-and-set from this exact value (never re-read it), for the same
+     * reason the batch path does: a re-read reopens the zombie race.
+     *
+     * <p>Returns the fencing token in force <em>after</em> dead-lettering: for a
+     * token-backed store that stepped the token past the pill, that is the pill's
+     * token; the runner adopts it so the next isolated item fences from the right
+     * value instead of a stale one. A store that does not advance any token
+     * returns {@code currentToken} unchanged.
+     *
+     * @param event        the poison-pill event
+     * @param currentToken the authoritative fencing token held when the pill was
+     *                     isolated ({@code < 0} if nothing has been committed yet)
+     * @param cause        the exception thrown when attempting to persist it alone
+     * @return the fencing token to use for the next item (the advanced token, or
+     *         {@code currentToken} if the store advances nothing)
      */
-    void onPoisonPill(E event, Exception cause);
+    long onPoisonPill(E event, long currentToken, Exception cause);
 }

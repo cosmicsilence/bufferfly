@@ -44,7 +44,8 @@ public class NaturalBatchingDispatcherTest {
         }
 
         @Override
-        public void onPoisonPill(String event, Exception cause) {
+        public long onPoisonPill(String event, long currentToken, Exception cause) {
+            return currentToken;
         }
     }
 
