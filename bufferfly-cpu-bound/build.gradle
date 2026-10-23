@@ -12,8 +12,7 @@ dependencies {
     testImplementation 'org.awaitility:awaitility:4.3.0'
     // Console SLF4J binding for tests so framework logs (SpinningActorDispatcher,
     // and the bufferfly-core classes it exercises) are visible when running tests.
-    // Pinned (not '2.0.+'): dynamic ranges break reproducible publishing metadata.
-    testRuntimeOnly   'org.slf4j:slf4j-simple:2.0.20'
+    testRuntimeOnly   'org.slf4j:slf4j-simple:2.0.+'
 }
 
 test {
