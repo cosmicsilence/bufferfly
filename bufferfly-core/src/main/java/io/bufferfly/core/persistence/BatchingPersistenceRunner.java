@@ -67,6 +67,28 @@ public final class BatchingPersistenceRunner<E> implements PersistenceRunner<E> 
 
     private volatile State state = State.STARTED;
 
+    /**
+     * The authoritative fencing token this runner currently holds. Seeded by the
+     * owning actor on restart via {@link #initToken(long)} (from the token
+     * durably stored for the partition), then advanced to the value returned by
+     * {@link TransactionalOperations#persistOnTransaction(List, long)} after
+     * every successful commit. Passing this known value down (rather than having
+     * the storage layer re-read it) is what makes the fence a true optimistic
+     * lock: a zombie actor holds a stale token and its compare-and-set fails.
+     *
+     * <p>The token is any monotonically increasing number the storage layer can
+     * compare-and-set on (a Kafka offset, a WAL position, a sequence); the core
+     * engine treats it only as an opaque fencing token.
+     *
+     * <p>Mutated only on the single persistence thread inside {@link #persistBatch}
+     * and seeded once from the actor thread in {@code preStart}; {@code volatile}
+     * guarantees the seed is visible to the persistence thread.
+     */
+    private volatile long currentToken = UNINITIALISED_TOKEN;
+
+    /** Sentinel for "no token committed yet" (first batch ever for the partition). */
+    public static final long UNINITIALISED_TOKEN = -1L;
+
 
     public BatchingPersistenceRunner(TransactionalOperations<E> operations) {
         this(new PersistenceConfig<>(operations));
@@ -140,6 +162,26 @@ public final class BatchingPersistenceRunner<E> implements PersistenceRunner<E> 
     }
 
     /**
+     * Seeds the authoritative fencing token this runner holds. Called by the
+     * owning actor on (re)start — typically from {@code preStart} — with the
+     * token durably stored for its partition (or {@link #UNINITIALISED_TOKEN}
+     * when nothing has been committed yet). Must be called before any event is
+     * enqueued; from that point the runner advances the token itself after each
+     * committed batch.
+     *
+     * @param storedToken the last durably committed token for the partition,
+     *                    or {@link #UNINITIALISED_TOKEN} if none
+     */
+    public void initToken(long storedToken) {
+        this.currentToken = storedToken;
+    }
+
+    /** @return the fencing token this runner currently holds. */
+    public long currentToken() {
+        return currentToken;
+    }
+
+    /**
      * Enqueues {@code event} and signals the dispatcher to schedule a consume
      * loop if one is not already running. Never blocks.
      *
@@ -187,10 +229,16 @@ public final class BatchingPersistenceRunner<E> implements PersistenceRunner<E> 
         int attempts = 0;
         while (true) {
             try {
-                operations.persistOnTransaction(List.copyOf(batch
-                        .stream()
-                        .map(PersistenceEvent::event)
-                        .toList()));
+                long newToken = operations.persistOnTransaction(
+                        List.copyOf(batch
+                                .stream()
+                                .map(PersistenceEvent::event)
+                                .toList()),
+                        currentToken);
+                // Adopt the advanced fencing token for the next batch. The CAS in
+                // the operations layer succeeded against our known currentToken,
+                // so we now own the token at its new value.
+                currentToken = newToken;
                 batch.forEach(e -> sideEffectProcessor.process(e.sideEffect()));
                 return; // success
             } catch (SingleItemException e) {
@@ -246,7 +294,9 @@ public final class BatchingPersistenceRunner<E> implements PersistenceRunner<E> 
     private void flushItemByItem(List<PersistenceEvent<E>> batch) {
         for (PersistenceEvent<E> item : batch) {
             try {
-                operations.persistOnTransaction(List.of(item.event()));
+                // Persist this single item, fencing against the token we hold, and
+                // adopt the advanced token so the next item's CAS matches.
+                currentToken = operations.persistOnTransaction(List.of(item.event()), currentToken);
                 sideEffectProcessor.process(item.sideEffect());
             } catch (UnrecoverableException e) {
                 log.error("Unrecoverable failure while isolating batch item-by-item; abandoning remaining items", e);
@@ -257,7 +307,12 @@ public final class BatchingPersistenceRunner<E> implements PersistenceRunner<E> 
                 log.warn("Poison pill detected ({}); dead-lettering via onPoisonPill and continuing with remaining items",
                         e.getMessage());
                 try {
-                    operations.onPoisonPill(item.event(), e);
+                    // Hand the operations layer the authoritative token we hold
+                    // right now (advanced by the good items isolated before this
+                    // pill) and adopt the token it returns — the store stepped the
+                    // fence past the dead-lettered record, so the NEXT good item
+                    // must CAS from that advanced value, not the now-stale one.
+                    currentToken = operations.onPoisonPill(item.event(), currentToken, e);
 
                 } catch (Exception swallowed) {
                     // onPoisonPill must not throw — swallow defensively

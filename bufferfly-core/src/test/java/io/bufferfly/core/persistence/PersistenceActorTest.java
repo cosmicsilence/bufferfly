@@ -284,7 +284,8 @@ class PersistenceActorTest {
             }
 
             @Override
-            public void onPoisonPill(Tweet event, Exception cause) {
+            public long onPoisonPill(Tweet event, long currentToken, Exception cause) {
+                return currentToken;
             }
         };
 
@@ -324,7 +325,8 @@ class PersistenceActorTest {
             }
 
             @Override
-            public void onPoisonPill(Tweet event, Exception cause) {
+            public long onPoisonPill(Tweet event, long currentToken, Exception cause) {
+                return currentToken;
             }
         };
 
@@ -365,7 +367,8 @@ class PersistenceActorTest {
             }
 
             @Override
-            public void onPoisonPill(Tweet event, Exception cause) {
+            public long onPoisonPill(Tweet event, long currentToken, Exception cause) {
+                return currentToken;
             }
         };
 
@@ -452,7 +455,8 @@ class PersistenceActorTest {
             }
 
             @Override
-            public void onPoisonPill(Tweet event, Exception cause) {
+            public long onPoisonPill(Tweet event, long currentToken, Exception cause) {
+                return currentToken;
             }
         };
 

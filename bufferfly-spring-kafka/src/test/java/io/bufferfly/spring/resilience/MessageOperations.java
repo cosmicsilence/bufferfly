@@ -92,8 +92,8 @@ public final class MessageOperations implements TransactionalOperations<Message>
     }
 
     @Override
-    public void persistOnTransaction(List<Message> batch) {
-        if (batch == null || batch.isEmpty()) return;
+    public long persistOnTransaction(List<Message> batch, long currentToken) {
+        if (batch == null || batch.isEmpty()) return currentToken;
 
         int partition = batch.get(0).partition();
 
@@ -112,8 +112,9 @@ public final class MessageOperations implements TransactionalOperations<Message>
 
         try {
             tx.executeWithoutResult(status -> {
-                // 1) fence + advance the offset (optimistic lock / zombie guard)
-                fenceAndAdvanceOffset(topic, partition, maxOffset);
+                // 1) fence + advance the offset: CAS from the authoritative token
+                //    the runner holds (currentToken) to the batch max. No read.
+                fenceAndAdvanceOffset(topic, partition, currentToken, maxOffset);
 
                 // 2) idempotent insert by (partition, offset). An over-length body
                 //    trips the strict-size VARCHAR and is caught below as a poison pill.
@@ -137,15 +138,12 @@ public final class MessageOperations implements TransactionalOperations<Message>
             throw new SingleItemException(
                     "DB rejected a record in the batch (data violation): " + e.getMessage(), e);
         }
+
+        return Math.max(currentToken, maxOffset);
     }
 
-    private void fenceAndAdvanceOffset(String topic, int partition, long newMax) {
-        Long stored = jdbc.query(
-                "SELECT latest_offset FROM consumer_offset WHERE topic = ? AND partition = ?",
-                rs -> rs.next() ? rs.getLong(1) : null,
-                topic, partition);
-
-        if (stored == null) {
+    private void fenceAndAdvanceOffset(String topic, int partition, long currentOffset, long newMax) {
+        if (currentOffset < 0) {
             int inserted = jdbc.update(
                     "INSERT INTO consumer_offset (topic, partition, latest_offset) VALUES (?, ?, ?)",
                     topic, partition, newMax);
@@ -155,29 +153,32 @@ public final class MessageOperations implements TransactionalOperations<Message>
             }
             return;
         }
-        if (newMax <= stored) {
-            return; // benign replay; idempotent insert makes this a safe no-op
+        if (newMax <= currentOffset) {
+            return; // benign replay at/behind the token we hold; idempotent insert makes this a safe no-op
         }
         int updated = jdbc.update("""
                         UPDATE consumer_offset
                            SET latest_offset = ?
                          WHERE topic = ? AND partition = ? AND latest_offset = ?""",
-                newMax, topic, partition, stored);
+                newMax, topic, partition, currentOffset);
         if (updated != 1) {
             throw new UnrecoverableException(
                     ("Offset fence failed for %s-%d: expected %d, advanced concurrently (zombie).")
-                            .formatted(topic, partition, stored));
+                            .formatted(topic, partition, currentOffset));
         }
     }
 
     @Override
-    public void onPoisonPill(Message event, Exception cause) {
+    public long onPoisonPill(Message event, long currentToken, Exception cause) {
         // Record to the in-memory DLQ (NOT the DB). Also advance the fencing token
         // past this offset so a restart's rewind resumes AFTER the poison pill
-        // rather than re-delivering it (which would loop).
+        // rather than re-delivering it (which would loop). CAS from the token the
+        // runner handed us — no read, no internal tracking.
         poisonPills.add(event);
         tx.executeWithoutResult(status ->
-                fenceAndAdvanceOffset(topicOf(event.partition()), event.partition(), event.offset()));
+                fenceAndAdvanceOffset(topicOf(event.partition()), event.partition(), currentToken, event.offset()));
+        // Hand back the advanced token so the runner does not go stale.
+        return Math.max(currentToken, event.offset());
     }
 
     // -- query helpers ------------------------------------------------------

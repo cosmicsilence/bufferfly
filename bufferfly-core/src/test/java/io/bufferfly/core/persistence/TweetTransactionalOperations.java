@@ -132,9 +132,10 @@ public class TweetTransactionalOperations implements TransactionalOperations<Twe
     }
 
     @Override
-    public void onPoisonPill(Tweet event, Exception cause) {
+    public long onPoisonPill(Tweet event, long currentToken, Exception cause) {
         poisonPills.add(event);
         poisonPillCauses.add(cause);
+        return currentToken; // non-token store: nothing to advance
     }
 
     private void handleException(Exception e, List<Tweet> batch) {

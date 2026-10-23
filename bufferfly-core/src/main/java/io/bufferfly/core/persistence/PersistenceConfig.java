@@ -12,8 +12,8 @@ package io.bufferfly.core.persistence;
 public final class PersistenceConfig<E> {
 
     public static final int DEFAULT_BATCH_SIZE = 1_000;
-    public static final long DEFAULT_TIMEOUT_MS = 50L;
-    public static final int DEFAULT_MAX_RETRIES = 3;
+    public static final long DEFAULT_TIMEOUT_MS = 20L;
+    public static final int DEFAULT_MAX_RETRIES = 5;
 
     private final TransactionalOperations<E> operations;
     private final int batchSize;

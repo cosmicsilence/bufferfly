@@ -65,6 +65,10 @@ public final class LedgerActor extends AbstractPersistentActor<ConsumedRecord<Ad
 
         // Resume from the last durably committed offset (fencing token source).
         long stored = operations.loadStoredOffset(kafkaContext.topic(), kafkaContext.partition());
+        // Seed the runner with the authoritative token (here, the Kafka offset) so
+        // its fence advances from this known value (a zombie actor holds a stale
+        // token and its CAS fails).
+        initToken(stored);
         if (stored < 0) {
             kafkaContext.seekToBeginning(); // nothing persisted yet -> replay from start
         } else {

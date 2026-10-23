@@ -104,6 +104,26 @@ public abstract class AbstractPersistentActor<T, E> extends AbstractActor<T> {
     }
 
     /**
+     * Seeds the persistence runner's authoritative fencing token. A persistent
+     * actor backed by a per-partition fencing token should call this from
+     * {@link #preStart()} with the token it loaded from the store (or
+     * {@link BatchingPersistenceRunner#UNINITIALISED_TOKEN} if none), so the
+     * runner advances the token from a known-good value after each batch instead
+     * of having the storage layer re-read it.
+     *
+     * <p>No-op when the runner is not a {@link BatchingPersistenceRunner}.
+     *
+     * @param storedToken the last durably committed fencing token for the
+     *                     partition, or
+     *                     {@link BatchingPersistenceRunner#UNINITIALISED_TOKEN}
+     */
+    protected final void initToken(long storedToken) {
+        if (runner instanceof BatchingPersistenceRunner<E> batching) {
+            batching.initToken(storedToken);
+        }
+    }
+
+    /**
      * Stops the underlying persistence runner when this actor is stopped.
      */
     @Override

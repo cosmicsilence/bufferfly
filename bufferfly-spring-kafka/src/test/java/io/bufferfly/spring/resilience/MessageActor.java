@@ -55,6 +55,8 @@ public final class MessageActor extends AbstractPersistentActor<ConsumedRecord<S
 
         // Resume from the last durably committed offset (fencing token source).
         long stored = operations.loadStoredOffset(ctx.topic(), ctx.partition());
+        // Seed the runner with the authoritative fencing token (the Kafka offset).
+        initToken(stored);
         if (stored < 0) {
             ctx.seekToBeginning();
         } else {
