@@ -70,6 +70,7 @@ subprojects {
     }
 
     publishing {
+        // Publish the resolved dependency versions in the POM
         publications.withType(MavenPublication).configureEach {
             versionMapping {
                 usage('java-api') { fromResolutionOf('runtimeClasspath') }
