@@ -10,6 +10,7 @@ plugins {
 
 dependencyLocking {
     lockAllConfigurations()
+    lockMode = LockMode.STRICT
 }
 
 tasks.register('resolveAndLockAll') {
@@ -66,6 +67,16 @@ subprojects {
     // javadoc's doclint is not wired into check/assemble by default.
     tasks.named('check') {
         dependsOn tasks.named('javadoc')
+    }
+
+    publishing {
+        // Publish the resolved dependency versions in the POM
+        publications.withType(MavenPublication).configureEach {
+            versionMapping {
+                usage('java-api') { fromResolutionOf('runtimeClasspath') }
+                usage('java-runtime') { fromResolutionResult() }
+            }
+        }
     }
 
     mavenPublishing {
