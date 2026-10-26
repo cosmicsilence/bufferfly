@@ -1,5 +1,6 @@
 package io.bufferfly.core.backpressure;
 
+import io.bufferfly.core.metrics.BufferflyMetrics;
 import io.bufferfly.core.persistence.PersistenceDispatcher;
 import io.bufferfly.core.persistence.PersistenceRunner;
 import org.slf4j.Logger;
@@ -69,6 +70,15 @@ public final class BackpressurePersistenceDispatcher<E> implements PersistenceDi
 
     private final AtomicBoolean underPressure = new AtomicBoolean(false);
 
+    /** Observability sink; {@link BufferflyMetrics#NOOP} when none wired. */
+    private final BufferflyMetrics metrics;
+
+    /** Metrics component label (typically the owning actor's name); never null. */
+    private final String component;
+
+    /** Default component label when none is supplied. */
+    public static final String DEFAULT_COMPONENT_NAME = "bufferfly-backpressure";
+
     /** Periodic evaluator; {@code null} when {@code evaluateIntervalMs <= 0}. */
     private final ScheduledExecutorService scheduler;
     private final ScheduledFuture<?> evaluatorTask;
@@ -108,8 +118,57 @@ public final class BackpressurePersistenceDispatcher<E> implements PersistenceDi
                                              int lowWatermark,
                                              BackpressureCallback callback,
                                              long evaluateIntervalMs) {
+        this(delegate, highWatermark, lowWatermark, callback, evaluateIntervalMs, BufferflyMetrics.NOOP);
+    }
+
+    /**
+     * Full constructor: as the periodic-evaluator constructor but with an
+     * observability sink. Each engage/release edge is reported to {@code metrics}
+     * ({@link BufferflyMetrics#backpressureEngaged(String)} /
+     * {@link BufferflyMetrics#backpressureReleased(String)}) in addition to firing the
+     * {@link BackpressureCallback}.
+     *
+     * @param delegate            the dispatcher whose buffer depth is monitored
+     * @param highWatermark       buffer depth at which backpressure is signalled; must be &gt; {@code lowWatermark}
+     * @param lowWatermark        buffer depth at which pressure is released; must be &gt;= 0
+     * @param callback            receives the edge-triggered transitions
+     * @param evaluateIntervalMs  background re-evaluation interval (ms); {@code 0} disables it
+     * @param metrics             observability sink; {@link BufferflyMetrics#NOOP} to disable
+     */
+    public BackpressurePersistenceDispatcher(PersistenceDispatcher<E> delegate,
+                                             int highWatermark,
+                                             int lowWatermark,
+                                             BackpressureCallback callback,
+                                             long evaluateIntervalMs,
+                                             BufferflyMetrics metrics) {
+        this(delegate, highWatermark, lowWatermark, callback, evaluateIntervalMs, metrics, DEFAULT_COMPONENT_NAME);
+    }
+
+    /**
+     * Full constructor: as the metrics constructor but with a {@code componentName}
+     * (typically the owning actor's name) used to label the backpressure
+     * engage/release signals, so per-actor backpressure can be told apart.
+     *
+     * @param delegate            the dispatcher whose buffer depth is monitored
+     * @param highWatermark       buffer depth at which backpressure is signalled; must be &gt; {@code lowWatermark}
+     * @param lowWatermark        buffer depth at which pressure is released; must be &gt;= 0
+     * @param callback            receives the edge-triggered transitions
+     * @param evaluateIntervalMs  background re-evaluation interval (ms); {@code 0} disables it
+     * @param metrics             observability sink; {@link BufferflyMetrics#NOOP} to disable
+     * @param componentName       label for the backpressure signals (the actor name)
+     */
+    public BackpressurePersistenceDispatcher(PersistenceDispatcher<E> delegate,
+                                             int highWatermark,
+                                             int lowWatermark,
+                                             BackpressureCallback callback,
+                                             long evaluateIntervalMs,
+                                             BufferflyMetrics metrics,
+                                             String componentName) {
         this.delegate = Objects.requireNonNull(delegate, "delegate must not be null");
         this.callback = Objects.requireNonNull(callback, "callback must not be null");
+        this.metrics = metrics == null ? BufferflyMetrics.NOOP : metrics;
+        this.component = (componentName == null || componentName.isBlank())
+                ? DEFAULT_COMPONENT_NAME : componentName;
         if (lowWatermark < 0)
             throw new IllegalArgumentException("lowWatermark must be >= 0, got " + lowWatermark);
         if (highWatermark <= lowWatermark)
@@ -163,6 +222,7 @@ public final class BackpressurePersistenceDispatcher<E> implements PersistenceDi
         // The buffer is now empty; relieve pressure if we were holding it.
         if (underPressure.compareAndSet(true, false)) {
             log.debug("Backpressure released on clear()/stop() while still engaged");
+            metrics.backpressureReleased(component);
             callback.onReleasedPressure();
         }
     }
@@ -185,11 +245,13 @@ public final class BackpressurePersistenceDispatcher<E> implements PersistenceDi
         if (currentSize >= highWatermark) {
             if (underPressure.compareAndSet(false, true)) {
                 log.info("Backpressure ENGAGED: buffer depth {} reached high watermark {}", currentSize, highWatermark);
+                metrics.backpressureEngaged(component);
                 callback.onBackpressure();
             }
         } else if (currentSize <= lowWatermark) {
             if (underPressure.compareAndSet(true, false)) {
                 log.info("Backpressure RELEASED: buffer depth {} receded to low watermark {}", currentSize, lowWatermark);
+                metrics.backpressureReleased(component);
                 callback.onReleasedPressure();
             }
         }

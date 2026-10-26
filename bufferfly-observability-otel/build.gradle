@@ -1,0 +1,48 @@
+description = '''\
+OpenTelemetry implementation of the BufferFly observability SPI \
+(io.bufferfly.core.metrics.BufferflyMetrics): maps BufferFly mailbox, \
+persistence and backpressure signals to OpenTelemetry counters and \
+asynchronous gauges.'''
+
+dependencies {
+    // The SPI lives in core; expose it to consumers of this adapter.
+    api project(':bufferfly-core')
+
+    // OpenTelemetry API only (not the SDK): the application owns SDK setup and
+    // passes a Meter in. Versions are managed by the OTel BOM.
+    api platform('io.opentelemetry:opentelemetry-bom:1.67.0')
+    api 'io.opentelemetry:opentelemetry-api'
+
+    testImplementation platform('org.junit:junit-bom:5.11.4')
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+    testRuntimeOnly   'org.junit.platform:junit-platform-launcher'
+
+    // The OTel in-memory testing SDK: wire a real SdkMeterProvider with an
+    // InMemoryMetricReader so tests can assert the exact instruments recorded.
+    testImplementation platform('io.opentelemetry:opentelemetry-bom:1.67.0')
+    testImplementation 'io.opentelemetry:opentelemetry-sdk'
+    testImplementation 'io.opentelemetry:opentelemetry-sdk-metrics'
+    testImplementation 'io.opentelemetry:opentelemetry-sdk-testing'
+
+    testRuntimeOnly('org.slf4j:slf4j-simple:2.0.+') {
+        because "Spring Boot BOM (pulled transitively via core test deps) strips SLF4J wildcards"
+    }
+}
+
+configurations.all {
+    resolutionStrategy {
+        eachDependency { DependencyResolveDetails details ->
+            if (details.requested.group == 'org.slf4j') {
+                details.useVersion '2.0.+'
+            }
+        }
+    }
+}
+
+test {
+    useJUnitPlatform()
+    testLogging {
+        events 'passed', 'skipped', 'failed'
+        showStandardStreams = false
+    }
+}

@@ -1,5 +1,6 @@
 package io.bufferfly.core.persistence;
 
+import io.bufferfly.core.metrics.BufferflyMetrics;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -57,11 +58,46 @@ public class NaturalBatchingDispatcher<E> implements PersistenceDispatcher<E> {
     private final AtomicReference<Future<?>> runningTask = new AtomicReference<>(null);
 
     public NaturalBatchingDispatcher(int batchSize, long timeoutMs) {
+        this(batchSize, timeoutMs, BufferflyMetrics.NOOP);
+    }
+
+    /**
+     * Creates a natural-batching dispatcher that reports its buffer depth to
+     * {@code metrics}. The depth gauge is registered once here (the backend
+     * samples {@link #size()} on its own schedule), under the default component
+     * name {@value #DEFAULT_COMPONENT_NAME}.
+     *
+     * @param batchSize maximum events coalesced per batch
+     * @param timeoutMs natural-batching window in milliseconds (1..50)
+     * @param metrics   observability sink; {@link BufferflyMetrics#NOOP} to disable
+     */
+    public NaturalBatchingDispatcher(int batchSize, long timeoutMs, BufferflyMetrics metrics) {
+        this(batchSize, timeoutMs, metrics, DEFAULT_COMPONENT_NAME);
+    }
+
+    /**
+     * Full constructor: as {@link #NaturalBatchingDispatcher(int, long, BufferflyMetrics)}
+     * but with a caller-supplied {@code componentName} used to label the
+     * buffer-depth gauge, so several dispatchers can be told apart.
+     *
+     * @param batchSize     maximum events coalesced per batch
+     * @param timeoutMs     natural-batching window in milliseconds (1..50)
+     * @param metrics       observability sink; {@link BufferflyMetrics#NOOP} to disable
+     * @param componentName label for the buffer-depth gauge
+     */
+    public NaturalBatchingDispatcher(int batchSize, long timeoutMs, BufferflyMetrics metrics, String componentName) {
         if (batchSize < 1) throw new IllegalArgumentException("batchSize must be >= 1");
         if (timeoutMs < 1 || timeoutMs > 50) throw new IllegalArgumentException("timeoutMs must be >= 1 AND <= 50 ms");
         this.batchSize = batchSize;
         this.timeoutMs = timeoutMs;
+        BufferflyMetrics m = metrics == null ? BufferflyMetrics.NOOP : metrics;
+        // Register the buffer-depth gauge once; the backend pulls size() itself.
+        m.registerPersistenceBufferDepth(
+                componentName == null ? DEFAULT_COMPONENT_NAME : componentName, this::size);
     }
+
+    /** Default label for this dispatcher's buffer-depth gauge. */
+    public static final String DEFAULT_COMPONENT_NAME = "bufferfly-persistence";
 
     @Override
     public void enqueue(PersistenceRunner.PersistenceEvent<E> event, PersistenceRunner<E> runner) {
