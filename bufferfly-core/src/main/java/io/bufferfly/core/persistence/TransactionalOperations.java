@@ -18,8 +18,10 @@ import java.util.List;
  *   <li>{@link UnrecoverableException} — discard the batch and move on.</li>
  *   <li>{@link TransientException} — retry the entire batch.</li>
  *   <li>{@link SingleItemException} — the batch contains a poison pill; the
- *       runner will re-submit each item individually and call
- *       {@link #onPoisonPill} for the offending element.</li>
+ *       runner re-submits each item individually to find it, dead-letters the
+ *       offending element via {@link #onPoisonPill}, and then <b>halts</b> (the
+ *       items after the pill are not persisted and are re-processed when the
+ *       actor restarts and replays from the committed offset).</li>
  * </ul>
  * Any other unchecked exception is treated as {@link UnrecoverableException}.
  *

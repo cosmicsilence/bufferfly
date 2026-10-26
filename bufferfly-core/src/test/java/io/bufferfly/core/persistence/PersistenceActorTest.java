@@ -126,7 +126,7 @@ class PersistenceActorTest {
     // -----------------------------------------------------------------------
 
     @Test
-    void should_isolatePoisonPillAndInsertValidTweets_when_tweetExceedsVarcharLength() {
+    void should_persistPrePillThenHalt_when_tweetExceedsVarcharLength() {
         // tweet table has TEXT VARCHAR2(100).
         // 100 characters must succeed.
         String exactly100 = "A".repeat(100);
@@ -138,25 +138,30 @@ class PersistenceActorTest {
         Tweet valid2 = new Tweet("valid-2", exactly100);
         Tweet valid3 = new Tweet("valid-3", "Valid end tweet");
 
-        // Send all tweets in quick succession so they form a batch
+        // Send all tweets in quick succession so they form a single batch
+        // [valid1, poison, valid2, valid3].
         actorRef.tell(valid1);
         actorRef.tell(poison);
         actorRef.tell(valid2);
         actorRef.tell(valid3);
 
-        // The poison pill must be isolated to onPoisonPill, while valid tweets are persisted
+        // Halt-at-pill: the batch is isolated item-by-item only far enough to FIND
+        // the pill. valid1 (before the pill) persists; the pill is dead-lettered;
+        // then the runner HALTS, so valid2 and valid3 (after the pill) are NOT
+        // persisted — in a real deployment the actor restarts and replays them
+        // from the committed offset.
         await().atMost(Duration.ofSeconds(5))
                 .untilAsserted(() -> {
                     assertEquals(4, actor.getReceiveCount());
-                    // Valid tweets (valid1, valid2, valid3) must be in the DB
-                    assertEquals(3, operations.countTweets(), "Only the 3 valid tweets should be in DB");
-                    assertEquals(3, actor.countSideEffects());
+                    // Only the valid tweet BEFORE the pill is in the DB.
+                    assertEquals(1, operations.countTweets(), "Only the valid tweet before the pill should be in DB");
+                    assertEquals(1, actor.countSideEffects(), "side effect runs only for the pre-pill valid tweet");
                     assertNotNull(operations.findTweetById("valid-1"));
-                    assertNotNull(operations.findTweetById("valid-2"));
-                    assertNotNull(operations.findTweetById("valid-3"));
+                    assertNull(operations.findTweetById("valid-2"), "the tweet after the pill is abandoned, not persisted");
+                    assertNull(operations.findTweetById("valid-3"), "the tweet after the pill is abandoned, not persisted");
                     assertNull(operations.findTweetById("poison-1"));
 
-                    // Poison pill recorded
+                    // Poison pill recorded exactly once.
                     assertEquals(1, operations.getPoisonPills().size(), "Poison pill count mismatch");
                     assertEquals("poison-1", operations.getPoisonPills().get(0).id());
                     assertEquals(101, operations.getPoisonPills().get(0).text().length());
@@ -171,7 +176,7 @@ class PersistenceActorTest {
         // The subsequent tweet is NOT persisted by this halted runner.
         await().during(Duration.ofSeconds(2)).atMost(Duration.ofSeconds(5))
                 .untilAsserted(() -> {
-                    assertEquals(3, operations.countTweets(),
+                    assertEquals(1, operations.countTweets(),
                             "runner halted after the poison pill; no further inserts");
                     assertNull(operations.findTweetById("subsequent"));
                 });
@@ -395,11 +400,11 @@ class PersistenceActorTest {
     }
 
     // -----------------------------------------------------------------------
-    // Scenario 10 — Multiple poison pills: side effects run ONLY for valid items
+    // Scenario 10 — Leading poison pill halts the batch: nothing after it runs
     // -----------------------------------------------------------------------
 
     @Test
-    void should_isolateMultiplePoisonPillsAndRunSideEffectsOnlyForValidItems() {
+    void should_haltAtFirstPoisonPill_and_notProcessAnythingAfterIt() {
         String poisonPill101 = "X".repeat(101);
 
         Tweet poison1 = new Tweet("multi-poison-1", poisonPill101);
@@ -407,6 +412,10 @@ class PersistenceActorTest {
         Tweet poison2 = new Tweet("multi-poison-2", poisonPill101);
         Tweet valid2 = new Tweet("multi-valid-2", "Valid message 2");
 
+        // Single batch [poison1, valid1, poison2, valid2]: the pill is at the
+        // front, so isolation finds it first, dead-letters it, and HALTS — none
+        // of valid1/poison2/valid2 are processed. They are re-processed when the
+        // actor restarts and replays from the committed offset.
         actorRef.tell(poison1);
         actorRef.tell(valid1);
         actorRef.tell(poison2);
@@ -415,15 +424,13 @@ class PersistenceActorTest {
         await().atMost(Duration.ofSeconds(5))
                 .untilAsserted(() -> {
                     assertEquals(4, actor.getReceiveCount());
-                    assertEquals(2, operations.countTweets(), "Only 2 valid tweets should be in DB");
-                    assertEquals(2, operations.getPoisonPills().size(), "Both poison pills should be recorded");
-                    assertEquals(2, actor.countSideEffects(), "Exactly 2 side effects must run for valid tweets only");
-
-                    List<String> sideEffectTweetIds = actor.getProcessedSideEffects().stream()
-                            .map(se -> se.tweet().id())
-                            .toList();
-                    assertEquals(List.of("multi-valid-1", "multi-valid-2"), sideEffectTweetIds,
-                            "Side effects must only be processed for valid tweets");
+                    assertEquals(0, operations.countTweets(),
+                            "nothing is persisted: the batch halts at the leading poison pill");
+                    assertEquals(1, operations.getPoisonPills().size(),
+                            "only the first poison pill is dead-lettered before the runner halts");
+                    assertEquals("multi-poison-1", operations.getPoisonPills().get(0).id());
+                    assertEquals(0, actor.countSideEffects(),
+                            "no side effects run: the first item is the pill and the rest are abandoned");
                 });
     }
 

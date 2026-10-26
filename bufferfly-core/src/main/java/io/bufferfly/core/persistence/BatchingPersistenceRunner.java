@@ -22,14 +22,18 @@ import java.util.List;
  *   <li>{@link TransientException} — entire batch is retried up to
  *       {@link PersistenceConfig#maxRetries} times with exponential back-off. After all
  *       retries are exhausted {@code onUnrecoverable} is invoked.</li>
- *   <li>{@link SingleItemException} — each element is re-submitted individually
- *       to isolate the poison pill:
+ *   <li>{@link SingleItemException} — the batch contains a poison pill, so the
+ *       runner re-submits elements individually to find it:
  *       <ul>
- *         <li>Items that succeed are committed normally.</li>
- *         <li>The first item that throws a {@link PersistenceException} is
- *             identified as the poison pill —
- *             {@link TransactionalOperations#onPoisonPill} is called for it
- *             and processing continues with the next item.</li>
+ *         <li>Items <em>before</em> the pill that succeed are committed normally.</li>
+ *         <li>The first item that throws a {@link PersistenceException} is the
+ *             poison pill — {@link TransactionalOperations#onPoisonPill} is called
+ *             to dead-letter it (advancing the fence past it), and the runner then
+ *             <b>halts</b>: items <em>after</em> the pill are deliberately left
+ *             un-persisted and {@code onUnrecoverable} is invoked. They are
+ *             re-processed when the restarted actor replays from the committed
+ *             offset, so the durable store never gets ahead of a record the store
+ *             rejected.</li>
  *         <li>If a single-item run throws {@link UnrecoverableException} or
  *             any unexpected exception, {@code onUnrecoverable} is invoked
  *             and the remainder of the batch is abandoned.</li>
@@ -242,12 +246,14 @@ public final class BatchingPersistenceRunner<E> implements PersistenceRunner<E> 
                 batch.forEach(e -> sideEffectProcessor.process(e.sideEffect()));
                 return; // success
             } catch (SingleItemException e) {
-                // Poison pill(s): isolate item-by-item — good items persist and
-                // the bad one is dead-lettered via onPoisonPill — then halt and
-                // hand off to the unrecoverable hook. The hook (e.g. in a sharded
-                // Kafka setup) restarts the actor, which resumes from the last
-                // durably committed offset. This runner instance stops here.
-                log.warn("Batch of {} flagged a poison pill ({}); isolating item-by-item",
+                // Poison pill in the batch: isolate item-by-item to FIND the pill.
+                // Good items before it persist; the pill is dead-lettered via
+                // onPoisonPill (fence advanced past it); then we HALT — the items
+                // after the pill are left un-persisted. The unrecoverable hook
+                // (e.g. in a sharded Kafka setup) restarts the actor, which resumes
+                // from the last durably committed offset and re-processes the
+                // abandoned tail. This runner instance stops here.
+                log.warn("Batch of {} flagged a poison pill ({}); isolating item-by-item to find and halt at it",
                         batch.size(), e.getMessage());
                 flushItemByItem(batch);
                 handleUnrecoverable();
@@ -279,17 +285,34 @@ public final class BatchingPersistenceRunner<E> implements PersistenceRunner<E> 
     }
 
     /**
-     * Re-submits each element individually to isolate poison pills.
+     * Re-submits each element individually to find and isolate the poison pill,
+     * then <b>halts</b> — it does <em>not</em> drain the rest of the batch.
      *
      * <ul>
-     *   <li>Success → committed, continue to next item.</li>
+     *   <li>Success → committed, continue to the next item.</li>
      *   <li>{@link PersistenceException} (including {@link SingleItemException})
-     *       → the item is the poison pill; call
-     *       {@link TransactionalOperations#onPoisonPill} and continue.</li>
+     *       → this item is the poison pill. {@link TransactionalOperations#onPoisonPill}
+     *       is called to dead-letter it (a token-backed store advances the fence
+     *       <em>past</em> it so a restart resumes <em>after</em> the pill, never
+     *       re-delivering it), and then processing <b>stops</b>: the items that
+     *       followed the pill in this batch are deliberately left un-persisted
+     *       and the method returns so the caller can halt the runner.</li>
      *   <li>{@link UnrecoverableException} or any unexpected exception on a
-     *       single-item run → call {@link #handleUnrecoverable()} and abort
-     *       the remainder of the batch.</li>
+     *       single-item run → halt immediately and abandon the remainder.</li>
      * </ul>
+     *
+     * <h2>Why halt at the pill instead of persisting the items after it</h2>
+     * The actor already applied every event in this batch to its in-memory state
+     * (that is what produced them), but persistence stops at the pill. If we kept
+     * persisting the post-pill items here, the durable store would contain writes
+     * the actor made <em>after</em> a record it never durably accepted, while the
+     * actor's own in-memory state reflects the whole batch — a split-brain that
+     * surfaces on the next rehydration (the restarted actor replays from the
+     * committed offset and re-derives a state that disagrees with what was
+     * written). Halting makes the boundary clean: everything up to and including
+     * the dead-lettered pill is durable and fenced; everything after it is
+     * discarded here and re-processed deterministically when the actor restarts
+     * and seeks back to the committed offset.
      */
     private void flushItemByItem(List<PersistenceEvent<E>> batch) {
         for (PersistenceEvent<E> item : batch) {
@@ -303,15 +326,20 @@ public final class BatchingPersistenceRunner<E> implements PersistenceRunner<E> 
                 handleUnrecoverable();
                 return; // abandon remainder of batch
             } catch (PersistenceException e) {
-                // Poison pill — notify and continue with remaining items
-                log.warn("Poison pill detected ({}); dead-lettering via onPoisonPill and continuing with remaining items",
+                // Poison pill found. Dead-letter it, then HALT: do not persist the
+                // items after it in this batch. They were accepted into the actor's
+                // in-memory state but must not be written past a record the store
+                // rejected — the restarted actor will re-process them from the
+                // committed offset, keeping persistence consistent with replay.
+                log.warn("Poison pill detected ({}); dead-lettering via onPoisonPill and halting — "
+                                + "the rest of the batch is abandoned and will be re-processed on restart",
                         e.getMessage());
                 try {
                     // Hand the operations layer the authoritative token we hold
                     // right now (advanced by the good items isolated before this
                     // pill) and adopt the token it returns — the store stepped the
-                    // fence past the dead-lettered record, so the NEXT good item
-                    // must CAS from that advanced value, not the now-stale one.
+                    // fence past the dead-lettered record, so a restart's rewind
+                    // resumes AFTER the pill rather than re-delivering it.
                     currentToken = operations.onPoisonPill(item.event(), currentToken, e);
 
                 } catch (Exception swallowed) {
@@ -319,6 +347,10 @@ public final class BatchingPersistenceRunner<E> implements PersistenceRunner<E> 
                     log.error("onPoisonPill threw while dead-lettering a poison pill; swallowing to keep the runner alive",
                             swallowed);
                 }
+                // HALT: the pill is dead-lettered and the fence is advanced past
+                // it; stop here and let the caller invoke the unrecoverable hook.
+                // Items after the pill are intentionally not persisted.
+                return;
             } catch (Exception e) {
                 // Unexpected exception on a single item → unrecoverable
                 log.error("Unexpected {} while isolating batch item-by-item; treating as unrecoverable",
