@@ -45,3 +45,19 @@ test {
         showStandardStreams = false
     }
 }
+
+// Expose this module's compiled test classes (the shared benchmark helper
+// io.bufferfly.spring.ledger.AddToAccount) to the bufferfly-benchmarks module,
+// which hosts the Postgres+Kafka benchmark that uses it while the helper itself
+// stays here (it is also used by the ledger showcase tests).
+configurations {
+    testArtifacts {
+        canBeConsumed = true
+        canBeResolved = false
+        extendsFrom testImplementation, testRuntimeOnly
+    }
+}
+
+artifacts {
+    testArtifacts(tasks.named('compileTestJava').map { it.destinationDirectory })
+}

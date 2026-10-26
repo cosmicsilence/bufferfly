@@ -56,3 +56,19 @@ test {
         showStandardStreams = false
     }
 }
+
+// Expose this module's compiled test classes (the shared benchmark helpers
+// TweeterActor / Tweet / TweetTransactionalOperations) to the
+// bufferfly-benchmarks module, which hosts the benchmark that uses them while
+// the helpers themselves stay here (they are also used by the regular tests).
+configurations {
+    testArtifacts {
+        canBeConsumed = true
+        canBeResolved = false
+        extendsFrom testImplementation, testRuntimeOnly
+    }
+}
+
+artifacts {
+    testArtifacts(tasks.named('compileTestJava').map { it.destinationDirectory })
+}

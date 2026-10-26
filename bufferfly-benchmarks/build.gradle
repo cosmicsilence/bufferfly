@@ -1,0 +1,112 @@
+description = '''\
+Performance benchmarks for BufferFly. Not published and not run as part of the \
+standard build/test lifecycle — run explicitly with the `benchmarks` task.'''
+
+// -----------------------------------------------------------------------------
+// This module hosts the three BufferFly benchmarks that used to live in the
+// src/test of bufferfly-core, bufferfly-cpu-bound and bufferfly-spring-kafka:
+//
+//   * PersistenceActorBenchmarkTest        (core: actor batching vs per-row)
+//   * DispatcherComparisonBenchmarkTest    (cpu-bound: spinning vs VT dispatch)
+//   * PostgresKafkaLedgerBenchmarkTest     (spring-kafka: actor vs classic)
+//
+// They are long-running and Docker-dependent, so they MUST NOT run on
+// `./gradlew build` or `./gradlew test`. The standard `test` task is therefore
+// detached from the `check`/`build` lifecycle and the benchmarks are driven by
+// the dedicated `benchmarks` task declared at the bottom of this file.
+// -----------------------------------------------------------------------------
+
+// A couple of the benchmarks reuse small test-only helper classes that stay in
+// their home modules (they are also used by those modules' regular tests):
+//   * core:        TweeterActor / Tweet / TweetTransactionalOperations
+//   * spring-kafka: io.bufferfly.spring.ledger.AddToAccount
+// Pull in their compiled test classes (and transitive test deps) without moving
+// the helpers.
+dependencies {
+    // --- main artifacts under benchmark ---
+    implementation project(':bufferfly-core')
+    implementation project(':bufferfly-cpu-bound')
+    implementation project(':bufferfly-spring-kafka')
+
+    // --- shared test helpers from the home modules ---
+    testImplementation project(path: ':bufferfly-core', configuration: 'testArtifacts')
+    testImplementation project(path: ':bufferfly-spring-kafka', configuration: 'testArtifacts')
+
+    // --- test harness ---
+    testImplementation platform('org.junit:junit-bom:5.11.4')
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+    testRuntimeOnly   'org.junit.platform:junit-platform-launcher'
+    testImplementation 'org.awaitility:awaitility:4.3.0'
+
+    // --- core benchmark (real Postgres via Testcontainers) ---
+    testImplementation platform('org.springframework.boot:spring-boot-dependencies:4.0.8')
+    testImplementation 'org.springframework:spring-jdbc'
+    testImplementation platform('org.testcontainers:testcontainers-bom:2.0.5')
+    testImplementation 'org.testcontainers:testcontainers'
+    testImplementation 'org.testcontainers:testcontainers-junit-jupiter'
+    testImplementation 'org.testcontainers:testcontainers-postgresql'
+    testImplementation 'org.postgresql:postgresql'
+    testImplementation 'com.zaxxer:HikariCP'
+
+    // --- spring-kafka benchmark (real Postgres + real Kafka via Testcontainers) ---
+    testImplementation 'org.springframework.kafka:spring-kafka'
+    testImplementation 'com.fasterxml.jackson.core:jackson-databind'
+    testImplementation 'org.testcontainers:testcontainers-kafka'
+
+    // Console SLF4J binding so framework logs are visible while benchmarking.
+    testRuntimeOnly('org.slf4j:slf4j-simple:2.0.+') {
+        because "Spring Boot BOM strips out wildcards for SLF4J modules"
+    }
+}
+
+configurations.all {
+    resolutionStrategy {
+        eachDependency { DependencyResolveDetails details ->
+            if (details.requested.group == 'org.slf4j') {
+                details.useVersion '2.0.+'
+            }
+        }
+    }
+}
+
+// NOTE: the Maven-publish plugin is intentionally NOT applied to this module
+// (see the root build.gradle `isPublishable` guard), so `./gradlew publishToMavenCentral`
+// during a reckon release never produces or uploads a benchmarks jar.
+
+// Keep the standard `test` task OUT of the build lifecycle: it is detached from
+// `check` (wired by the root build.gradle) and disabled so `./gradlew build`
+// and `./gradlew test` never run the benchmarks. Disabling `test` makes it a
+// no-op wherever it is reached (directly, or via `check`/`build`), so the
+// long-running, Docker-dependent benchmarks only ever run through the explicit
+// `benchmarks` task below.
+tasks.named('test') {
+    enabled = false
+}
+
+// The dedicated entry point: `./gradlew benchmarks` (or
+// `./gradlew :bufferfly-benchmarks:benchmarks`). Runs every *BenchmarkTest in
+// a fresh JVM each (the Kafka benchmark needs broker/offset isolation) and
+// always streams their stdout reports.
+tasks.register('benchmarks', Test) {
+    group = 'verification'
+    description = 'Runs the BufferFly performance benchmarks (long-running, Docker-dependent).'
+
+    testClassesDirs = sourceSets.test.output.classesDirs
+    classpath = sourceSets.test.runtimeClasspath
+
+    useJUnitPlatform()
+    include '**/*BenchmarkTest.class'
+
+    // Fork a fresh JVM per benchmark class for broker/offset/JIT isolation.
+    forkEvery = 1
+    // Benchmarks push millions of messages / 150k rows — give them headroom.
+    maxHeapSize = '2g'
+
+    testLogging {
+        events 'passed', 'skipped', 'failed'
+        showStandardStreams = true
+    }
+
+    // Never cache or skip: a benchmark is only meaningful when actually executed.
+    outputs.upToDateWhen { false }
+}

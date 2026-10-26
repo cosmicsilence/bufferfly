@@ -28,9 +28,16 @@ tasks.register('resolveAndLockAll') {
 
 subprojects {
     apply plugin: 'java-library'
-    apply plugin: 'com.vanniktech.maven.publish'
 
     group = 'io.github.cosmicsilence'
+
+    // bufferfly-benchmarks is a test-only harness, not a library: it is never
+    // published, so the Maven Central publishing plugin is not applied to it.
+    // Every other subproject is a published artifact.
+    def isPublishable = project.name != 'bufferfly-benchmarks'
+    if (isPublishable) {
+        apply plugin: 'com.vanniktech.maven.publish'
+    }
 
     dependencyLocking {
         lockAllConfigurations()
@@ -69,46 +76,48 @@ subprojects {
         dependsOn tasks.named('javadoc')
     }
 
-    publishing {
-        // Publish the resolved dependency versions in the POM
-        publications.withType(MavenPublication).configureEach {
-            versionMapping {
-                usage('java-api') { fromResolutionOf('runtimeClasspath') }
-                usage('java-runtime') { fromResolutionResult() }
+    if (isPublishable) {
+        publishing {
+            // Publish the resolved dependency versions in the POM
+            publications.withType(MavenPublication).configureEach {
+                versionMapping {
+                    usage('java-api') { fromResolutionOf('runtimeClasspath') }
+                    usage('java-runtime') { fromResolutionResult() }
+                }
             }
         }
-    }
 
-    mavenPublishing {
-        publishToMavenCentral(true)
-        signAllPublications()
+        mavenPublishing {
+            publishToMavenCentral(true)
+            signAllPublications()
 
-        pom {
-            name = project.name
-            description = provider { project.description }
-            url = 'https://github.com/cosmicsilence/bufferfly'
-            inceptionYear = '2026'
-
-            licenses {
-                license {
-                    name = 'The Apache License, Version 2.0'
-                    url = 'https://www.apache.org/licenses/LICENSE-2.0.txt'
-                    distribution = 'repo'
-                }
-            }
-
-            developers {
-                developer {
-                    id = 'thiagoampj'
-                    name = 'Thiago Moraes'
-                    url = 'https://github.com/thiagoampj'
-                }
-            }
-
-            scm {
+            pom {
+                name = project.name
+                description = provider { project.description }
                 url = 'https://github.com/cosmicsilence/bufferfly'
-                connection = 'scm:git:https://github.com/cosmicsilence/bufferfly.git'
-                developerConnection = 'scm:git:ssh://git@github.com/cosmicsilence/bufferfly.git'
+                inceptionYear = '2026'
+
+                licenses {
+                    license {
+                        name = 'The Apache License, Version 2.0'
+                        url = 'https://www.apache.org/licenses/LICENSE-2.0.txt'
+                        distribution = 'repo'
+                    }
+                }
+
+                developers {
+                    developer {
+                        id = 'thiagoampj'
+                        name = 'Thiago Moraes'
+                        url = 'https://github.com/thiagoampj'
+                    }
+                }
+
+                scm {
+                    url = 'https://github.com/cosmicsilence/bufferfly'
+                    connection = 'scm:git:https://github.com/cosmicsilence/bufferfly.git'
+                    developerConnection = 'scm:git:ssh://git@github.com/cosmicsilence/bufferfly.git'
+                }
             }
         }
     }

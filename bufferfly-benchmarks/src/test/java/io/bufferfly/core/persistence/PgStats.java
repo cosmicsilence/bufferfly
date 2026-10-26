@@ -4,14 +4,13 @@ import org.springframework.jdbc.core.JdbcTemplate;
 
 /**
  * A snapshot of Postgres server-side counters used to quantify WAL and commit
- * pressure, so the two approaches in {@link PersistenceActorBenchmarkTest} can
- * be compared not just on wall-clock time but on how much work each made the
- * database actually do.
+ * pressure, so the two approaches can be compared not just on wall-clock time
+ * but on how much work they made the database do.
  *
  * <ul>
  *   <li>{@code xactCommit} — {@code pg_stat_database.xact_commit}: total
- *       transactions committed in this database. The direct path commits ~once
- *       per row; the actor path commits ~once per natural batch.</li>
+ *       transactions committed in this database. The per-row path commits ~once
+ *       per row; the actor path commits ~once per batch.</li>
  *   <li>{@code walBytes} — {@code pg_stat_wal.wal_bytes}: total WAL bytes
  *       generated (cluster-wide). More, smaller transactions amplify WAL via
  *       per-commit records and full-page writes.</li>
