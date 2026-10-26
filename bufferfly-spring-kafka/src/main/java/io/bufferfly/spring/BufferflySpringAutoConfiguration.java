@@ -4,8 +4,10 @@ import io.bufferfly.core.actor.ActorManager;
 import io.bufferfly.core.config.BufferflyConfig;
 import io.bufferfly.core.metrics.BufferflyMetrics;
 import org.springframework.boot.autoconfigure.AutoConfiguration;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnClass;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
 import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Role;
 import org.springframework.beans.factory.config.BeanDefinition;
 import org.springframework.kafka.core.ConsumerFactory;
@@ -65,5 +67,24 @@ public class BufferflySpringAutoConfiguration {
             ActorManager actorManager,
             BufferflyMetrics bufferflyMetrics) {
         return new ShardedActorBeanPostProcessor(consumerFactory, actorManager, bufferflyMetrics);
+    }
+
+    /**
+     * Registers the {@link BufferflyHealthIndicator} <b>only</b> when Spring Boot
+     * Actuator's health API ({@code HealthIndicator}) is on the classpath. Apps
+     * without Actuator get no health bean and pull in none of the health module.
+     * The indicator is a minimal, stateless {@code isRunning()} aggregate — see
+     * its javadoc for why it deliberately checks nothing else.
+     */
+    @Configuration(proxyBeanMethods = false)
+    @ConditionalOnClass(org.springframework.boot.health.contributor.HealthIndicator.class)
+    static class HealthContributorConfiguration {
+
+        @Bean
+        @ConditionalOnMissingBean
+        public BufferflyHealthIndicator bufferflyHealthIndicator(
+                ShardedActorBeanPostProcessor shardedActorBeanPostProcessor) {
+            return new BufferflyHealthIndicator(shardedActorBeanPostProcessor);
+        }
     }
 }

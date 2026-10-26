@@ -29,6 +29,7 @@ actor engine for the most common high-volume ingestion shape: **Kafka → actor
   - [Dead-lettering and replay](#dead-lettering-and-replay)
   - [A complete example](#a-complete-example)
   - [What to watch (metrics)](#what-to-watch-metrics)
+- [🩺 Health check](#-health-check)
 - [📊 Benchmark: actor natural-batching vs classic locking consumer](#-benchmark-actor-natural-batching-vs-classic-locking-consumer)
   - [How the benchmark is built](#how-the-benchmark-is-built)
   - [What the classic consumer does](#what-the-classic-consumer-does)
@@ -407,6 +408,87 @@ dead-lettered correctly.
 | **Restart + rewind on fatal failure** | `onUnrecoverable` → `ctx.restartActor()` stops the current actor and starts a fresh one that rehydrates in-memory state and seeks back to the last committed offset. |
 | **Poison-pill dead-lettering** | A record the DB can never accept is classified as `SingleItemException`; the runner isolates the batch item-by-item, persists the good records, and dead-letters the offender. |
 | **Post-commit side effects** | `PersistenceEvent`s can carry a `SideEffect` that runs only **after** the batch is durably committed — the right place to update a read model or emit a downstream event. |
+| **Health check (opt-in)** | With Spring Boot Actuator on the classpath, a `bufferfly` health indicator reports **DOWN only when a listener container is not running** — the one condition a pod restart fixes. See [Health check](#-health-check). |
+
+---
+
+## 🩺 Health check
+
+When **Spring Boot Actuator** is on the classpath, BufferFly auto-registers a
+`HealthIndicator` named `bufferfly` that contributes to `/actuator/health`. It is
+deliberately **minimal and stateless**:
+
+```json
+// GET /actuator/health   (UP)
+{
+  "status": "UP",
+  "components": {
+    "bufferfly": {
+      "status": "UP",
+      "details": { "ledger": "running", "containers": 1 }
+    }
+  }
+}
+```
+
+```json
+// a container whose Kafka listener is not running
+{
+  "status": "DOWN",
+  "components": {
+    "bufferfly": {
+      "status": "DOWN",
+      "details": { "ledger": "not running", "containers": 1 }
+    }
+  }
+}
+```
+
+### What it checks — and why only this
+
+It reports **DOWN only when a `@ShardedActor`'s Kafka listener container is not
+running**, and **UP** otherwise. That is the single condition a **pod restart can
+actually fix** (the listener thread died, or a wiring/startup bug left it down).
+
+A health check drives orchestration — a liveness/readiness probe going DOWN
+restarts the pod — so the only honest thing to report DOWN for is something a
+restart resolves. BufferFly therefore **deliberately does not** fail health on:
+
+| Condition | Why it is NOT a health failure |
+| :--- | :--- |
+| **A paused partition (backpressure)** | This is the shock absorber working *correctly* — Kafka is told to wait while the DB catches up. Restarting drops the in-memory buffer and re-saturates the DB on the replacement pod → a kill-loop that amplifies the incident. |
+| **An actor crash-looping on a poison pill** | Handled in-process by the restart supervisor (backoff + dead-letter). A restart just moves the same bad-data loop to a fresh pod; it cannot fix the data. |
+| **Rebalance churn** | Partitions momentarily assigned-but-starting or just-revoked are transient and self-healing. Reacting would make the probe flap on every deploy/scale. Because the indicator never inspects partition-level state, it is immune to rebalance staleness. |
+
+Those conditions belong on **dashboards and alerts** (via the metrics below),
+answering *"is the system behaving well?"* — not on a restart decision, which
+answers *"should this pod exist?"*. See [What to watch (metrics)](#what-to-watch-metrics)
+and the poison-pill metrics table above: `bufferfly.partition.paused`,
+`bufferfly.poison_pills`, `bufferfly.actor.restarted`.
+
+### Enabling it
+
+It is **opt-in by dependency**: add Actuator and the health check appears; without
+Actuator, BufferFly pulls in none of the health module and registers no bean.
+
+```groovy
+implementation 'org.springframework.boot:spring-boot-starter-actuator'
+```
+
+```yaml
+# expose the health endpoint (standard Boot config)
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health
+  endpoint:
+    health:
+      show-details: always   # to see the per-container details shown above
+```
+
+To override it, define your own bean named `bufferflyHealthIndicator` (the
+auto-configuration backs off via `@ConditionalOnMissingBean`).
 
 ---
 

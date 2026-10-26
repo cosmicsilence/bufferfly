@@ -185,6 +185,15 @@ public final class ShardedActorContainer<K, V> {
         return container;
     }
 
+    /**
+     * @return whether the underlying Kafka listener container is running (its
+     *         consumer thread(s) are active and polling). This is the single
+     *         liveness fact a pod restart can fix — see {@code BufferflyHealthIndicator}.
+     */
+    public boolean isRunning() {
+        return container.isRunning();
+    }
+
     public String name() {
         return name;
     }

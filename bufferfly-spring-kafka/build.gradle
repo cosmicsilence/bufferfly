@@ -10,11 +10,19 @@ dependencies {
     // spring-jdbc is used by the main-source AbstractJdbcTransactionalOperations /
     // FencingOffsetRepository (JdbcTemplate + programmatic TransactionTemplate).
     implementation 'org.springframework:spring-jdbc'
+    // Spring Boot 4 health API (HealthIndicator/Health/Status live in the
+    // spring-boot-health module). compileOnly because the health check is an
+    // OPTIONAL add-on: it is auto-configured only when Actuator is on the app's
+    // classpath (@ConditionalOnClass(HealthIndicator)). Apps without Actuator
+    // pull none of it in.
+    compileOnly 'org.springframework.boot:spring-boot-health'
 
     testImplementation 'org.springframework.boot:spring-boot-starter-test'
     testImplementation 'org.springframework.kafka:spring-kafka-test'
     testImplementation 'com.fasterxml.jackson.core:jackson-databind'
     testImplementation 'org.hsqldb:hsqldb:2.7.4'
+    // Health API on the test classpath so the HealthIndicator can be exercised.
+    testImplementation 'org.springframework.boot:spring-boot-health'
     // Benchmark (PostgresKafkaLedgerBenchmarkTest): a real Postgres + a real
     // Kafka broker via Testcontainers, so the actor's natural batching can be
     // compared against a classic locking consumer over a networked DB. Versions
