@@ -69,10 +69,9 @@ configurations.all {
     }
 }
 
-// The benchmarks are not a library: never publish this module.
-tasks.withType(AbstractPublishToMaven).configureEach { enabled = false }
-tasks.matching { it.name == 'generateMetadataFileForMavenPublication' }
-        .configureEach { enabled = false }
+// NOTE: the Maven-publish plugin is intentionally NOT applied to this module
+// (see the root build.gradle `isPublishable` guard), so `./gradlew publishToMavenCentral`
+// during a reckon release never produces or uploads a benchmarks jar.
 
 // Keep the standard `test` task OUT of the build lifecycle: it is detached from
 // `check` (wired by the root build.gradle) and disabled so `./gradlew build`
