@@ -36,6 +36,14 @@ import java.util.function.IntSupplier;
  * an {@code actor} attribute, and persistence/backpressure instruments use a
  * {@code component} attribute, so a backend can split the series per component.
  *
+ * <h2>Hot-path allocation</h2>
+ * The per-message counter calls ({@code mailboxEnqueued}, …) do <b>not</b>
+ * allocate an {@code Attributes} per call. Because the actor/component name is
+ * stable, the attribute set is built <b>once per name</b> and cached, so a 5M+
+ * msg/s dispatch path pays only the counter's atomic add, not a fresh allocation
+ * each message. (The engine itself never samples a gauge on the hot path — gauge
+ * suppliers are read by the SDK's metric reader on its own schedule.)
+ *
  * <h2>Gauges</h2>
  * Gauge registration builds an asynchronous {@code ObservableLongGauge} whose
  * callback samples the supplied {@link IntSupplier} whenever the SDK's metric
@@ -98,6 +106,20 @@ public final class OpenTelemetryBufferflyMetrics implements BufferflyMetrics, Au
     private final ConcurrentHashMap<String, ObservableLongGauge> bufferGauges = new ConcurrentHashMap<>();
 
     /**
+     * Per-component {@link Attributes} caches so the hot-path counter calls do
+     * not allocate a fresh {@code Attributes} on every message. The actor/
+     * component name is stable, so the attribute set is built once per name and
+     * reused. Keyed by name (bounded by the number of actors/partitions, which
+     * is small and stable), so these caches do not grow without bound.
+     *
+     * <p>{@code actor}-labelled attributes (mailbox instruments) and
+     * {@code component}-labelled attributes (persistence/backpressure/lifecycle
+     * instruments) are kept separately because they use different attribute keys.
+     */
+    private final ConcurrentHashMap<String, Attributes> actorAttrs = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Attributes> componentAttrs = new ConcurrentHashMap<>();
+
+    /**
      * @param meter the OpenTelemetry {@link Meter} to build instruments on
      *              (typically {@code openTelemetry.getMeter("io.bufferfly")})
      */
@@ -139,12 +161,12 @@ public final class OpenTelemetryBufferflyMetrics implements BufferflyMetrics, Au
 
     @Override
     public void mailboxEnqueued(String actorName) {
-        mailboxEnqueued.add(1, Attributes.of(ACTOR_ATTR, safe(actorName)));
+        mailboxEnqueued.add(1, actorAttrs(actorName));
     }
 
     @Override
     public void mailboxRefused(String actorName) {
-        mailboxRefused.add(1, Attributes.of(ACTOR_ATTR, safe(actorName)));
+        mailboxRefused.add(1, actorAttrs(actorName));
     }
 
     @Override
@@ -153,7 +175,7 @@ public final class OpenTelemetryBufferflyMetrics implements BufferflyMetrics, Au
         // Replace-and-close if the same actor re-registers (idempotent, no leak).
         mailboxGauges.compute(name, (k, previous) -> {
             if (previous != null) previous.close();
-            Attributes attrs = Attributes.of(ACTOR_ATTR, name);
+            Attributes attrs = actorAttrs(name);
             return meter.gaugeBuilder(MAILBOX_SIZE)
                     .setDescription("Current actor mailbox depth").setUnit("{message}")
                     .ofLongs()
@@ -165,24 +187,24 @@ public final class OpenTelemetryBufferflyMetrics implements BufferflyMetrics, Au
 
     @Override
     public void batchPersisted(String component, int size) {
-        Attributes attrs = Attributes.of(COMPONENT_ATTR, safe(component));
+        Attributes attrs = componentAttrs(component);
         batchesPersisted.add(1, attrs);
         eventsPersisted.add(size, attrs);
     }
 
     @Override
     public void poisonPill(String component) {
-        poisonPills.add(1, Attributes.of(COMPONENT_ATTR, safe(component)));
+        poisonPills.add(1, componentAttrs(component));
     }
 
     @Override
     public void unrecoverableFailure(String component) {
-        unrecoverableFailures.add(1, Attributes.of(COMPONENT_ATTR, safe(component)));
+        unrecoverableFailures.add(1, componentAttrs(component));
     }
 
     @Override
     public void batchRetry(String component) {
-        batchRetries.add(1, Attributes.of(COMPONENT_ATTR, safe(component)));
+        batchRetries.add(1, componentAttrs(component));
     }
 
     @Override
@@ -190,7 +212,7 @@ public final class OpenTelemetryBufferflyMetrics implements BufferflyMetrics, Au
         String name = safe(component);
         bufferGauges.compute(name, (k, previous) -> {
             if (previous != null) previous.close();
-            Attributes attrs = Attributes.of(COMPONENT_ATTR, name);
+            Attributes attrs = componentAttrs(name);
             return meter.gaugeBuilder(BUFFER_DEPTH)
                     .setDescription("Current persistence buffer depth").setUnit("{event}")
                     .ofLongs()
@@ -202,44 +224,44 @@ public final class OpenTelemetryBufferflyMetrics implements BufferflyMetrics, Au
 
     @Override
     public void backpressureEngaged(String component) {
-        backpressureEngaged.add(1, Attributes.of(COMPONENT_ATTR, safe(component)));
+        backpressureEngaged.add(1, componentAttrs(component));
     }
 
     @Override
     public void backpressureReleased(String component) {
-        backpressureReleased.add(1, Attributes.of(COMPONENT_ATTR, safe(component)));
+        backpressureReleased.add(1, componentAttrs(component));
     }
 
     // -- kafka partition lifecycle ------------------------------------------
 
     @Override
     public void partitionPaused(String component) {
-        partitionPaused.add(1, Attributes.of(COMPONENT_ATTR, safe(component)));
+        partitionPaused.add(1, componentAttrs(component));
     }
 
     @Override
     public void partitionResumed(String component) {
-        partitionResumed.add(1, Attributes.of(COMPONENT_ATTR, safe(component)));
+        partitionResumed.add(1, componentAttrs(component));
     }
 
     @Override
     public void actorRestarted(String component) {
-        actorRestarted.add(1, Attributes.of(COMPONENT_ATTR, safe(component)));
+        actorRestarted.add(1, componentAttrs(component));
     }
 
     @Override
     public void recordRejected(String component) {
-        recordRejected.add(1, Attributes.of(COMPONENT_ATTR, safe(component)));
+        recordRejected.add(1, componentAttrs(component));
     }
 
     @Override
     public void partitionAssigned(String component) {
-        partitionAssigned.add(1, Attributes.of(COMPONENT_ATTR, safe(component)));
+        partitionAssigned.add(1, componentAttrs(component));
     }
 
     @Override
     public void partitionRevoked(String component) {
-        partitionRevoked.add(1, Attributes.of(COMPONENT_ATTR, safe(component)));
+        partitionRevoked.add(1, componentAttrs(component));
     }
 
     // -- lifecycle ----------------------------------------------------------
@@ -251,6 +273,18 @@ public final class OpenTelemetryBufferflyMetrics implements BufferflyMetrics, Au
         mailboxGauges.clear();
         bufferGauges.values().forEach(ObservableLongGauge::close);
         bufferGauges.clear();
+        actorAttrs.clear();
+        componentAttrs.clear();
+    }
+
+    /** @return the cached {@code actor}-labelled attributes for {@code actorName} (built once, reused). */
+    private Attributes actorAttrs(String actorName) {
+        return actorAttrs.computeIfAbsent(safe(actorName), n -> Attributes.of(ACTOR_ATTR, n));
+    }
+
+    /** @return the cached {@code component}-labelled attributes for {@code component} (built once, reused). */
+    private Attributes componentAttrs(String component) {
+        return componentAttrs.computeIfAbsent(safe(component), n -> Attributes.of(COMPONENT_ATTR, n));
     }
 
     private static String safe(String s) {

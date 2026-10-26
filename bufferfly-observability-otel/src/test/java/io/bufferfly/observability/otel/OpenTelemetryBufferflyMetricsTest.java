@@ -110,6 +110,36 @@ class OpenTelemetryBufferflyMetricsTest {
     }
 
     @Test
+    void should_keepOneSeriesPerName_acrossManyCalls_withCachedAttributes() {
+        // Many repeated calls for two names. With per-name Attributes caching, the
+        // hot path reuses one Attributes instance per name; correctness must be
+        // unchanged: exactly one time series per name, summed to the call count.
+        for (int i = 0; i < 1_000; i++) {
+            metrics.mailboxEnqueued("actor-A");
+        }
+        for (int i = 0; i < 250; i++) {
+            metrics.mailboxEnqueued("actor-B");
+        }
+
+        Collection<MetricData> metricsData = reader.collectAllMetrics();
+        MetricData enqueued = byName(metricsData, OpenTelemetryBufferflyMetrics.MAILBOX_ENQUEUED);
+        assertNotNull(enqueued);
+
+        List<LongPointData> points = List.copyOf(enqueued.getLongSumData().getPoints());
+        assertEquals(2, points.size(), "exactly two series — one per distinct actor name, not one per call");
+        for (LongPointData point : points) {
+            String actor = point.getAttributes().get(AttributeKey.stringKey("actor"));
+            if ("actor-A".equals(actor)) {
+                assertEquals(1_000, point.getValue(), "actor-A count is exact (not sampled)");
+            } else if ("actor-B".equals(actor)) {
+                assertEquals(250, point.getValue(), "actor-B count is exact");
+            } else {
+                throw new AssertionError("unexpected actor series: " + actor);
+            }
+        }
+    }
+
+    @Test
     void should_attachComponentAttribute_toPersistenceAndBackpressureCounters() {
         metrics.batchPersisted("ledger-actor-2", 4);
         metrics.poisonPill("ledger-actor-2");
