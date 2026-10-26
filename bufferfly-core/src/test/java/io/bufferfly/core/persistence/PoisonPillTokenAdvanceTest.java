@@ -6,15 +6,27 @@ import java.util.ArrayList;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * Pins down the fencing-token contract across a poison pill isolated
- * <em>in the middle</em> of a batch: {@link TransactionalOperations#onPoisonPill}
- * advances the stored token past the dead-lettered record, so it MUST return
- * that advanced token and the runner MUST adopt it — otherwise the runner's
- * in-memory {@code currentToken} is left stale (still pointing before the pill)
- * and the <b>very next good item's</b> compare-and-set fences against the wrong
- * token and fails spuriously.
+ * Pins down the fencing-token contract when a poison pill is isolated
+ * <em>in the middle</em> of a batch, under the <b>halt-at-pill</b> policy:
+ *
+ * <ul>
+ *   <li>good records <em>before</em> the pill persist and advance the fence;</li>
+ *   <li>the pill is dead-lettered via {@link TransactionalOperations#onPoisonPill},
+ *       which advances the stored token <em>past</em> it so a restart's rewind
+ *       resumes AFTER the pill rather than re-delivering it;</li>
+ *   <li>the runner then <b>halts</b> — good records <em>after</em> the pill in the
+ *       same batch are deliberately NOT persisted. They are re-processed when the
+ *       actor restarts and replays from the committed offset, so the store never
+ *       gets ahead of the rejected record.</li>
+ * </ul>
+ *
+ * <p>The crucial token invariant is still asserted: after dead-lettering, the
+ * runner's in-memory {@code currentToken} must equal the fence advanced past the
+ * pill (not a stale pre-pill value), so that whatever it does next fences from
+ * the right place.
  *
  * <p>The fake operations below is a faithful model of the real JDBC fence: it
  * holds one {@code storedToken} and only accepts a write whose
@@ -89,7 +101,7 @@ class PoisonPillTokenAdvanceTest {
     }
 
     @Test
-    void should_notStaleCurrentToken_when_poisonPillIsInTheMiddleOfABatch() {
+    void should_persistPrePillAndFencePastPill_but_abandonPostPill_when_poisonPillIsInTheMiddleOfABatch() {
         FakeFencingOps ops = new FakeFencingOps(0L);
         boolean[] unrecoverable = {false};
         PersistenceConfig<Rec> config = new PersistenceConfig<>(ops, 10, 10L, 0, () -> unrecoverable[0] = true);
@@ -98,8 +110,9 @@ class PoisonPillTokenAdvanceTest {
         // Restart at a known-good token: token 0 already committed.
         runner.initToken(0L);
 
-        // Batch: good(1), POISON(2), good(3). The poison is isolated; the fence
-        // must advance 0→1 (good), 1→2 (pill, via onPoisonPill), 2→3 (good).
+        // Batch: good(1), POISON(2), good(3). The pill is isolated: the fence
+        // advances 0→1 (good), then 1→2 via onPoisonPill (pill dead-lettered),
+        // and the runner HALTS — good(3) is abandoned, to be replayed on restart.
         List<PersistenceRunner.PersistenceEvent<Rec>> batch = List.of(
                 PersistenceRunner.newEvent(new Rec(1, false)),
                 PersistenceRunner.newEvent(new Rec(2, true)),
@@ -107,13 +120,14 @@ class PoisonPillTokenAdvanceTest {
 
         runner.persistBatch(batch);
 
-        // The trailing good record (token 3) MUST be persisted. With the bug,
-        // currentToken stays at 1 after the pill, so item 3's CAS (expecting
-        // storedToken=1 but it is 2) fails → the item is abandoned and lost.
-        assertEquals(List.of(1L, 3L), ops.persisted,
-                "both good records (before and after the pill) must be persisted");
+        // Only the record BEFORE the pill is persisted; the trailing good record
+        // (token 3) is deliberately NOT persisted — it is re-processed on restart.
+        assertEquals(List.of(1L), ops.persisted,
+                "only the good record before the pill must be persisted; the one after it is abandoned");
         assertEquals(List.of(2L), ops.deadLettered, "the poison pill must be dead-lettered");
-        assertEquals(3L, ops.storedToken, "the fence must have advanced all the way to token 3");
-        assertEquals(3L, runner.currentToken(), "the runner must hold the advanced token (3)");
+        assertEquals(2L, ops.storedToken, "the fence must have advanced past the pill (to token 2)");
+        assertEquals(2L, runner.currentToken(),
+                "the runner must hold the fence advanced past the pill (2), never a stale pre-pill value");
+        assertTrue(unrecoverable[0], "halting at the pill must invoke the unrecoverable/restart hook");
     }
 }

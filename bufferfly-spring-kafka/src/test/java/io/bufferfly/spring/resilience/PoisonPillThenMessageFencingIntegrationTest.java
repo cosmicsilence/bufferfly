@@ -16,6 +16,7 @@ import org.springframework.jdbc.datasource.DriverManagerDataSource;
 
 import javax.sql.DataSource;
 import java.time.Duration;
+import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -28,34 +29,36 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * token-backed {@link io.bufferfly.core.persistence.TransactionalOperations}
  * (JDBC + HSQLDB, the same {@link MessageOperations} the embedded-Kafka
  * resilience suite uses) — but driven directly through a {@link MessageActor}
- * and {@link ActorManager}, without a Kafka broker, so the fencing-token
+ * and {@link ActorManager}, without a Kafka broker, so the <b>halt-at-pill</b>
  * contract can be pinned down deterministically.
  *
- * <p>The scenario is the one that exposed the stale-token bug: a poison pill
- * sits <b>in the middle</b> of the stream, immediately followed by a good
- * message.
+ * <p>The scenario: a poison pill sits <b>in the middle</b> of the stream,
+ * immediately followed by a good message.
  *
  * <ol>
  *   <li>The real {@link NaturalBatchingDispatcher} coalesces the records and
  *       hands a batch to the real {@code BatchingPersistenceRunner}.</li>
  *   <li>{@link MessageOperations} (the real JDBC fence) rejects the oversized
  *       body with a {@code DataIntegrityViolationException}, so the runner
- *       isolates item-by-item and dead-letters the pill via {@code onPoisonPill},
- *       which <b>advances the stored fencing offset past the pill</b>.</li>
- *   <li>The <b>next good message's</b> batch then fences with a compare-and-set.
- *       If the runner's in-memory {@code currentToken} were left stale (still
- *       pointing before the pill, as it was before the fix), that CAS
- *       ({@code WHERE latest_offset = staleToken}) matches zero rows →
- *       {@link io.bufferfly.core.persistence.UnrecoverableException} → the actor
- *       restarts and the good message is lost.</li>
+ *       isolates item-by-item: the good record <em>before</em> the pill persists,
+ *       the pill is dead-lettered via {@code onPoisonPill} (which <b>advances the
+ *       stored fencing offset past the pill</b>), and then the runner <b>halts</b>.</li>
+ *   <li>The good record <em>after</em> the pill is therefore <b>not</b> persisted
+ *       by this runner instance; the unrecoverable/restart hook fires. In a real
+ *       Kafka deployment the actor restarts and seeks to the committed offset
+ *       (now past the pill), re-consuming and persisting the trailing record from
+ *       a clean state — the store never gets ahead of the rejected record.</li>
  * </ol>
  *
- * The assertions below prove the opposite: every good message persists, the
- * pill is dead-lettered exactly once, and the actor is NEVER restarted by a
- * spurious fence failure.
+ * The assertions below prove exactly that boundary: the pre-pill record persists,
+ * the pill is dead-lettered once and the fence advances past it, the post-pill
+ * record is abandoned (not written by the halted runner), and the restart hook is
+ * invoked. This {@link KafkaContext} is a no-op counter (no real broker), so the
+ * trailing record's eventual re-processing is the restart machinery's job,
+ * verified elsewhere; here we pin the <em>halt</em> itself.
  */
 @Timeout(60)
-@DisplayName("🦋 natural-batching × JDBC fencing token: a message after a poison pill must not trip the offset fence")
+@DisplayName("🦋 natural-batching × JDBC fencing token: a poison pill halts the batch; the record after it is abandoned, not persisted")
 class PoisonPillThenMessageFencingIntegrationTest {
 
     private static final String TOPIC = "fencing-it";
@@ -105,14 +108,13 @@ class PoisonPillThenMessageFencingIntegrationTest {
     }
 
     @Test
-    void should_persistMessageAfterPoisonPill_without_trippingTheOffsetFence() {
+    void should_persistPrePillAndFencePastPill_but_abandonPostPill_andInvokeRestart() {
         final String oversized = "x".repeat(MessageOperations.BODY_MAX_LENGTH + 50);
 
         // Real natural-batching dispatcher + real token-backed JDBC operations,
         // wired through the real runner by PersistenceConfig. A roomy batch window
         // lets the three records coalesce so the pill is isolated with a good
-        // record both before and after it in the same item-by-item pass — the
-        // exact shape that left currentToken stale before the fix.
+        // record both before and after it in the same item-by-item pass.
         KafkaContext ctx = noopContext();
         PersistenceConfig<Message> config = PersistenceConfig.builder(operations)
                 .batchSize(10)
@@ -137,27 +139,38 @@ class PoisonPillThenMessageFencingIntegrationTest {
                 .untilAsserted(() -> assertEquals(1, operations.poisonPillCount(),
                         "the oversized body must be dead-lettered exactly once"));
 
-        // ...and BOTH good records persist — the one after the pill is the bug's
-        // victim: its fence CAS would fail against a stale token.
+        // ...the restart hook (onUnrecoverable) fires because the runner halts at
+        // the pill. In production this is what restarts the actor and rewinds.
         await().atMost(Duration.ofSeconds(10))
-                .untilAsserted(() -> assertEquals(2, operations.countForPartition(PARTITION),
-                        "both good records (before AND after the poison pill) must persist"));
+                .untilAsserted(() -> assertEquals(1, restarts.get(),
+                        "halting at the pill must invoke the restart hook exactly once"));
 
-        // The stored fencing offset advanced all the way past the last good record.
+        // Only the record BEFORE the pill persists. The record after it is
+        // abandoned by the halted runner (no real restart/replay in this harness).
         await().atMost(Duration.ofSeconds(10))
-                .untilAsserted(() -> assertEquals(2L, operations.loadStoredOffset(TOPIC, PARTITION),
-                        "the fencing token must have advanced to the last processed offset (2)"));
+                .untilAsserted(() -> assertEquals(1, operations.countForPartition(PARTITION),
+                        "only the good record before the poison pill persists; the one after it is abandoned"));
 
-        // Hold briefly to prove it settles with no late duplicate / re-delivery loop.
+        // The stored fencing offset advanced PAST the pill (to the pill's offset 1),
+        // so a real restart would resume AFTER the pill — never re-delivering it.
+        await().atMost(Duration.ofSeconds(10))
+                .untilAsserted(() -> assertEquals(1L, operations.loadStoredOffset(TOPIC, PARTITION),
+                        "the fencing token must have advanced past the pill (to offset 1)"));
+
+        // Hold briefly to prove it settles: no late insert of the abandoned record,
+        // no re-delivery loop of the pill, no extra restarts.
         await().during(Duration.ofSeconds(2)).atMost(Duration.ofSeconds(8))
                 .untilAsserted(() -> {
-                    assertEquals(2, operations.countForPartition(PARTITION), "no duplicate inserts");
+                    assertEquals(1, operations.countForPartition(PARTITION), "no late insert of the abandoned record");
                     assertEquals(1, operations.poisonPillCount(), "no re-delivery loop of the pill");
+                    assertEquals(1, restarts.get(), "exactly one restart");
                 });
 
-        assertEquals(2L, operations.loadStoredOffset(TOPIC, PARTITION), "final stored offset is 2");
+        assertEquals(1L, operations.loadStoredOffset(TOPIC, PARTITION), "final stored offset is 1 (past the pill)");
         assertTrue(operations.bodiesForPartition(PARTITION).stream()
                         .noneMatch(b -> b.length() > MessageOperations.BODY_MAX_LENGTH),
                 "the oversized body must never reach the DB");
+        assertEquals(List.of("before-the-pill"), operations.bodiesForPartition(PARTITION),
+                "only the pre-pill record is stored");
     }
 }
