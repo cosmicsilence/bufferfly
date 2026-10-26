@@ -256,7 +256,7 @@ public final class BatchingPersistenceRunner<E> implements PersistenceRunner<E> 
                 // the operations layer succeeded against our known currentToken,
                 // so we now own the token at its new value.
                 currentToken = newToken;
-                batch.forEach(e -> sideEffectProcessor.process(e.sideEffect()));
+                batch.forEach(e -> e.sideEffects().forEach(sideEffectProcessor::process));
                 metrics.batchPersisted(component, batch.size());
                 return; // success
             } catch (SingleItemException e) {
@@ -335,7 +335,7 @@ public final class BatchingPersistenceRunner<E> implements PersistenceRunner<E> 
                 // Persist this single item, fencing against the token we hold, and
                 // adopt the advanced token so the next item's CAS matches.
                 currentToken = operations.persistOnTransaction(List.of(item.event()), currentToken);
-                sideEffectProcessor.process(item.sideEffect());
+                item.sideEffects().forEach(sideEffectProcessor::process);
                 metrics.batchPersisted(component, 1);
             } catch (UnrecoverableException e) {
                 log.error("Unrecoverable failure while isolating batch item-by-item; abandoning remaining items", e);

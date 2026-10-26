@@ -67,17 +67,50 @@ public interface PersistenceRunner<E> {
         return new NoOpSideEffect();
     }
 
+    /** An event with no side effects. */
     static <E> PersistenceEvent<E> newEvent(E e) {
-        return new PersistenceEvent<>(e, noOpSideEffect());
+        return new PersistenceEvent<>(e, List.of());
     }
 
+    /**
+     * An event carrying a single side effect. {@code null} is treated as "no
+     * side effect" so callers can pass a nullable value freely.
+     */
     static <E> PersistenceEvent<E> newEvent(E e, SideEffect sideEffect) {
-        return new PersistenceEvent<>(e, sideEffect);
+        return new PersistenceEvent<>(e, sideEffect == null ? List.of() : List.of(sideEffect));
+    }
+
+    /**
+     * An event carrying any number of side effects, run in order <em>after</em>
+     * the batch holding this event is durably committed.
+     */
+    @SafeVarargs
+    static <E> PersistenceEvent<E> newEvent(E e, SideEffect... sideEffects) {
+        return new PersistenceEvent<>(e, (sideEffects == null || sideEffects.length == 0)
+                ? List.of() : List.of(sideEffects));
+    }
+
+    /** An event carrying a list of side effects (defensively copied). */
+    static <E> PersistenceEvent<E> newEvent(E e, List<SideEffect> sideEffects) {
+        return new PersistenceEvent<>(e, sideEffects == null ? List.of() : List.copyOf(sideEffects));
     }
 
     record NoOpSideEffect() implements SideEffect {
     }
 
-    record PersistenceEvent<E>(E event, SideEffect sideEffect) {
+    /**
+     * A persistence event: the payload {@code event} plus zero or more
+     * {@link SideEffect}s to run, in order, <b>after</b> the batch containing it
+     * is durably committed. The side-effect list is never {@code null} (empty for
+     * none) and is held immutably.
+     *
+     * @param event       the payload to persist
+     * @param sideEffects the post-commit side effects, in run order; never null
+     * @param <E>         the persistence event payload type
+     */
+    record PersistenceEvent<E>(E event, List<SideEffect> sideEffects) {
+        public PersistenceEvent {
+            sideEffects = (sideEffects == null) ? List.of() : List.copyOf(sideEffects);
+        }
     }
 }
