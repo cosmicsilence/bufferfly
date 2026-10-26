@@ -14,6 +14,7 @@ include 'bufferfly-core'
 include 'bufferfly-spring-kafka'
 include 'bufferfly-cpu-bound'
 include 'bufferfly-benchmarks'
+include 'bufferfly-observability-otel'
 
 reckon {
     defaultInferredScope = 'patch'

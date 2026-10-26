@@ -1,5 +1,6 @@
 package io.bufferfly.core.actor;
 
+import io.bufferfly.core.metrics.BufferflyMetrics;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -40,6 +41,14 @@ public class VTDispatcher implements ActorDispatcher, CallerRunsCapable {
     private final Map<String, Mailbox<?>> mailboxes = new ConcurrentHashMap<>();
 
     /**
+     * Observability sink. Defaults to {@link BufferflyMetrics#NOOP}, so a
+     * dispatcher with no collector wired reports nothing and pays no cost beyond
+     * an inlinable virtual call. Every mailbox event is a fire-and-forget
+     * notification; the dispatcher never reads back from it on the hot path.
+     */
+    private final BufferflyMetrics metrics;
+
+    /**
      * When {@code true}, {@link #dispatch} drains the mailbox on the
      * <em>calling thread</em> instead of handing off to a virtual thread.
      * This is the {@code CALLER_RUNS} backpressure mode: the producer thread is
@@ -75,12 +84,28 @@ public class VTDispatcher implements ActorDispatcher, CallerRunsCapable {
      * @param mailboxCapacityOverrides map of actor-name → capacity; may be empty
      */
     public VTDispatcher(int defaultMailboxCapacity, Map<String, Integer> mailboxCapacityOverrides) {
+        this(defaultMailboxCapacity, mailboxCapacityOverrides, BufferflyMetrics.NOOP);
+    }
+
+    /**
+     * Full constructor: a custom default capacity, per-actor capacity overrides,
+     * and an observability sink.
+     *
+     * @param defaultMailboxCapacity   default capacity for actors without an override
+     * @param mailboxCapacityOverrides map of actor-name → capacity; may be empty
+     * @param metrics                  the collector to report mailbox events to;
+     *                                 use {@link BufferflyMetrics#NOOP} to disable
+     */
+    public VTDispatcher(int defaultMailboxCapacity,
+                        Map<String, Integer> mailboxCapacityOverrides,
+                        BufferflyMetrics metrics) {
         if (defaultMailboxCapacity <= 0) {
             throw new IllegalArgumentException(
                     "defaultMailboxCapacity must be > 0, got: " + defaultMailboxCapacity);
         }
         this.defaultMailboxCapacity = defaultMailboxCapacity;
         this.mailboxCapacityOverrides = Map.copyOf(mailboxCapacityOverrides);
+        this.metrics = metrics == null ? BufferflyMetrics.NOOP : metrics;
     }
 
     /**
@@ -107,9 +132,11 @@ public class VTDispatcher implements ActorDispatcher, CallerRunsCapable {
         // Always enqueue first so ordering is preserved regardless of mode.
         final var accepted = mailboxFor(actor).offer(t);
         if (!accepted) {
+            metrics.mailboxRefused(actor.name());
             throw new MailBoxRefusedException(
                     "Mailbox refused for the actor.name=%s".formatted(actor.name()));
         }
+        metrics.mailboxEnqueued(actor.name());
         consume(actor);
     }
 
@@ -205,7 +232,11 @@ public class VTDispatcher implements ActorDispatcher, CallerRunsCapable {
     private <T> Mailbox<T> mailboxFor(Actor<T> actor) {
         return (Mailbox<T>) mailboxes.computeIfAbsent(actor.name(), name -> {
             int capacity = mailboxCapacityOverrides.getOrDefault(name, defaultMailboxCapacity);
-            return new BlockingMailbox<>(capacity);
+            BlockingMailbox<T> mailbox = new BlockingMailbox<>(capacity);
+            // Register the depth gauge exactly once, when the mailbox is created.
+            // The backend samples size() on its own schedule — no hot-path push.
+            metrics.registerMailboxSize(name, mailbox::size);
+            return mailbox;
         });
     }
 

@@ -3,6 +3,7 @@ package io.bufferfly.spring;
 import io.bufferfly.core.actor.Actor;
 import io.bufferfly.core.actor.ActorManager;
 import io.bufferfly.core.actor.ActorReference;
+import io.bufferfly.core.metrics.BufferflyMetrics;
 import org.apache.kafka.clients.consumer.Consumer;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.common.TopicPartition;
@@ -78,6 +79,9 @@ public final class ShardedActorContainer<K, V> {
     private final ActorManager actorManager;
     private final ConcurrentMessageListenerContainer<K, V> container;
 
+    /** Observability sink; {@link BufferflyMetrics#NOOP} when none wired. */
+    private final BufferflyMetrics metrics;
+
     /**
      * The message listener / lifecycle component. It owns the per-partition
      * {@link Shard}s and the single {@link RestartSupervisor} actor reference —
@@ -119,10 +123,21 @@ public final class ShardedActorContainer<K, V> {
                                  ShardedActorFactory<V> factory,
                                  ConsumerFactory<K, V> consumerFactory,
                                  ActorManager actorManager) {
+        this(name, topic, concurrency, factory, consumerFactory, actorManager, BufferflyMetrics.NOOP);
+    }
+
+    public ShardedActorContainer(String name,
+                                 String topic,
+                                 int concurrency,
+                                 ShardedActorFactory<V> factory,
+                                 ConsumerFactory<K, V> consumerFactory,
+                                 ActorManager actorManager,
+                                 BufferflyMetrics metrics) {
         this.name = Objects.requireNonNull(name, "name");
         this.topic = Objects.requireNonNull(topic, "topic");
         this.factory = Objects.requireNonNull(factory, "factory");
         this.actorManager = Objects.requireNonNull(actorManager, "actorManager");
+        this.metrics = metrics == null ? BufferflyMetrics.NOOP : metrics;
         Objects.requireNonNull(consumerFactory, "consumerFactory");
         if (concurrency < 1) throw new IllegalArgumentException("concurrency must be >= 1");
 
@@ -170,6 +185,15 @@ public final class ShardedActorContainer<K, V> {
         return container;
     }
 
+    /**
+     * @return whether the underlying Kafka listener container is running (its
+     *         consumer thread(s) are active and polling). This is the single
+     *         liveness fact a pod restart can fix — see {@code BufferflyHealthIndicator}.
+     */
+    public boolean isRunning() {
+        return container.isRunning();
+    }
+
     public String name() {
         return name;
     }
@@ -200,16 +224,18 @@ public final class ShardedActorContainer<K, V> {
         Actor<ConsumedRecord<V>> actor = factory.createActor(tp, ctx);
         ActorReference<ConsumedRecord<V>> ref = actorManager.start(actor);
         shard.actorRef = ref;
-        shard.consumer = new ShardedActorConsumer<>(tp, ref, this::pausePartition);
+        shard.consumer = new ShardedActorConsumer<>(tp, ref, this::pausePartition, metrics, factory.actorName(tp));
         log.info("Partition {} -> started actor '{}'", tp, actor.name());
     }
 
     private void pausePartition(TopicPartition tp) {
         pausePartitionAction.accept(tp);
+        metrics.partitionPaused(factory.actorName(tp));
     }
 
     private void resumePartition(TopicPartition tp) {
         resumePartitionAction.accept(tp);
+        metrics.partitionResumed(factory.actorName(tp));
     }
 
     /**
@@ -316,6 +342,7 @@ public final class ShardedActorContainer<K, V> {
             Shard<V> shard = shards.computeIfAbsent(tp, p -> new Shard<>());
             if (!shard.hasActor()) {
                 ShardedActorContainer.this.startActor(tp, shard);
+                metrics.partitionAssigned(factory.actorName(tp));
             }
         }
 
@@ -324,6 +351,7 @@ public final class ShardedActorContainer<K, V> {
             Shard<V> shard = shards.get(tp);
             if (shard != null && !shard.hasActor()) {
                 ShardedActorContainer.this.startActor(tp, shard);
+                metrics.actorRestarted(factory.actorName(tp));
             }
         }
 
@@ -344,6 +372,7 @@ public final class ShardedActorContainer<K, V> {
             if (shard != null && shard.actorRef != null) {
                 log.info("Releasing partition {} (revoke)", tp);
                 shard.actorRef.stop();
+                metrics.partitionRevoked(factory.actorName(tp));
             }
         }
 
@@ -429,6 +458,7 @@ public final class ShardedActorContainer<K, V> {
             // took effect, or any record while a restart's rewind is pending.
             if (!shard.seekState.shouldDeliver(record.offset())) {
                 log.debug("Discarding stale/pre-rewind record {} at offset {}", tp, record.offset());
+                metrics.recordRejected(factory.actorName(tp));
                 return false;
             }
         }
@@ -436,6 +466,7 @@ public final class ShardedActorContainer<K, V> {
             // Partition not owned here, or its actor is momentarily down during a
             // restart — do not ack; it will be redelivered.
             log.warn("No active actor for {} at offset {}; skipping (will redeliver)", tp, record.offset());
+            metrics.recordRejected(factory.actorName(tp));
             return false;
         }
         shard.consumer.tellActor(record, ack);

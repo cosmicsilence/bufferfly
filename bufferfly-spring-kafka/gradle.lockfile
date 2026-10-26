@@ -106,6 +106,7 @@ org.slf4j:slf4j-api:2.0.18=compileClasspath,testCompileClasspath
 org.slf4j:slf4j-api:2.0.20=runtimeClasspath,testRuntimeClasspath
 org.springframework.boot:spring-boot-autoconfigure:4.0.8=compileClasspath,runtimeClasspath,testCompileClasspath,testRuntimeClasspath
 org.springframework.boot:spring-boot-dependencies:4.0.8=compileClasspath,runtimeClasspath,testCompileClasspath,testRuntimeClasspath
+org.springframework.boot:spring-boot-health:4.0.8=compileClasspath,testCompileClasspath,testRuntimeClasspath
 org.springframework.boot:spring-boot-kafka:4.0.8=compileClasspath,runtimeClasspath,testCompileClasspath,testRuntimeClasspath
 org.springframework.boot:spring-boot-persistence:4.0.8=compileClasspath,runtimeClasspath,testCompileClasspath,testRuntimeClasspath
 org.springframework.boot:spring-boot-starter-kafka:4.0.8=compileClasspath,runtimeClasspath,testCompileClasspath,testRuntimeClasspath

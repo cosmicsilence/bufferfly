@@ -1,6 +1,7 @@
 package io.bufferfly.spring;
 
 import io.bufferfly.core.actor.ActorManager;
+import io.bufferfly.core.metrics.BufferflyMetrics;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.BeansException;
@@ -35,6 +36,7 @@ public class ShardedActorBeanPostProcessor
 
     private final ConsumerFactory<Object, Object> consumerFactory;
     private final ActorManager actorManager;
+    private final BufferflyMetrics metrics;
 
     private final List<Discovered> discovered = new ArrayList<>();
     private final List<ShardedActorContainer<Object, Object>> containers = new ArrayList<>();
@@ -44,8 +46,15 @@ public class ShardedActorBeanPostProcessor
 
     public ShardedActorBeanPostProcessor(ConsumerFactory<Object, Object> consumerFactory,
                                          ActorManager actorManager) {
+        this(consumerFactory, actorManager, BufferflyMetrics.NOOP);
+    }
+
+    public ShardedActorBeanPostProcessor(ConsumerFactory<Object, Object> consumerFactory,
+                                         ActorManager actorManager,
+                                         BufferflyMetrics metrics) {
         this.consumerFactory = Objects.requireNonNull(consumerFactory, "consumerFactory");
         this.actorManager = Objects.requireNonNull(actorManager, "actorManager");
+        this.metrics = metrics == null ? BufferflyMetrics.NOOP : metrics;
     }
 
     @Override
@@ -98,7 +107,8 @@ public class ShardedActorBeanPostProcessor
                     d.annotation().concurrency(),
                     d.factory(),
                     consumerFactory,
-                    actorManager);
+                    actorManager,
+                    metrics);
             containers.add(container);
         }
     }

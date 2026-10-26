@@ -1,5 +1,6 @@
 package io.bufferfly.core.persistence;
 
+import io.bufferfly.core.metrics.BufferflyMetrics;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -58,6 +59,16 @@ public final class BatchingPersistenceRunner<E> implements PersistenceRunner<E> 
     private final PersistenceDispatcher<E> dispatcher;
     private final PersistenceConfig<E> config;
     private final SideEffectProcessor sideEffectProcessor;
+
+    /**
+     * Observability sink taken from {@link PersistenceConfig#metrics()}. Defaults
+     * to {@link BufferflyMetrics#NOOP}. Every call is fire-and-forget on the
+     * persistence thread.
+     */
+    private final BufferflyMetrics metrics;
+
+    /** Metrics component label (the owning actor's name); never null. */
+    private final String component;
 
     /**
      * Called when a batch failure is unrecoverable (after retries are
@@ -159,6 +170,8 @@ public final class BatchingPersistenceRunner<E> implements PersistenceRunner<E> 
         this.onUnrecoverable = onUnrecoverable;
         this.dispatcher = dispatcher;
         this.sideEffectProcessor = processor;
+        this.metrics = config.metrics() == null ? BufferflyMetrics.NOOP : config.metrics();
+        this.component = config.componentName();
     }
 
     public PersistenceConfig<E> config() {
@@ -244,6 +257,7 @@ public final class BatchingPersistenceRunner<E> implements PersistenceRunner<E> 
                 // so we now own the token at its new value.
                 currentToken = newToken;
                 batch.forEach(e -> sideEffectProcessor.process(e.sideEffect()));
+                metrics.batchPersisted(component, batch.size());
                 return; // success
             } catch (SingleItemException e) {
                 // Poison pill in the batch: isolate item-by-item to FIND the pill.
@@ -268,6 +282,7 @@ public final class BatchingPersistenceRunner<E> implements PersistenceRunner<E> 
                 }
                 log.warn("Transient failure persisting batch of {} (attempt {}/{}): {}; retrying with back-off",
                         batch.size(), attempts, config.maxRetries(), e.getMessage());
+                metrics.batchRetry(component);
                 backOff(attempts);
             } catch (UnrecoverableException e) {
                 log.error("Unrecoverable failure persisting batch of {}; halting runner and invoking recovery hook",
@@ -321,6 +336,7 @@ public final class BatchingPersistenceRunner<E> implements PersistenceRunner<E> 
                 // adopt the advanced token so the next item's CAS matches.
                 currentToken = operations.persistOnTransaction(List.of(item.event()), currentToken);
                 sideEffectProcessor.process(item.sideEffect());
+                metrics.batchPersisted(component, 1);
             } catch (UnrecoverableException e) {
                 log.error("Unrecoverable failure while isolating batch item-by-item; abandoning remaining items", e);
                 handleUnrecoverable();
@@ -347,6 +363,7 @@ public final class BatchingPersistenceRunner<E> implements PersistenceRunner<E> 
                     log.error("onPoisonPill threw while dead-lettering a poison pill; swallowing to keep the runner alive",
                             swallowed);
                 }
+                metrics.poisonPill(component);
                 // HALT: the pill is dead-lettered and the fence is advanced past
                 // it; stop here and let the caller invoke the unrecoverable hook.
                 // Items after the pill are intentionally not persisted.
@@ -371,6 +388,7 @@ public final class BatchingPersistenceRunner<E> implements PersistenceRunner<E> 
         // hook typically restarts the actor, which brings up a fresh runner;
         // this defunct one must not keep draining batches and racing it.
         state = State.STOPPED;
+        metrics.unrecoverableFailure(component);
         try {
             onUnrecoverable.run();
         } catch (Exception swallowed) {

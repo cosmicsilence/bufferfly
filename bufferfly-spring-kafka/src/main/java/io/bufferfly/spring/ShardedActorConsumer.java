@@ -3,6 +3,7 @@ package io.bufferfly.spring;
 import io.bufferfly.core.actor.ActorReference;
 import io.bufferfly.core.actor.MailBoxRefusedException;
 import io.bufferfly.core.backpressure.UnderPressureException;
+import io.bufferfly.core.metrics.BufferflyMetrics;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.common.TopicPartition;
 import org.slf4j.Logger;
@@ -51,6 +52,8 @@ public final class ShardedActorConsumer<V> {
     private final TopicPartition topicPartition;
     private final ActorReference<ConsumedRecord<V>> actor;
     private final Consumer<TopicPartition> pauseSignal;
+    private final BufferflyMetrics metrics;
+    private final String component;
 
     /**
      * @param topicPartition the partition this consumer serves
@@ -62,9 +65,26 @@ public final class ShardedActorConsumer<V> {
     public ShardedActorConsumer(TopicPartition topicPartition,
                                 ActorReference<ConsumedRecord<V>> actor,
                                 Consumer<TopicPartition> pauseSignal) {
+        this(topicPartition, actor, pauseSignal, BufferflyMetrics.NOOP, null);
+    }
+
+    /**
+     * @param topicPartition the partition this consumer serves
+     * @param actor          the actor owning the partition
+     * @param pauseSignal    invoked when the actor rejects a record under pressure
+     * @param metrics        observability sink; {@link BufferflyMetrics#NOOP} to disable
+     * @param component      the component label (the per-partition actor name)
+     */
+    public ShardedActorConsumer(TopicPartition topicPartition,
+                                ActorReference<ConsumedRecord<V>> actor,
+                                Consumer<TopicPartition> pauseSignal,
+                                BufferflyMetrics metrics,
+                                String component) {
         this.topicPartition = Objects.requireNonNull(topicPartition, "topicPartition");
         this.actor = Objects.requireNonNull(actor, "actor");
         this.pauseSignal = Objects.requireNonNull(pauseSignal, "pauseSignal");
+        this.metrics = metrics == null ? BufferflyMetrics.NOOP : metrics;
+        this.component = component == null ? topicPartition.toString() : component;
     }
 
     public TopicPartition topicPartition() {
@@ -96,6 +116,7 @@ public final class ShardedActorConsumer<V> {
             // Both mean "stop feeding me"; they are handled identically.
             log.warn("Backpressure ({}) on {}-{} at offset {}; pausing partition for redelivery",
                     bp.getClass().getSimpleName(), record.topic(), record.partition(), record.offset());
+            metrics.recordRejected(component);
             pauseSignal.accept(topicPartition);
             return false;
         }

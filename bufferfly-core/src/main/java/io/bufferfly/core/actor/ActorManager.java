@@ -2,6 +2,7 @@ package io.bufferfly.core.actor;
 
 import io.bufferfly.core.actor.Actor.State;
 import io.bufferfly.core.config.BufferflyConfig;
+import io.bufferfly.core.metrics.BufferflyMetrics;
 
 import java.util.HashMap;
 import java.util.Map;
@@ -56,7 +57,22 @@ public class ActorManager {
      * {@link IllegalArgumentException} here, at construction time.
      */
     public ActorManager(BufferflyConfig config) {
-        this(DispatcherWiring.from(config));
+        this(DispatcherWiring.from(config, BufferflyMetrics.NOOP));
+    }
+
+    /**
+     * Creates an ActorManager wired from a {@link BufferflyConfig} with an
+     * observability sink. The {@code metrics} collector is handed to the default
+     * {@link VTDispatcher} so mailbox enqueue/refuse counters and the mailbox
+     * depth gauge are reported. Per-actor dispatchers configured via a different
+     * FQN get the same collector when they are a {@link VTDispatcher}.
+     *
+     * @param config  the configuration to resolve dispatchers from
+     * @param metrics the collector to report mailbox events to; use
+     *                {@link BufferflyMetrics#NOOP} to disable
+     */
+    public ActorManager(BufferflyConfig config, BufferflyMetrics metrics) {
+        this(DispatcherWiring.from(config, metrics == null ? BufferflyMetrics.NOOP : metrics));
     }
 
     private ActorManager(DispatcherWiring wiring) {
@@ -109,10 +125,11 @@ public class ActorManager {
     private static ActorDispatcher instantiateDispatcher(
             String fqn,
             int defaultCapacity,
-            Map<String, Integer> capacityOverrides) {
+            Map<String, Integer> capacityOverrides,
+            BufferflyMetrics metrics) {
 
         if (VTDispatcher.class.getName().equals(fqn)) {
-            return new VTDispatcher(defaultCapacity, capacityOverrides);
+            return new VTDispatcher(defaultCapacity, capacityOverrides, metrics);
         }
         try {
             Class<?> cls = Class.forName(fqn);
@@ -156,21 +173,21 @@ public class ActorManager {
          *       override (falling back to the global default).</li>
          * </ol>
          */
-        static DispatcherWiring from(BufferflyConfig config) {
+        static DispatcherWiring from(BufferflyConfig config, BufferflyMetrics metrics) {
             BufferflyConfig.ActorsConfig actors = config.getActors();
             String defaultFqn = actors.getDefaultDispatcher();
             int defaultCapacity = actors.getDefaultMailboxCapacity();
             Map<String, BufferflyConfig.ActorOverrideConfig> overrides = actors.getOverrides();
 
             ActorDispatcher defaultDispatcher =
-                    instantiateDispatcher(defaultFqn, defaultCapacity, capacityOverrides(overrides));
+                    instantiateDispatcher(defaultFqn, defaultCapacity, capacityOverrides(overrides), metrics);
 
             Map<String, ActorDispatcher> perActor = new HashMap<>();
             overrides.forEach((actorName, override) -> {
                 String fqn = override.getDispatcher();
                 if (fqn != null && !fqn.equals(defaultFqn)) {
                     perActor.put(actorName,
-                            instantiateDispatcher(fqn, resolveCapacity(override, defaultCapacity), Map.of()));
+                            instantiateDispatcher(fqn, resolveCapacity(override, defaultCapacity), Map.of(), metrics));
                 }
             });
 
