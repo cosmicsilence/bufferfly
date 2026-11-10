@@ -33,7 +33,7 @@ class MultiSideEffectTest {
 
     private static BatchingPersistenceRunner<String> runner(RecordingOps ops, List<String> processed) {
         PersistenceConfig<String> config = PersistenceConfig.builder(ops)
-                .batchSize(10).timeoutMs(10L).maxRetries(0).build();
+                .batchSize(10).maxRetries(0).build();
         // Record each processed side effect's label, preserving invocation order.
         return config.instantiate(se -> processed.add(((Labelled) se).label()));
     }

@@ -111,7 +111,7 @@ class LedgerBackpressureTest {
             return new LedgerShardFactory(operations, confirmations)
                     // small batch + tiny timeout + small watermarks so a modest
                     // backlog crosses the high watermark (pause).
-                    .withBackpressure(5, 5L, 10, 2)
+                    .withBackpressure(5, 10, 2)
                     // tiny evaluation window so the falling edge (resume) fires
                     // promptly as the buffer drains after the flood — the whole
                     // point of the periodic evaluator. Production picks a larger

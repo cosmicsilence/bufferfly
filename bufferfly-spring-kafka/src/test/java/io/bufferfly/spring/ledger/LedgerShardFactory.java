@@ -54,7 +54,6 @@ public class LedgerShardFactory implements ShardedActorFactory<AddToAccount> {
     private volatile int highWatermark = 50_000;
     private volatile int lowWatermark = 20_000;
     private volatile int batchSize = 200;
-    private volatile long timeoutMs = 20L;
     // How often the backpressure dispatcher re-evaluates its buffer depth in the
     // background so the falling edge (resume) fires as the buffer drains even
     // after upstream has been paused and stops enqueuing. A sensible production
@@ -74,9 +73,8 @@ public class LedgerShardFactory implements ShardedActorFactory<AddToAccount> {
     }
 
     /** Tune the persistence/backpressure parameters (used by tests). */
-    public LedgerShardFactory withBackpressure(int batchSize, long timeoutMs, int highWatermark, int lowWatermark) {
+    public LedgerShardFactory withBackpressure(int batchSize, int highWatermark, int lowWatermark) {
         this.batchSize = batchSize;
-        this.timeoutMs = timeoutMs;
         this.highWatermark = highWatermark;
         this.lowWatermark = lowWatermark;
         return this;
@@ -120,12 +118,11 @@ public class LedgerShardFactory implements ShardedActorFactory<AddToAccount> {
             }
         };
         PersistenceDispatcher<LedgerChange> dispatcher = new BackpressurePersistenceDispatcher<>(
-                new NaturalBatchingDispatcher<>(batchSize, timeoutMs),
+                new NaturalBatchingDispatcher<>(batchSize),
                 highWatermark, lowWatermark, backpressure, evaluateIntervalMs);
 
         PersistenceConfig<LedgerChange> config = PersistenceConfig.builder(operations)
                 .batchSize(batchSize)
-                .timeoutMs(timeoutMs)
                 .maxRetries(5)
                 .dispatcher(dispatcher)
                 .onUnrecoverable(onUnrecoverable)

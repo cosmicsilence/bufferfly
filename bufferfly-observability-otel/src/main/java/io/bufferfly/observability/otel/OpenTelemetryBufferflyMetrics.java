@@ -150,7 +150,7 @@ public final class OpenTelemetryBufferflyMetrics implements BufferflyMetrics, Au
         this.actorRestarted = meter.counterBuilder(ACTOR_RESTARTED)
                 .setDescription("Actor restarts after unrecoverable failure").setUnit("{restart}").build();
         this.recordRejected = meter.counterBuilder(RECORD_REJECTED)
-                .setDescription("Records left un-acked for redelivery").setUnit("{record}").build();
+                .setDescription("Records not delivered to their actor (backpressure, no active actor, or pre-rewind), so not committed").setUnit("{record}").build();
         this.partitionAssigned = meter.counterBuilder(PARTITION_ASSIGNED)
                 .setDescription("Kafka partition assignments").setUnit("{assignment}").build();
         this.partitionRevoked = meter.counterBuilder(PARTITION_REVOKED)

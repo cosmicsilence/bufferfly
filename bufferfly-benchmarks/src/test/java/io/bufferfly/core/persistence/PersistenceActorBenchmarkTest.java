@@ -112,7 +112,6 @@ class PersistenceActorBenchmarkTest {
         PersistenceConfig<Tweet> config = new PersistenceConfig<>(
                 actorOperations,
                 1_000, // batchSize
-                10L,   // timeoutMs
                 3      // maxRetries
         );
         TweeterActor actor = new TweeterActor("tweeter-bench-" + UUID.randomUUID(), config);

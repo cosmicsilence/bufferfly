@@ -121,7 +121,7 @@ public final class BatchingPersistenceRunner<E> implements PersistenceRunner<E> 
                 config.onUnrecoverable(),
                 config.dispatcher() != null
                         ? config.dispatcher()
-                        : new NaturalBatchingDispatcher<>(config.batchSize(), config.timeoutMs()),
+                        : new NaturalBatchingDispatcher<>(config.batchSize()),
                 processor
         );
     }
@@ -146,7 +146,7 @@ public final class BatchingPersistenceRunner<E> implements PersistenceRunner<E> 
         this(operations, config, onUnrecoverable,
                 config.dispatcher() != null
                         ? config.dispatcher()
-                        : new NaturalBatchingDispatcher<>(config.batchSize(), config.timeoutMs()),
+                        : new NaturalBatchingDispatcher<>(config.batchSize()),
                 processor);
     }
 
@@ -314,6 +314,12 @@ public final class BatchingPersistenceRunner<E> implements PersistenceRunner<E> 
      *       and the method returns so the caller can halt the runner.</li>
      *   <li>{@link UnrecoverableException} or any unexpected exception on a
      *       single-item run → halt immediately and abandon the remainder.</li>
+     *   <li>{@link TransientException} on a single-item run → NOT a poison pill;
+     *       halt and let the restart replay this item (and the untried remainder)
+     *       from the committed offset. Although {@code TransientException} extends
+     *       {@link PersistenceException}, it must be caught <em>before</em> the
+     *       generic {@code PersistenceException} branch so a transient blip never
+     *       dead-letters a good record.</li>
      * </ul>
      *
      * <h2>Why halt at the pill instead of persisting the items after it</h2>
@@ -341,6 +347,19 @@ public final class BatchingPersistenceRunner<E> implements PersistenceRunner<E> 
                 log.error("Unrecoverable failure while isolating batch item-by-item; abandoning remaining items", e);
                 handleUnrecoverable();
                 return; // abandon remainder of batch
+            } catch (TransientException e) {
+                // A transient failure (deadlock, timeout, pool blip) on a single
+                // item is NOT a poison pill, even though TransientException extends
+                // PersistenceException. Dead-lettering it here would discard a good
+                // record and advance the fence past it, so a restart's rewind would
+                // SKIP it — silent data loss. Instead halt and let the restart
+                // replay this item (and the untried remainder) from the committed
+                // offset, where the transient condition may well have cleared.
+                log.warn("Transient failure ({}) while isolating batch item-by-item; "
+                                + "halting for replay instead of dead-lettering a good record",
+                        e.getMessage());
+                handleUnrecoverable();
+                return; // abandon remainder of batch; it will be replayed on restart
             } catch (PersistenceException e) {
                 // Poison pill found. Dead-letter it, then HALT: do not persist the
                 // items after it in this batch. They were accepted into the actor's

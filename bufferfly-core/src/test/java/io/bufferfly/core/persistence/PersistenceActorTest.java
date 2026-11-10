@@ -59,7 +59,6 @@ class PersistenceActorTest {
         PersistenceConfig<Tweet> config = new PersistenceConfig<>(
                 operations,
                 500,  // batch size
-                20L,  // 20ms timeout
                 3     // 3 retries
         );
 
@@ -296,9 +295,7 @@ class PersistenceActorTest {
 
         PersistenceConfig<Tweet> failingConfig = new PersistenceConfig<>(
                 failingOps,
-                10,
-                10L,
-                1,
+                10, 1,
                 () -> unrecoverableCalled.set(true)
         );
 
@@ -337,9 +334,7 @@ class PersistenceActorTest {
 
         PersistenceConfig<Tweet> failingConfig = new PersistenceConfig<>(
                 failingOps,
-                10,
-                10L,
-                2,
+                10, 2,
                 () -> unrecoverableCalled.set(true)
         );
 
@@ -379,9 +374,7 @@ class PersistenceActorTest {
 
         PersistenceConfig<Tweet> failingConfig = new PersistenceConfig<>(
                 failingOps,
-                10,
-                10L,
-                1,
+                10, 1,
                 () -> unrecoverableCalled.set(true)
         );
 
@@ -469,9 +462,7 @@ class PersistenceActorTest {
 
         PersistenceConfig<Tweet> config = new PersistenceConfig<>(
                 ops,
-                10,
-                10L,
-                1,
+                10, 1,
                 () -> unrecoverableCalled.set(true)
         );
 

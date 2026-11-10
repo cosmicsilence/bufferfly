@@ -173,10 +173,11 @@ public interface BufferflyMetrics {
     void actorRestarted(String component);
 
     /**
-     * A consumed record was <b>rejected</b> (left un-acked) and will be
-     * redelivered — because the actor pushed back under pressure, or because no
-     * active actor currently owns the partition (e.g. mid-restart), or a stale
-     * pre-rewind record was discarded.
+     * A consumed record was <b>rejected</b>: not delivered to the actor, so its
+     * partition's slice of the poll is not committed and the record is read
+     * again later — because the actor pushed back under pressure, because no
+     * active actor currently owns the partition (e.g. mid-restart), or because
+     * it belonged to the poll taken before a requested rewind (seek).
      *
      * @param component the owning component (the per-partition actor name)
      */

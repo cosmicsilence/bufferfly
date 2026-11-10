@@ -9,11 +9,9 @@ import org.apache.kafka.common.TopicPartition;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.springframework.kafka.core.ConsumerFactory;
-import org.springframework.kafka.support.Acknowledgment;
 
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
-import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -57,11 +55,6 @@ class ShardedActorContainerMetricsTest {
         }
     }
 
-    static final class RecordingAck implements Acknowledgment {
-        final AtomicInteger acks = new AtomicInteger();
-        @Override public void acknowledge() { acks.incrementAndGet(); }
-    }
-
     @SuppressWarnings("unchecked")
     private static ShardedActorContainer<String, String> newContainer(
             CapturingFactory factory, InMemoryBufferflyMetrics metrics) {
@@ -103,13 +96,12 @@ class ShardedActorContainerMetricsTest {
     void should_countRecordRejected_whenNoShardOwnsPartition() {
         InMemoryBufferflyMetrics metrics = new InMemoryBufferflyMetrics();
         ShardedActorContainer<String, String> container = newContainer(new CapturingFactory(), metrics);
-        // no assignment -> the record is rejected (un-acked, will redeliver)
+        // no assignment -> the record is rejected (not committed, will redeliver)
 
-        RecordingAck ack = new RecordingAck();
-        container.onRecord(new ConsumerRecord<>(TOPIC, 0, 7L, "k", "orphan"), ack);
+        var offsets = container.onBatch(List.of(new ConsumerRecord<>(TOPIC, 0, 7L, "k", "orphan")));
 
         assertEquals(1, metrics.recordRejectedFor(COMPONENT), "the un-owned record is counted as rejected");
-        assertEquals(0, ack.acks.get(), "and not acked");
+        assertTrue(offsets.isEmpty(), "and not committed");
     }
 
     @Test

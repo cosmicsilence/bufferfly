@@ -5,11 +5,13 @@ import org.springframework.jdbc.datasource.DataSourceTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
 
 import javax.sql.DataSource;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
- * The <b>shared</b> Postgres ledger store used by <em>both</em> benchmark
- * approaches, so the two differ only in <em>how</em> they drive the database —
+ * The <b>shared</b> Postgres ledger store used by <em>every</em> benchmark
+ * approach, so they differ only in <em>how</em> they drive the database —
  * not in the schema, the SQL, or the DataSource.
  *
  * <h2>Schema (per approach, isolated by table prefix)</h2>
@@ -20,23 +22,24 @@ import java.util.List;
  *                            UNIQUE(topic, partition, offset_value))
  *   &lt;p&gt;_consumer_offset(topic, partition, latest_offset, PRIMARY KEY(topic, partition))
  * </pre>
- * Each approach gets its own prefixed set of tables ({@code actor_*} vs
- * {@code classic_*}) so a single run of one does not pollute the other and the
- * per-approach row counts/balances can be asserted independently against the
- * same Postgres instance.
+ * Each approach gets its own prefixed set of tables ({@code actor_*},
+ * {@code classic_*}, {@code lockbatch_*}) so a run of one does not pollute
+ * another and the per-approach row counts/balances can be asserted
+ * independently against the same Postgres instance.
  *
- * <h2>Two write paths, one store</h2>
+ * <h2>Three write paths, one store</h2>
  * <ul>
  *   <li>{@link #applyOneLocked} — the <b>classic</b> path: a single tiny
  *       transaction per message (BEGIN; INSERT change; UPSERT balance; UPSERT
- *       offset; COMMIT). This is the per-message-transaction pattern the actor
- *       is meant to replace; running it from a 7-thread pool per topic is what
- *       produces WAL/commit contention on Postgres.</li>
+ *       offset; COMMIT).</li>
  *   <li>{@link #applyBatch} — the <b>actor</b> path: one transaction per
- *       <em>natural batch</em> (bulk insert of all changes, batched balance
- *       upserts, a single offset advance). Millions of tiny commits collapse
- *       into a handful of fat ones.</li>
+ *       <em>natural batch</em>. The fencing offset is advanced by the actor's
+ *       {@code FencingOffsetRepository} in the same transaction.</li>
+ *   <li>{@link #applyPollBatch} — the <b>locking batch consumer</b> path: one
+ *       transaction per Kafka poll, with the offset upserted in it.</li>
  * </ul>
+ * Both batch paths issue the identical change insert and balance upsert, each as
+ * one JDBC batch, so they differ only in how and when they are invoked.
  */
 public final class PgLedgerStore {
 
@@ -138,13 +141,7 @@ public final class PgLedgerStore {
                                 """.formatted(changeTable),
                         updated, topic, partition, offset);
                 // advance the stored offset (fencing token) in the same tx
-                jdbc.update("""
-                                INSERT INTO %s (NAM_TOPIC, NUM_PARTITION, NUM_OFFSET, DAT_CREATED)
-                                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-                                ON CONFLICT (NAM_TOPIC, NUM_PARTITION)
-                                DO UPDATE SET NUM_OFFSET = GREATEST(%s.NUM_OFFSET, EXCLUDED.NUM_OFFSET)
-                                """.formatted(offsetTable, offsetTable),
-                        topic, partition, offset);
+                upsertOffset(topic, partition, offset);
             }
             return updated;
         });
@@ -153,44 +150,92 @@ public final class PgLedgerStore {
     /**
      * The <b>actor</b> write path: persist a whole natural batch in one
      * transaction — bulk insert of changes (idempotent by
-     * {@code (topic, partition, offset)}), per-account balance upserts, and a
-     * single offset advance to the batch max. This is what turns N tiny commits
-     * into one fat commit.
+     * {@code (topic, partition, offset)}) and one balance upsert per touched
+     * account. The batch is in offset order for a single partition, so the last
+     * change per account carries its final balance. The fencing offset is
+     * advanced by the actor's {@code FencingOffsetRepository} in the same (outer)
+     * transaction, so it is not touched here.
+     *
+     * @return change rows actually inserted (a replayed change already stored is
+     *         skipped and not counted)
      */
-    public void applyBatch(List<PgLedgerChange> batch) {
-        if (batch == null || batch.isEmpty()) return;
+    public int applyBatch(List<PgLedgerChange> batch) {
+        if (batch == null || batch.isEmpty()) return 0;
 
-        tx.executeWithoutResult(status -> {
-            jdbc.batchUpdate("""
-                            INSERT INTO %s (account_number, amount, resulting_balance, topic, partition, offset_value)
-                            VALUES (?, ?, ?, ?, ?, ?)
-                            ON CONFLICT (topic, partition, offset_value) DO NOTHING
-                            """.formatted(changeTable),
-                    batch.stream()
-                            .map(c -> new Object[]{
-                                    c.accountNumber(), c.amount(), c.resultingBalance(),
-                                    c.topic(), c.partition(), c.offset()})
-                            .toList());
-
-            // one upsert per account with its final (last-in-batch) resulting balance
-            // the batch is in offset order so the last write per account wins.
-            batch.stream()
-                    .collect(java.util.stream.Collectors.toMap(
-                            PgLedgerChange::accountNumber,
-                            c -> c,
-                            (a, b) -> b,
-                            java.util.LinkedHashMap::new))
-                    .forEach((account, last) ->
-                            jdbc.update("""
-                                            INSERT INTO %s (account_number, balance) VALUES (?, ?)
-                                            ON CONFLICT (account_number) DO UPDATE SET balance = EXCLUDED.balance
-                                            """.formatted(balanceTable),
-                                    account, last.resultingBalance()));
-            // NOTE: the fencing offset (FENCE_OFFSET) is advanced by the actor's
-            // FencingOffsetRepository in the SAME (outer) transaction, so we do
-            // not touch the offset table here — that is the actor path's single
-            // source of truth for the token.
+        Map<String, Long> finalBalances = new LinkedHashMap<>();
+        batch.forEach(c -> finalBalances.put(c.accountNumber(), c.resultingBalance()));
+        Integer inserted = tx.execute(status -> {
+            int rows = insertChanges(batch);
+            upsertBalances(finalBalances);
+            return rows;
         });
+        return inserted == null ? 0 : inserted;
+    }
+
+    /**
+     * The <b>locking batch consumer</b> write path: persist one Kafka poll in a
+     * single transaction — the same bulk change insert and balance upsert as
+     * {@link #applyBatch}, plus one offset upsert per partition in the poll.
+     *
+     * <p>The final balances are passed in rather than derived from the change
+     * list, because the poll's records are processed by several worker threads
+     * and the list order does not have to match the order the balances were
+     * computed in.
+     *
+     * @param changes       every change of the poll
+     * @param finalBalances each touched account's balance after the whole poll
+     */
+    public void applyPollBatch(List<PgLedgerChange> changes, Map<String, Long> finalBalances) {
+        if (changes.isEmpty()) return;
+
+        Map<PartitionKey, Long> maxOffsets = new LinkedHashMap<>();
+        changes.forEach(c -> maxOffsets.merge(new PartitionKey(c.topic(), c.partition()), c.offset(), Math::max));
+        tx.executeWithoutResult(status -> {
+            insertChanges(changes);
+            upsertBalances(finalBalances);
+            maxOffsets.forEach((p, offset) -> upsertOffset(p.topic(), p.partition(), offset));
+        });
+    }
+
+    private record PartitionKey(String topic, int partition) {
+    }
+
+    private int insertChanges(List<PgLedgerChange> changes) {
+        int[] counts = jdbc.batchUpdate("""
+                        INSERT INTO %s (account_number, amount, resulting_balance, topic, partition, offset_value)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        ON CONFLICT (topic, partition, offset_value) DO NOTHING
+                        """.formatted(changeTable),
+                changes.stream()
+                        .map(c -> new Object[]{
+                                c.accountNumber(), c.amount(), c.resultingBalance(),
+                                c.topic(), c.partition(), c.offset()})
+                        .toList());
+        int inserted = 0;
+        for (int count : counts) {
+            inserted += Math.max(count, 0);
+        }
+        return inserted;
+    }
+
+    private void upsertBalances(Map<String, Long> balances) {
+        jdbc.batchUpdate("""
+                        INSERT INTO %s (account_number, balance) VALUES (?, ?)
+                        ON CONFLICT (account_number) DO UPDATE SET balance = EXCLUDED.balance
+                        """.formatted(balanceTable),
+                balances.entrySet().stream()
+                        .map(e -> new Object[]{e.getKey(), e.getValue()})
+                        .toList());
+    }
+
+    private void upsertOffset(String topic, int partition, long offset) {
+        jdbc.update("""
+                        INSERT INTO %s (NAM_TOPIC, NUM_PARTITION, NUM_OFFSET, DAT_CREATED)
+                        VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                        ON CONFLICT (NAM_TOPIC, NUM_PARTITION)
+                        DO UPDATE SET NUM_OFFSET = GREATEST(%s.NUM_OFFSET, EXCLUDED.NUM_OFFSET)
+                        """.formatted(offsetTable, offsetTable),
+                topic, partition, offset);
     }
 
     // -- query helpers -------------------------------------------------------
@@ -215,6 +260,53 @@ public final class PgLedgerStore {
 
     public int distinctAccounts() {
         Integer n = jdbc.queryForObject("SELECT COUNT(*) FROM " + balanceTable, Integer.class);
+        return n == null ? 0 : n;
+    }
+
+    /**
+     * Each account's latest stored balance among the changes of one partition —
+     * the state an actor owning the partition starts from after a
+     * (re)assignment. Changes are written in the same transaction as the fencing
+     * offset, so this matches the stored offset.
+     */
+    public Map<String, Long> balancesForPartition(String topic, int partition) {
+        Map<String, Long> balances = new LinkedHashMap<>();
+        jdbc.query("""
+                        SELECT DISTINCT ON (account_number) account_number, resulting_balance
+                          FROM %s
+                         WHERE topic = ? AND partition = ?
+                         ORDER BY account_number, offset_value DESC
+                        """.formatted(changeTable),
+                (org.springframework.jdbc.core.RowCallbackHandler) rs ->
+                        balances.put(rs.getString(1), rs.getLong(2)),
+                topic, partition);
+        return balances;
+    }
+
+    /** @return how many accounts have a stored balance different from {@code expected}. */
+    public int accountsWithBalanceOtherThan(long expected) {
+        Integer n = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM " + balanceTable + " WHERE balance <> ?", Integer.class, expected);
+        return n == null ? 0 : n;
+    }
+
+    /**
+     * Counts change rows whose {@code resulting_balance} does not follow from the
+     * previous change of the same account in Kafka offset order. Every amount is
+     * {@code +1}, so in offset order each account's balances must read 1, 2, 3, …
+     * A non-zero count means changes for one account were applied in a different
+     * order than they were produced (the final balance can still be right).
+     */
+    public int outOfOrderChanges() {
+        Integer n = jdbc.queryForObject("""
+                SELECT COUNT(*) FROM (
+                    SELECT resulting_balance,
+                           LAG(resulting_balance) OVER (
+                               PARTITION BY account_number ORDER BY topic, partition, offset_value) AS previous
+                      FROM %s
+                ) t
+                WHERE resulting_balance <> COALESCE(previous, 0) + 1
+                """.formatted(changeTable), Integer.class);
         return n == null ? 0 : n;
     }
 }

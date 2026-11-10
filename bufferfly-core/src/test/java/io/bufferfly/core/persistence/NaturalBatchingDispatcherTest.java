@@ -49,10 +49,10 @@ public class NaturalBatchingDispatcherTest {
         }
     }
 
-    static BatchingPersistenceRunner<String> runner(SpyOperations spy,
+    static BatchingPersistenceRunner<String> runner(TransactionalOperations<String> ops,
                                                     NaturalBatchingDispatcher<String> dispatcher,
-                                                    int batchSize, long timeoutMs) {
-        var config = new PersistenceConfig<>(spy, batchSize, timeoutMs, 0, () -> {}, dispatcher);
+                                                    int batchSize) {
+        var config = new PersistenceConfig<>(ops, batchSize, 0, () -> {}, dispatcher);
         return config.instantiate();
     }
 
@@ -66,8 +66,8 @@ public class NaturalBatchingDispatcherTest {
         final int BATCH_SIZE = 50;
 
         SpyOperations spy = new SpyOperations();
-        NaturalBatchingDispatcher<String> dispatcher = new NaturalBatchingDispatcher<>(BATCH_SIZE, 50);
-        BatchingPersistenceRunner<String> runner = runner(spy, dispatcher, BATCH_SIZE, 50);
+        NaturalBatchingDispatcher<String> dispatcher = new NaturalBatchingDispatcher<>(BATCH_SIZE);
+        BatchingPersistenceRunner<String> runner = runner(spy, dispatcher, BATCH_SIZE);
 
         // Realistic load: 10 virtual-thread producers hammer the buffer
         // concurrently (not a single serial loop), all released together so
@@ -105,52 +105,59 @@ public class NaturalBatchingDispatcherTest {
 
 
 // -----------------------------------------------------------------------
-// Test 2 — natural-batching timeout: a slow trickle must be coalesced
-//          within the timeoutMs window (light-load path)
+// Test 2 — pure natural batching: never wait; batch what accumulated while
+//          the previous batch was being written
 // -----------------------------------------------------------------------
 
-    /**
-     * Natural batching must <em>wait</em> up to {@code timeoutMs} collecting
-     * whatever arrives in that window into a single batch — not return after the
-     * first couple of polls. Under a slow trickle (events spaced a few ms apart,
-     * never filling {@code batchSize}), the drain loop should therefore gather
-     * several trickled events per batch.
-     *
-     * <p>This exercises the light-load / timeout path that the saturated
-     * {@link #shouldRespectBatchSizes()} test cannot: a drain loop that fails to
-     * honour the timeout window would flush each trickled event in its own tiny
-     * batch, so no batch would ever coalesce many of them.
-     */
-    @Test
-    void should_coalesceTrickleWithinTimeoutWindow_when_eventsArriveSlowly() throws InterruptedException {
-        final int EVENTS = 60;
-        final long GAP_MS = 3;      // well inside the timeout window
-        final int BATCH_SIZE = 500; // large, so batchSize never bounds a trickle
-        final long TIMEOUT_MS = 50; // the max allowed window
+    /** Operations whose first write blocks until released, to hold a batch "in flight". */
+    static final class GatedOperations implements TransactionalOperations<String> {
+        final CountDownLatch firstWriteStarted = new CountDownLatch(1);
+        final CountDownLatch releaseFirstWrite = new CountDownLatch(1);
+        final List<List<String>> batches = new CopyOnWriteArrayList<>();
 
-        SpyOperations spy = new SpyOperations();
-        NaturalBatchingDispatcher<String> dispatcher = new NaturalBatchingDispatcher<>(BATCH_SIZE, TIMEOUT_MS);
-        BatchingPersistenceRunner<String> runner = runner(spy, dispatcher, BATCH_SIZE, TIMEOUT_MS);
-
-        // A single slow producer: one event every GAP_MS. At ~3ms spacing, a
-        // correct 50ms window should sweep up roughly a dozen events per batch.
-        for (int i = 0; i < EVENTS; i++) {
-            runner.enqueue(PersistenceRunner.newEvent("e-" + i));
-            Thread.sleep(GAP_MS);
+        @Override
+        public void persistOnTransaction(List<String> batch) {
+            batches.add(List.copyOf(batch));
+            if (batches.size() == 1) {
+                firstWriteStarted.countDown();
+                try {
+                    releaseFirstWrite.await();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
         }
 
-        // All events must eventually land...
-        await().atMost(Duration.ofSeconds(30))
-                .untilAsserted(() -> assertEquals(EVENTS, spy.flushed.get(),
-                        "all trickled events must be flushed"));
+        @Override
+        public long onPoisonPill(String event, long currentToken, Exception cause) {
+            return currentToken;
+        }
+    }
 
-        // ...and natural batching must have coalesced the trickle: at least one
-        // batch holds several events (far more than the ~1-2 a non-waiting drain
-        // loop could ever gather under this spacing).
-        int largestBatch = spy.flushes.stream().mapToInt(Integer::intValue).max().orElse(0);
-        assertTrue(largestBatch >= 5,
-                "timeout window must coalesce a trickle into a batch of several events, but the largest batch was "
-                        + largestBatch + " (flushes=" + spy.flushes + ")");
+    /**
+     * Natural batching never waits for more events: a lone event is written
+     * immediately, and the events that arrive while that write is in flight form
+     * the next batch together.
+     */
+    @Test
+    void should_persistImmediately_andBatchWhatArrivesDuringAWrite() throws InterruptedException {
+        GatedOperations ops = new GatedOperations();
+        BatchingPersistenceRunner<String> runner = runner(ops, new NaturalBatchingDispatcher<>(500), 500);
+
+        // A lone event is written on its own, without waiting for company.
+        runner.enqueue(PersistenceRunner.newEvent("first"));
+        assertTrue(ops.firstWriteStarted.await(5, TimeUnit.SECONDS), "a lone event must be persisted immediately");
+        assertEquals(List.of(List.of("first")), ops.batches, "the first batch holds only the lone event");
+
+        // While that write is in flight, more events accumulate in the buffer...
+        for (int i = 0; i < 10; i++) {
+            runner.enqueue(PersistenceRunner.newEvent("e-" + i));
+        }
+        ops.releaseFirstWrite.countDown();
+
+        // ...and are written together as the next natural batch.
+        await().atMost(Duration.ofSeconds(5)).untilAsserted(() -> assertEquals(2, ops.batches.size()));
+        assertEquals(10, ops.batches.get(1).size(), "events buffered during a write form one batch");
     }
 
 // -----------------------------------------------------------------------
@@ -166,8 +173,8 @@ public class NaturalBatchingDispatcherTest {
         final int TOTAL = THREADS * EVENTS_EACH;
 
         SpyOperations spy = new SpyOperations();
-        NaturalBatchingDispatcher<String> dispatcher = new NaturalBatchingDispatcher<>(20, 5);
-        BatchingPersistenceRunner<String> runner = runner(spy, dispatcher, 20, 5);
+        NaturalBatchingDispatcher<String> dispatcher = new NaturalBatchingDispatcher<>(20);
+        BatchingPersistenceRunner<String> runner = runner(spy, dispatcher, 20);
 
         CountDownLatch gate = new CountDownLatch(1);
         CountDownLatch done = new CountDownLatch(THREADS);

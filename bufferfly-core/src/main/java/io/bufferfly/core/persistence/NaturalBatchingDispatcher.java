@@ -1,8 +1,6 @@
 package io.bufferfly.core.persistence;
 
 import io.bufferfly.core.metrics.BufferflyMetrics;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -10,8 +8,8 @@ import java.util.Optional;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.FutureTask;
 import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -20,10 +18,12 @@ import java.util.concurrent.atomic.AtomicReference;
  * using <em>natural batching</em> and executes them on a virtual thread.
  *
  * <h2>Natural batching</h2>
- * The consume loop drains up to {@code batchSize} events <em>or</em> waits up
- * to {@code timeoutMs} milliseconds — whichever comes first. Under high load
- * the batch is always full, maximising bulk-write efficiency. Under low load
- * the timeout ensures data is never held back indefinitely.
+ * A batch starts as soon as events are buffered and is completed as soon as
+ * {@code batchSize} is reached or the buffer is empty — it never waits for more
+ * events. While a batch is being persisted, new events accumulate in the
+ * buffer and form the next batch. Under load batches fill up to
+ * {@code batchSize}; under light load each event is written as soon as the
+ * previous batch commits.
  *
  * <h2>Thread-safety / single-writer guarantee</h2>
  * {@link #tryConsumeSafely} uses an {@link AtomicBoolean} as a mutex: the
@@ -47,18 +47,18 @@ import java.util.concurrent.atomic.AtomicReference;
  */
 public class NaturalBatchingDispatcher<E> implements PersistenceDispatcher<E> {
 
-    private static final Logger log = LoggerFactory.getLogger(NaturalBatchingDispatcher.class);
+    /** Default label for this dispatcher's buffer-depth gauge. */
+    public static final String DEFAULT_COMPONENT_NAME = "bufferfly-persistence";
 
     private final int batchSize;
-    private final long timeoutMs;
 
     private final LinkedBlockingQueue<PersistenceRunner.PersistenceEvent<E>> buffer = new LinkedBlockingQueue<>(Integer.MAX_VALUE);
     private final ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
     private final AtomicBoolean scheduled = new AtomicBoolean(false);
     private final AtomicReference<Future<?>> runningTask = new AtomicReference<>(null);
 
-    public NaturalBatchingDispatcher(int batchSize, long timeoutMs) {
-        this(batchSize, timeoutMs, BufferflyMetrics.NOOP);
+    public NaturalBatchingDispatcher(int batchSize) {
+        this(batchSize, BufferflyMetrics.NOOP);
     }
 
     /**
@@ -68,36 +68,29 @@ public class NaturalBatchingDispatcher<E> implements PersistenceDispatcher<E> {
      * name {@value #DEFAULT_COMPONENT_NAME}.
      *
      * @param batchSize maximum events coalesced per batch
-     * @param timeoutMs natural-batching window in milliseconds (1..50)
      * @param metrics   observability sink; {@link BufferflyMetrics#NOOP} to disable
      */
-    public NaturalBatchingDispatcher(int batchSize, long timeoutMs, BufferflyMetrics metrics) {
-        this(batchSize, timeoutMs, metrics, DEFAULT_COMPONENT_NAME);
+    public NaturalBatchingDispatcher(int batchSize, BufferflyMetrics metrics) {
+        this(batchSize, metrics, DEFAULT_COMPONENT_NAME);
     }
 
     /**
-     * Full constructor: as {@link #NaturalBatchingDispatcher(int, long, BufferflyMetrics)}
+     * Full constructor: as {@link #NaturalBatchingDispatcher(int, BufferflyMetrics)}
      * but with a caller-supplied {@code componentName} used to label the
      * buffer-depth gauge, so several dispatchers can be told apart.
      *
      * @param batchSize     maximum events coalesced per batch
-     * @param timeoutMs     natural-batching window in milliseconds (1..50)
      * @param metrics       observability sink; {@link BufferflyMetrics#NOOP} to disable
      * @param componentName label for the buffer-depth gauge
      */
-    public NaturalBatchingDispatcher(int batchSize, long timeoutMs, BufferflyMetrics metrics, String componentName) {
+    public NaturalBatchingDispatcher(int batchSize, BufferflyMetrics metrics, String componentName) {
         if (batchSize < 1) throw new IllegalArgumentException("batchSize must be >= 1");
-        if (timeoutMs < 1 || timeoutMs > 50) throw new IllegalArgumentException("timeoutMs must be >= 1 AND <= 50 ms");
         this.batchSize = batchSize;
-        this.timeoutMs = timeoutMs;
         BufferflyMetrics m = metrics == null ? BufferflyMetrics.NOOP : metrics;
         // Register the buffer-depth gauge once; the backend pulls size() itself.
         m.registerPersistenceBufferDepth(
                 componentName == null ? DEFAULT_COMPONENT_NAME : componentName, this::size);
     }
-
-    /** Default label for this dispatcher's buffer-depth gauge. */
-    public static final String DEFAULT_COMPONENT_NAME = "bufferfly-persistence";
 
     @Override
     public void enqueue(PersistenceRunner.PersistenceEvent<E> event, PersistenceRunner<E> runner) {
@@ -123,42 +116,29 @@ public class NaturalBatchingDispatcher<E> implements PersistenceDispatcher<E> {
         if (!scheduled.compareAndSet(false, true)) {
             return; // another thread is already scheduled or running
         }
-        Future<?> task = executor.submit(() -> consumeLoop(runner));
+        final FutureTask<Void> task = new FutureTask<>(() -> {
+            consumeLoop(runner);
+            return null;
+        });
         runningTask.set(task);
+        executor.submit(task);
     }
 
     private void consumeLoop(PersistenceRunner<E> runner) {
         try {
-            List<PersistenceRunner.PersistenceEvent<E>> batch = drainBatch();
+            List<PersistenceRunner.PersistenceEvent<E>> batch = new ArrayList<>(batchSize);
+            buffer.drainTo(batch, batchSize);
             if (!batch.isEmpty()) {
                 runner.persistBatch(batch);
             }
-        } catch (InterruptedException e) {
-            log.warn("Natural-batching consume loop interrupted while draining; stopping this drain cycle");
-            Thread.currentThread().interrupt();
-            return;
         } finally {
             runningTask.set(null);
             scheduled.set(false);
         }
-        // Double-check: events may have arrived between the last buffer.poll()
-        // and the scheduled.set(false) above. If so, reschedule immediately.
+        // Events may have arrived while the batch was persisted, or after the
+        // drain and before scheduled.set(false). If so, reschedule immediately.
         if (!buffer.isEmpty()) {
             tryConsumeSafely(runner);
         }
     }
-
-    private List<PersistenceRunner.PersistenceEvent<E>> drainBatch() throws InterruptedException {
-        List<PersistenceRunner.PersistenceEvent<E>> batch = new ArrayList<>(batchSize);
-        long deadline = System.currentTimeMillis() + timeoutMs;
-        while (System.currentTimeMillis() < deadline && batch.size() < batchSize) {
-            long nextTimeout = Math.max(deadline - System.currentTimeMillis(), 0L);
-            PersistenceRunner.PersistenceEvent<E> head = buffer.poll(nextTimeout, TimeUnit.MILLISECONDS);
-            if (head != null) {
-                batch.add(head);
-            }
-        }
-        return batch;
-    }
-
 }

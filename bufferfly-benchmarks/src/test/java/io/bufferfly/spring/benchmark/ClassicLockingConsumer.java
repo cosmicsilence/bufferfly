@@ -2,11 +2,10 @@ package io.bufferfly.spring.benchmark;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.bufferfly.spring.ledger.AddToAccount;
-import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
-import org.apache.kafka.common.serialization.StringDeserializer;
+import org.apache.kafka.common.TopicPartition;
 
 import java.time.Duration;
 import java.util.List;
@@ -23,8 +22,9 @@ import java.util.concurrent.locks.ReentrantLock;
 /**
  * The <b>classic</b> approach: the pipeline BufferFly is designed to replace.
  *
- * <p>For each of the {@code topics}, one {@link KafkaConsumer} polls records and
- * dispatches them to a fixed thread pool of {@link #THREADS_PER_TOPIC} workers.
+ * <p>For each partition of the topic, one {@link KafkaConsumer} (assigned that
+ * partition) polls records and dispatches them to a fixed thread pool of
+ * {@link #THREADS_PER_PARTITION} workers.
  * Each worker computes the account's new balance <b>under a per-account
  * {@link ReentrantLock}</b> (the lock-based substitute for the actor's
  * single-writer discipline) and persists the change in a <b>single tiny
@@ -44,10 +44,11 @@ import java.util.concurrent.locks.ReentrantLock;
  */
 public final class ClassicLockingConsumer implements AutoCloseable {
 
-    public static final int THREADS_PER_TOPIC = 7;
+    public static final int THREADS_PER_PARTITION = 7;
 
     private final String bootstrapServers;
-    private final List<String> topics;
+    private final String topic;
+    private final int partitions;
     private final String groupId;
     private final PgLedgerStore store;
     private final ObjectMapper mapper = new ObjectMapper();
@@ -61,32 +62,35 @@ public final class ClassicLockingConsumer implements AutoCloseable {
     private final List<ExecutorService> pools = new java.util.concurrent.CopyOnWriteArrayList<>();
     private final List<KafkaConsumer<String, String>> consumers = new java.util.concurrent.CopyOnWriteArrayList<>();
 
-    public ClassicLockingConsumer(String bootstrapServers, List<String> topics, String groupId, PgLedgerStore store) {
+    public ClassicLockingConsumer(String bootstrapServers, String topic, int partitions, String groupId,
+                                  PgLedgerStore store) {
         this.bootstrapServers = bootstrapServers;
-        this.topics = List.copyOf(topics);
+        this.topic = topic;
+        this.partitions = partitions;
         this.groupId = groupId;
         this.store = store;
     }
 
     /**
-     * Starts one poll thread + 7-thread worker pool per topic and processes
+     * Starts one poll thread + 7-thread worker pool per partition and processes
      * until {@code expectedTotal} messages have been persisted.
      *
-     * @param expectedTotal messages to wait for across all topics
+     * @param expectedTotal messages to wait for across all partitions
      * @return milliseconds from start to all persisted
      */
     public long runUntil(long expectedTotal) throws InterruptedException {
         CountDownLatch done = new CountDownLatch(1);
         long start = System.nanoTime();
 
-        for (String topic : topics) {
-            ExecutorService pool = Executors.newFixedThreadPool(THREADS_PER_TOPIC);
+        for (int p = 0; p < partitions; p++) {
+            ExecutorService pool = Executors.newFixedThreadPool(THREADS_PER_PARTITION);
             pools.add(pool);
             KafkaConsumer<String, String> consumer = newConsumer();
-            consumer.subscribe(List.of(topic));
+            consumer.assign(List.of(new TopicPartition(topic, p)));
             consumers.add(consumer);
 
-            Thread poll = new Thread(() -> pollLoop(consumer, pool, expectedTotal, done), "classic-poll-" + topic);
+            Thread poll = new Thread(() -> pollLoop(consumer, pool, expectedTotal, done),
+                    "classic-poll-" + topic + "-" + p);
             poll.start();
             pollThreads.add(poll);
         }
@@ -140,15 +144,7 @@ public final class ClassicLockingConsumer implements AutoCloseable {
     }
 
     private KafkaConsumer<String, String> newConsumer() {
-        Map<String, Object> props = new java.util.HashMap<>();
-        props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
-        props.put(ConsumerConfig.GROUP_ID_CONFIG, groupId);
-        props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
-        props.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, true);
-        props.put(ConsumerConfig.MAX_POLL_RECORDS_CONFIG, 500);
-        props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
-        props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
-        return new KafkaConsumer<>(props);
+        return BenchmarkConsumers.newConsumer(bootstrapServers, groupId, true);
     }
 
     public long processed() {

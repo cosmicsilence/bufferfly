@@ -90,9 +90,9 @@ class PersistenceRunnerShutdownTest {
         // batchSize 1 so the very first enqueued event forms a batch and enters
         // persistOnTransaction (where it blocks), leaving later events buffered.
         // Use an explicit dispatcher instance so we can observe its buffer size().
-        NaturalBatchingDispatcher<String> dispatcher = new NaturalBatchingDispatcher<>(1, 5L);
+        NaturalBatchingDispatcher<String> dispatcher = new NaturalBatchingDispatcher<>(1);
         PersistenceConfig<String> config = PersistenceConfig.builder(ops)
-                .batchSize(1).timeoutMs(5L).maxRetries(0).dispatcher(dispatcher).build();
+                .batchSize(1).maxRetries(0).dispatcher(dispatcher).build();
         StringActor actor = new StringActor("shutdown-actor-" + UUID.randomUUID(), config);
         ref = manager.start(actor);
 
@@ -136,7 +136,7 @@ class PersistenceRunnerShutdownTest {
         BlockingOps ops = new BlockingOps();
         ops.release.countDown(); // don't block; this test is only about post-stop enqueue
         PersistenceConfig<String> config = PersistenceConfig.builder(ops)
-                .batchSize(10).timeoutMs(5L).maxRetries(0).build();
+                .batchSize(10).maxRetries(0).build();
         StringActor actor = new StringActor("reject-actor-" + UUID.randomUUID(), config);
         ActorReference<String> local = manager.start(actor);
         BatchingPersistenceRunner<String> runner = (BatchingPersistenceRunner<String>) actor.runner();
