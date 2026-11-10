@@ -563,7 +563,7 @@ class ShardedActorContainerTest {
     /**
      * Behavior contract: a restart performs, <b>in order</b>, pause → (stop old)
      * → start a fresh actor (which rewinds) → resume. During the window between
-     * stop and the fresh actor rewinding, records are discarded (un-acked). This
+     * stop and the fresh actor rewinding, records are discarded (not delivered, not committed). This
      * is asserted purely through observable seams.
      */
     @Test
