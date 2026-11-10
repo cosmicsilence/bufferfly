@@ -333,11 +333,11 @@ so the commit/WAL cost of the per-row path is visible next to the actor's bulk t
 
 | Metric | Actor + natural batching | 15 virtual threads, one INSERT per row | Advantage |
 | :--- | :---: | :---: | :---: |
-| **time for 100,000 rows** | **~1,060 ms** | ~12,334 ms | **~11.6× faster** |
-| **throughput** | **~94,300 rows/s** | ~8,110 rows/s | **~11.6×** |
-| **pg `xact_commit`** | **499** (103 bulk tx) | 97,753 | **~196× fewer commits** |
-| pg `wal_records` | 93,550 | 403,869 | ~4.3× fewer |
-| **pg `wal_bytes`** | **9,103,464** | 33,055,427 | **~3.6× less WAL** |
+| **time for 100,000 rows** | **~1,155 ms** | ~12,219 ms | **~10.6× faster** |
+| **throughput** | **~86,500 rows/s** | ~8,180 rows/s | **~10.6×** |
+| **pg `xact_commit`** | **476** (103 bulk tx) | 98,505 | **~207× fewer commits** |
+| pg `wal_records` | 87,457 | 412,117 | ~4.7× fewer |
+| **pg `wal_bytes`** | **8,484,851** | 33,862,017 | **~4.0× less WAL** |
 
 The actor coalesces the 100,000 writes into ~103 bulk transactions, turning per-row transaction
 overhead (begin/commit + WAL flush) into a near-constant cost — exactly the pain described above,
@@ -346,7 +346,7 @@ measured against a real database.
 > ⚠️ **About these numbers.** Postgres runs on the **same machine** as the test, so the network
 > round-trip per transaction is near-zero — which *understates* the advantage. Over a network to a
 > managed database, where each commit costs a real round-trip and holds a pooled connection,
-> collapsing ~98k commits into ~500 is far more dramatic than the ~11.6× seen here. Treat this as a
+> collapsing ~98k commits into ~500 is far more dramatic than the ~10.6× seen here. Treat this as a
 > conservative lower bound that isolates the batching effect itself. Absolute figures vary with
 > hardware, JVM warmup, and Docker overhead.
 
@@ -357,19 +357,19 @@ measured against a real database.
 
 `PostgresKafkaLedgerBenchmarkTest` takes the batching story to a **real database**: a BufferFly
 actor pipeline and a classic locking consumer ingest the **same** Kafka workload —
-**150,000 messages over 3 topics** — into the **same real Postgres**, on throwaway Docker containers
+**150,000 messages on one topic with 3 partitions, keyed by account** — into the **same real Postgres**, on throwaway Docker containers
 via Testcontainers. Both write through the **same HikariCP pool** and the same schema, so the only
 variable is *how* each drives the database. Beyond wall-clock it captures Postgres's own
 `pg_stat_database.xact_commit` and `pg_stat_wal` counters. Both must persist every message exactly
 once with identical balances — same result, very different DB cost.
 
-| Metric | Classic (7 threads/topic, 1 tx/msg) | Actor (natural batching) | Advantage |
+| Metric | Classic (7 threads/partition, 1 tx/msg) | Actor (natural batching) | Advantage |
 | :--- | :---: | :---: | :---: |
-| **end-to-end time** | 92,819 ms | **3,285 ms** | **28.3× faster** |
-| **throughput** | ~1,616 msg/s | **~45,662 msg/s** | **28.3×** |
-| **pg `xact_commit`** | 149,237 | **447** | **≈334× fewer commits** |
-| pg `wal_records` | 1,533,179 | 853,899 | ~1.80× fewer |
-| **pg `wal_bytes`** | 108,944,531 | **67,509,478** | **~1.61× less WAL** |
+| **end-to-end time** | 98,050 ms | **3,453 ms** | **28.4× faster** |
+| **throughput** | ~1,530 msg/s | **~43,440 msg/s** | **28.4×** |
+| **pg `xact_commit`** | 149,269 | **512** | **≈292× fewer commits** |
+| pg `wal_records` | 1,530,328 | 720,263 | ~2.1× fewer |
+| **pg `wal_bytes`** | 106,938,138 | **54,968,827** | **~1.9× less WAL** |
 
 The classic path pays a full `BEGIN`/`COMMIT` + WAL flush **per message**; the actor collapses
 ~149k commits into a few hundred fat ones. This comparison shows the value of **batching**, not of
@@ -380,29 +380,30 @@ the actor model specifically: the next benchmark gives the conventional design b
 A one-transaction-per-message baseline is easy to beat. `PostgresKafkaBatchLedgerBenchmarkTest`
 pits the actor against the strongest conventional design built from standard building blocks:
 `LockingBatchLedgerConsumer` keeps balances **in memory under per-account `ReentrantLock`s** (7 worker
-threads per topic) and writes each Kafka poll in **one synchronous bulk transaction** before the next
+threads per partition) and writes each Kafka poll in **one synchronous bulk transaction** before the next
 poll, then `commitSync`s the offsets. Both poll 500 records at a time and issue the identical change
 insert and balance upsert as JDBC batches.
 
-It runs **three key distributions**, 600,000 messages each over 3 topics, 5 rounds alternating which
-approach runs first, and reports medians. It also counts lock acquisitions that had to wait, and
+It runs **three key distributions**, 600,000 messages each on one topic with 3 partitions, 5 rounds
+alternating which approach runs first, and reports medians. It also counts lock acquisitions that had to wait, and
 change rows whose recorded balance is out of Kafka-offset order (the lock consumer's workers can
 apply one account's updates in a different order than they were produced; the actor never does).
 
 | Key distribution | Locking batch | Actor (batch 500) | Actor speed | Contended locks | Out-of-order rows |
 | :--- | ---: | ---: | ---: | ---: | ---: |
-| round-robin, 500 accounts/topic | **15,126 ms** | 18,597 ms | 0.81× | 0 | 0 |
-| shuffled, 500 accounts/topic | 15,591 ms | **13,119 ms** | **1.19×** | 175 | 1,124 |
-| shuffled, 10 accounts/topic (hot keys) | 11,358 ms | **8,795 ms** | **1.29×** | 6,911 | 51,441 |
+| round-robin, 1,500 accounts | 15,870 ms | **14,790 ms** | **1.07×** | 0 | 0 |
+| shuffled, 1,500 accounts | **13,078 ms** | 13,663 ms | 0.96× | 195 | 1,166 |
+| shuffled, 30 accounts (hot keys) | **7,570 ms** | 9,167 ms | 0.83× | 7,982 | 53,596 |
 
-- **Database cost is the same.** Both commit about once per 500 messages (~1,200–1,250 commits) and
+- **Database cost is the same.** Both commit about once per 500 messages (~1,200–1,240 commits) and
   write the same WAL. Once the conventional design batches, the database does the same work.
-- **The database write dominates both.** Each side spends ~65–98% of its time inside a transaction
+- **The database write dominates both.** Each side spends ~75–93% of its time inside a transaction
   and ~2–5% on in-memory work, so lock-free memory and overlapped fetching can only win a few
   percent here.
-- **Results are noisy.** Single rounds of the same configuration vary by up to ~40%; treat gaps under
-  ~20% as noise. With the actor's batch size lowered to 250 (polls stay at 500) the actor commits
-  twice as often and the outcome flips (1.11×, 0.92×, 0.93×), which is also within the noise.
+- **Results are noisy.** Single rounds of the same configuration vary by up to ~35%, and the lock
+  consumer's round-robin median was 15.9 s in this run and 9.7 s in the next with identical
+  settings; treat gaps under ~20% as noise. With the actor's batch size lowered to 250 (polls stay
+  at 500) the actor commits twice as often and came out at 0.91×, 0.85× and 0.80×.
 - **What the actor adds** over a well-built batch consumer is structural: no locks, offset-ordered
   state per partition, per-partition backpressure, and supervised restart with offset rewind.
 
@@ -419,33 +420,74 @@ for the setup, the time breakdown and per-batch-size results.
 > `./gradlew :bufferfly-benchmarks:benchmarks --tests '*PostgresKafkaLedgerBenchmarkTest*'`
 > `./gradlew :bufferfly-benchmarks:benchmarks --tests '*PostgresKafkaBatchLedgerBenchmarkTest*'`
 
+### 📊 Real Postgres + Kafka: sharded actors vs. Apache Flink
+
+`FlinkVsShardedActorLedgerBenchmarkTest` runs the ledger through **Apache Flink 2.2.1** in its
+standard form — `KafkaSource` → `keyBy(account)` → `KeyedProcessFunction` with the balance in keyed
+`ValueState` → `JdbcSink` in batches of 500 — and through BufferFly's `ShardedActorContainer` with a
+persistent actor per partition and natural batching up to 500. Same topic, tables and batch size;
+state in memory on both sides; Flink defaults otherwise (local environment, checkpointing off).
+
+600,000 messages per scenario, medians of 3 rounds, steady-state time:
+
+| Key distribution | BufferFly (3 writers) | Flink, parallelism 3 | Flink, default (22) |
+| :--- | ---: | ---: | ---: |
+| round-robin, 1,500 accounts | 17,063 ms | 13,934 ms | **6,736 ms** |
+| shuffled, 1,500 accounts | 12,574 ms | 13,875 ms | **6,107 ms** |
+| shuffled, 30 accounts (hot keys) | 9,092 ms | 12,481 ms | **6,617 ms** |
+
+- **Same number of writers:** BufferFly and Flink at parallelism 3 are close with 1,500 accounts
+  (one each way), and BufferFly is ~1.4× faster with hot keys. The cause of Flink's hot-key result
+  is not measured; it is not key skew (the 30 keys split 12 / 11 / 7 over its 3 subtasks).
+- **Flink's default parallelism** writes over 22 connections against BufferFly's 3 (one per
+  partition), and was fastest in every scenario of this run.
+- **Database cost:** BufferFly commits about half as often (~1,150–1,200 vs ~2,400–2,500) and
+  writes up to ~30% less WAL with hot keys, because it upserts each account once per batch instead
+  of once per change.
+- **Noisy run.** The machine was busier than in an earlier run of the same code, where every
+  contender was 30–50% faster (BufferFly 9.8 / 10.8 / 7.1 s, Flink p3 9.2 / 10.4 / 10.9 s, Flink
+  default 3.6 / 3.4 / 5.1 s); the ranking was the same except that BufferFly led Flink p3 on
+  shuffled keys only in the latest run.
+- **Correctness:** every run persists each change exactly once, with exact balances and no change
+  out of offset order. Partitions move between the 3 consumers once at start-up while the group
+  forms; BufferFly's actors reload their partition's state and offset in `preStart`, so this is
+  lossless.
+
+See the [`bufferfly-spring-kafka` README](bufferfly-spring-kafka/README.md#-benchmark-sharded-actors-vs-apache-flink-keyed-state--jdbc-sink)
+for the setup, the database counters and what is not compared (checkpointing, exactly-once sinks,
+RocksDB, a real Flink cluster).
+
+> Run it yourself (requires Docker; skips cleanly without it):
+> `./gradlew :bufferfly-benchmarks:benchmarks --tests '*FlinkVsShardedActorLedgerBenchmarkTest*'`
+
 ### 📊 Firehose: actor dispatch throughput
 
-End-to-end processing of a burst of 5,000,000 messages to a single target actor path
+End-to-end processing of a burst of 15,000,000 messages to a single target actor path
 (`DispatcherComparisonBenchmarkTest`):
 
 | Upstream Producers | bufferfly-core<br>*(Virtual Threads)* | bufferfly-cpu-bound<br>*(Hardware-Pinned Core)* | Speedup |
 | :--- | :---: | :---: | :---: |
-| **1 producer**   | ~5.5M msg/s | **⚡ 14.25M msg/s** | **2.59×** |
-| **10 producers** | ~4.8M msg/s | **⚡ 12.68M msg/s** | **2.64×** |
-| **50 producers** | ~4.4M msg/s | **⚡ 13.82M msg/s** | **3.14×** |
+| **1 producer**   | ~5.5M msg/s | **⚡ 14.9M msg/s** | **2.71×** |
+| **10 producers** | ~3.3M msg/s | **⚡ 13.9M msg/s** | **4.17×** |
+| **50 producers** | ~2.8M msg/s | **⚡ 11.0M msg/s** | **3.97×** |
 
-> Single-producer pipelines frequently cross **15M msg/s** on the spinning engine because
-> hardware cache-line invalidation is eliminated.
+> A single producer gets closest to **15M msg/s** on the spinning engine, because no other
+> producer contends for the mailbox's cache line.
 
 ### 📦 bufferfly-core — the virtual thread engine
 
 - **Blueprint:** a `VTDispatcher` with a bounded `LinkedBlockingQueue` mailbox per actor, handing
   execution to the JVM's virtual-thread carrier pool. One single-consumer slot per actor guarantees
   the single-threaded-actor invariant.
-- **Ceiling:** ~4.5M–5.5M msg/s, bounded by virtual-thread continuation and stack-frame overhead.
+- **Ceiling:** ~2.8M–5.5M msg/s (more producers, lower), bounded by virtual-thread continuation and
+  stack-frame overhead.
 - **Idle cost:** ~zero. Thousands of actors co-exist with no dedicated threads and no busy-spin.
 - **Best for:** business state machines, webhook ingestion, and standard Kafka partition processing.
 
 ### 🏎️ bufferfly-cpu-bound — the hardware-pinned spinning engine
 
 - **The 15M mark:** a core-pinned infinite busy-spin thread (`SpinningActorDispatcher`) over a
-  JCTools MPSC `LOCK XADD` mailbox eliminates the CAS-retry cliff, reaching 14.25M+ msg/s.
+  JCTools MPSC `LOCK XADD` mailbox eliminates the CAS-retry cliff, reaching ~11M–15M msg/s.
 - **Self-healing affinity:** an amortized bitwise-mask counter (`& 0xFFFF`) re-checks core placement
   once every 65,536 cycles; if the OS migrates the thread it snaps back to its original core with no
   heavy JNI overhead.

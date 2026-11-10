@@ -155,16 +155,21 @@ public final class PgLedgerStore {
      * change per account carries its final balance. The fencing offset is
      * advanced by the actor's {@code FencingOffsetRepository} in the same (outer)
      * transaction, so it is not touched here.
+     *
+     * @return change rows actually inserted (a replayed change already stored is
+     *         skipped and not counted)
      */
-    public void applyBatch(List<PgLedgerChange> batch) {
-        if (batch == null || batch.isEmpty()) return;
+    public int applyBatch(List<PgLedgerChange> batch) {
+        if (batch == null || batch.isEmpty()) return 0;
 
         Map<String, Long> finalBalances = new LinkedHashMap<>();
         batch.forEach(c -> finalBalances.put(c.accountNumber(), c.resultingBalance()));
-        tx.executeWithoutResult(status -> {
-            insertChanges(batch);
+        Integer inserted = tx.execute(status -> {
+            int rows = insertChanges(batch);
             upsertBalances(finalBalances);
+            return rows;
         });
+        return inserted == null ? 0 : inserted;
     }
 
     /**
@@ -195,8 +200,8 @@ public final class PgLedgerStore {
     private record PartitionKey(String topic, int partition) {
     }
 
-    private void insertChanges(List<PgLedgerChange> changes) {
-        jdbc.batchUpdate("""
+    private int insertChanges(List<PgLedgerChange> changes) {
+        int[] counts = jdbc.batchUpdate("""
                         INSERT INTO %s (account_number, amount, resulting_balance, topic, partition, offset_value)
                         VALUES (?, ?, ?, ?, ?, ?)
                         ON CONFLICT (topic, partition, offset_value) DO NOTHING
@@ -206,6 +211,11 @@ public final class PgLedgerStore {
                                 c.accountNumber(), c.amount(), c.resultingBalance(),
                                 c.topic(), c.partition(), c.offset()})
                         .toList());
+        int inserted = 0;
+        for (int count : counts) {
+            inserted += Math.max(count, 0);
+        }
+        return inserted;
     }
 
     private void upsertBalances(Map<String, Long> balances) {
@@ -251,6 +261,26 @@ public final class PgLedgerStore {
     public int distinctAccounts() {
         Integer n = jdbc.queryForObject("SELECT COUNT(*) FROM " + balanceTable, Integer.class);
         return n == null ? 0 : n;
+    }
+
+    /**
+     * Each account's latest stored balance among the changes of one partition —
+     * the state an actor owning the partition starts from after a
+     * (re)assignment. Changes are written in the same transaction as the fencing
+     * offset, so this matches the stored offset.
+     */
+    public Map<String, Long> balancesForPartition(String topic, int partition) {
+        Map<String, Long> balances = new LinkedHashMap<>();
+        jdbc.query("""
+                        SELECT DISTINCT ON (account_number) account_number, resulting_balance
+                          FROM %s
+                         WHERE topic = ? AND partition = ?
+                         ORDER BY account_number, offset_value DESC
+                        """.formatted(changeTable),
+                (org.springframework.jdbc.core.RowCallbackHandler) rs ->
+                        balances.put(rs.getString(1), rs.getLong(2)),
+                topic, partition);
+        return balances;
     }
 
     /** @return how many accounts have a stored balance different from {@code expected}. */

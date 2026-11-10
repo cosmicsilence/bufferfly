@@ -10,6 +10,7 @@ standard build/test lifecycle — run explicitly with the `benchmarks` task.'''
 //   * PostgresKafkaLedgerBenchmarkTest       (spring-kafka: actor vs per-message consumer)
 //   * PostgresKafkaBatchLedgerBenchmarkTest  (spring-kafka: actor vs batching locking consumer)
 //   * ShardedActorContainerThroughputBenchmarkTest (spring-kafka: container poll -> route -> commit, no DB)
+//   * FlinkVsShardedActorLedgerBenchmarkTest (spring-kafka: sharded actors vs Apache Flink keyed state + JDBC sink)
 //
 // The benchmarks are long-running and Docker-dependent, so they MUST NOT run on
 // `./gradlew build` or `./gradlew test`. The standard `test` task is therefore
@@ -54,6 +55,14 @@ dependencies {
     testImplementation 'com.fasterxml.jackson.core:jackson-databind'
     testImplementation 'org.testcontainers:testcontainers-kafka'
 
+    // --- Flink benchmark (keyed-state ledger vs sharded actors) ---
+    // Connector versions are the ones built for Flink 2.2.
+    testImplementation 'org.apache.flink:flink-streaming-java:2.2.1'
+    testImplementation 'org.apache.flink:flink-clients:2.2.1'
+    testImplementation 'org.apache.flink:flink-connector-base:2.2.1'
+    testImplementation 'org.apache.flink:flink-connector-kafka:5.0.0-2.2'
+    testImplementation 'org.apache.flink:flink-connector-jdbc-core:4.1.0-2.2'
+
     // Console SLF4J binding so framework logs are visible while benchmarking.
     testRuntimeOnly('org.slf4j:slf4j-simple:2.0.+') {
         because "Spring Boot BOM strips out wildcards for SLF4J modules"
@@ -65,6 +74,11 @@ configurations.all {
         eachDependency { DependencyResolveDetails details ->
             if (details.requested.group == 'org.slf4j') {
                 details.useVersion '2.0.+'
+            }
+            // The Flink Kafka connector asks for a newer kafka-clients; keep the
+            // one the framework ships with so every benchmark uses the same client.
+            if (details.requested.group == 'org.apache.kafka' && details.requested.name == 'kafka-clients') {
+                details.useVersion '4.1.2'
             }
         }
     }
@@ -93,7 +107,12 @@ tasks.register('benchmarks', Test) {
     description = 'Runs the BufferFly performance benchmarks (long-running, Docker-dependent).'
 
     testClassesDirs = sourceSets.test.output.classesDirs
-    classpath = sourceSets.test.runtimeClasspath
+    // Flink's JDBC connector needs openlineage-sql-java, which bundles an old,
+    // unshaded copy of commons-lang3. Put the real commons-lang3 jar first so
+    // Testcontainers (via commons-compress) does not load the old classes.
+    def runtime = sourceSets.test.runtimeClasspath
+    classpath = runtime.filter { it.name.startsWith('commons-lang3-') } +
+            runtime.filter { !it.name.startsWith('commons-lang3-') }
 
     useJUnitPlatform()
     include '**/*BenchmarkTest.class'

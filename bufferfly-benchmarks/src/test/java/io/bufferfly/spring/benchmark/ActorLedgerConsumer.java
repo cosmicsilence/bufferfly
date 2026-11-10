@@ -8,6 +8,7 @@ import io.bufferfly.spring.ledger.AddToAccount;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
+import org.apache.kafka.common.TopicPartition;
 
 import java.time.Duration;
 import java.util.List;
@@ -15,13 +16,14 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * The <b>BufferFly actor</b> approach: the same 3 topics are consumed, but each
- * (topic, partition) is owned by a single {@link PgLedgerActor}. The actor keeps
+ * The <b>BufferFly actor</b> approach: the same topic is consumed, one consumer
+ * per partition, and each (topic, partition) is owned by a single
+ * {@link PgLedgerActor}. The actor keeps
  * the running balance in memory (single-writer, no locks) and streams changes to
  * Postgres through the natural-batching persistence runner, which coalesces many
  * messages into one bulk transaction.
  *
- * <p>Kafka records are polled on a thread per topic and routed to the owning
+ * <p>Kafka records are polled on a thread per partition and routed to the owning
  * actor via its {@link ActorReference#tell}. The actor's mailbox absorbs the
  * burst; the {@code BatchingPersistenceRunner} drains it into fat transactions.
  * One commit covers up to {@code batchSize} messages, so WAL/commit pressure on
@@ -30,7 +32,8 @@ import java.util.concurrent.ConcurrentHashMap;
 public final class ActorLedgerConsumer implements AutoCloseable {
 
     private final String bootstrapServers;
-    private final List<String> topics;
+    private final String topic;
+    private final int partitions;
     private final String groupId;
     private final PgActorLedgerOperations operations;
     private final int batchSize;
@@ -46,18 +49,20 @@ public final class ActorLedgerConsumer implements AutoCloseable {
     private final java.util.concurrent.atomic.AtomicLong parseNanos = new java.util.concurrent.atomic.AtomicLong();
     private final java.util.concurrent.atomic.AtomicLong tellNanos = new java.util.concurrent.atomic.AtomicLong();
 
-    public ActorLedgerConsumer(String bootstrapServers, List<String> topics, String groupId,
+    public ActorLedgerConsumer(String bootstrapServers, String topic, int partitions, String groupId,
                                PgActorLedgerOperations operations, int batchSize) {
         this.bootstrapServers = bootstrapServers;
-        this.topics = List.copyOf(topics);
+        this.topic = topic;
+        this.partitions = partitions;
         this.groupId = groupId;
         this.operations = operations;
         this.batchSize = batchSize;
     }
 
     /**
-     * Starts one poll thread per topic, routing records to a per-partition
-     * actor, and waits until {@code expectedTotal} changes are committed.
+     * Starts one poll thread per partition (its consumer is assigned exactly that
+     * partition), routing records to the partition's actor, and waits until
+     * {@code expectedTotal} changes are committed.
      *
      * @param expectedTotal total changes to wait for
      * @return milliseconds from start to all persisted
@@ -65,11 +70,11 @@ public final class ActorLedgerConsumer implements AutoCloseable {
     public long runUntil(long expectedTotal) throws InterruptedException {
         long start = System.nanoTime();
 
-        for (String topic : topics) {
+        for (int p = 0; p < partitions; p++) {
             KafkaConsumer<String, String> consumer = newConsumer();
-            consumer.subscribe(List.of(topic));
+            consumer.assign(List.of(new TopicPartition(topic, p)));
             consumers.add(consumer);
-            Thread poll = new Thread(() -> pollLoop(consumer), "actor-poll-" + topic);
+            Thread poll = new Thread(() -> pollLoop(consumer), "actor-poll-" + topic + "-" + p);
             poll.start();
             pollThreads.add(poll);
         }

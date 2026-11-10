@@ -34,11 +34,12 @@ import java.util.concurrent.locks.ReentrantLock;
  * instead of BufferFly.
  *
  * <p>Like the actor, it keeps balances in memory and writes to Postgres in
- * bulk. Unlike the actor, it does so in lock-step with Kafka. For each topic,
- * one poll thread runs this loop:
+ * bulk. Unlike the actor, it does so in lock-step with Kafka. For each
+ * partition, one poll thread (with a consumer assigned that partition) runs this
+ * loop:
  * <ol>
  *   <li>{@code poll()} up to {@code max.poll.records} (500) records;</li>
- *   <li>hand every record to a pool of {@link #THREADS_PER_TOPIC} workers, each
+ *   <li>hand every record to a pool of {@link #THREADS_PER_PARTITION} workers, each
  *       updating its account's balance in a shared in-memory map <b>under a
  *       per-account {@link ReentrantLock}</b>, and wait for all of them;</li>
  *   <li>write the whole poll <b>synchronously in one transaction</b>
@@ -59,10 +60,11 @@ import java.util.concurrent.locks.ReentrantLock;
  */
 public final class LockingBatchLedgerConsumer implements AutoCloseable {
 
-    public static final int THREADS_PER_TOPIC = 7;
+    public static final int THREADS_PER_PARTITION = 7;
 
     private final String bootstrapServers;
-    private final List<String> topics;
+    private final String topic;
+    private final int partitions;
     private final String groupId;
     private final PgLedgerStore store;
     private final ObjectMapper mapper = new ObjectMapper();
@@ -85,31 +87,32 @@ public final class LockingBatchLedgerConsumer implements AutoCloseable {
     private final List<ExecutorService> pools = new CopyOnWriteArrayList<>();
     private final List<KafkaConsumer<String, String>> consumers = new CopyOnWriteArrayList<>();
 
-    public LockingBatchLedgerConsumer(String bootstrapServers, List<String> topics, String groupId,
+    public LockingBatchLedgerConsumer(String bootstrapServers, String topic, int partitions, String groupId,
                                       PgLedgerStore store) {
         this.bootstrapServers = bootstrapServers;
-        this.topics = List.copyOf(topics);
+        this.topic = topic;
+        this.partitions = partitions;
         this.groupId = groupId;
         this.store = store;
     }
 
     /**
-     * Starts one poll thread + worker pool per topic and processes until
+     * Starts one poll thread + worker pool per partition and processes until
      * {@code expectedTotal} changes have been committed to the database.
      *
-     * @param expectedTotal changes to wait for across all topics
+     * @param expectedTotal changes to wait for across all partitions
      * @return milliseconds from start to all persisted
      */
     public long runUntil(long expectedTotal) throws InterruptedException {
         long start = System.nanoTime();
 
-        for (String topic : topics) {
-            ExecutorService pool = Executors.newFixedThreadPool(THREADS_PER_TOPIC);
+        for (int p = 0; p < partitions; p++) {
+            ExecutorService pool = Executors.newFixedThreadPool(THREADS_PER_PARTITION);
             pools.add(pool);
             KafkaConsumer<String, String> consumer = newConsumer();
-            consumer.subscribe(List.of(topic));
+            consumer.assign(List.of(new TopicPartition(topic, p)));
             consumers.add(consumer);
-            Thread poll = new Thread(() -> pollLoop(consumer, pool), "lockbatch-poll-" + topic);
+            Thread poll = new Thread(() -> pollLoop(consumer, pool), "lockbatch-poll-" + topic + "-" + p);
             poll.start();
             pollThreads.add(poll);
         }
@@ -161,8 +164,8 @@ public final class LockingBatchLedgerConsumer implements AutoCloseable {
         }
 
         // 2) the balances of the accounts this poll touched are now final for the
-        //    poll (accounts are namespaced per topic, so only this thread's
-        //    workers update them, and they have all finished)
+        //    poll (an account always maps to one partition, so only this
+        //    consumer's workers update it, and they have all finished)
         Map<String, Long> finalBalances = new HashMap<>();
         changes.forEach(c -> finalBalances.put(c.accountNumber(), balances.get(c.accountNumber())));
         long t1 = System.nanoTime();

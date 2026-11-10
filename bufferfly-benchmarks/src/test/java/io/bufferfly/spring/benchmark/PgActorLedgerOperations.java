@@ -7,6 +7,8 @@ import org.springframework.transaction.support.TransactionSynchronizationManager
 
 import javax.sql.DataSource;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -21,18 +23,28 @@ import java.util.concurrent.atomic.AtomicLong;
  * and let {@link PgLedgerStore#applyBatch} do the bulk insert + balance upserts
  * inside that same transaction.
  *
- * <p>{@link #persisted()} counts changes once their transaction has committed,
- * so the benchmark can detect completion without querying the database (polling
- * queries would show up in the measured {@code xact_commit}).
+ * <p>{@link #persisted()} counts records up to the highest offset committed per
+ * partition, so the benchmark can detect completion without querying the
+ * database (polling queries would show up in the measured {@code xact_commit}).
+ * It counts offsets rather than inserted rows so it stays exact when a commit
+ * succeeds on the server but the client sees an error (e.g. an actor stopped by
+ * a rebalance while waiting for the reply): the next owner replays those
+ * records, inserts nothing, and still advances the offset.
  */
 public final class PgActorLedgerOperations extends AbstractJdbcTransactionalOperations<PgLedgerChange> {
 
     private final PgLedgerStore store;
-    private final AtomicLong persisted = new AtomicLong();
+    /** Highest committed offset per "topic/partition". */
+    private final Map<String, Long> committedOffsets = new ConcurrentHashMap<>();
     /** Time from the start of each batch transaction to its commit, summed over all partitions. */
     private final AtomicLong dbNanos = new AtomicLong();
     /** Start of the batch currently being persisted, per persistence thread. */
     private final ThreadLocal<Long> batchStart = new ThreadLocal<>();
+
+    /** @return the shared store this operations layer writes to. */
+    public PgLedgerStore store() {
+        return store;
+    }
 
     public PgActorLedgerOperations(DataSource dataSource, PgLedgerStore store) {
         super(dataSource, new FencingOffsetRepository(
@@ -41,9 +53,9 @@ public final class PgActorLedgerOperations extends AbstractJdbcTransactionalOper
         this.store = store;
     }
 
-    /** @return changes whose transaction has committed so far. */
+    /** @return records durably processed so far: per partition, the highest committed offset + 1. */
     public long persisted() {
-        return persisted.get();
+        return committedOffsets.values().stream().mapToLong(offset -> offset + 1).sum();
     }
 
     /** @return ms spent in batch transactions (start to commit), summed over all partitions. */
@@ -59,13 +71,13 @@ public final class PgActorLedgerOperations extends AbstractJdbcTransactionalOper
     @Override
     protected void persistBatch(List<PgLedgerChange> batch) {
         store.applyBatch(batch);
-        int size = batch.size();
         long start = batchStart.get();
         TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
             @Override
             public void afterCommit() {
                 dbNanos.addAndGet(System.nanoTime() - start);
-                persisted.addAndGet(size);
+                batch.forEach(change -> committedOffsets.merge(
+                        change.topic() + "/" + change.partition(), change.offset(), Math::max));
             }
         });
     }

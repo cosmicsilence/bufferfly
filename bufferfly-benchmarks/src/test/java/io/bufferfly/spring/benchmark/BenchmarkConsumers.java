@@ -12,19 +12,19 @@ import java.util.Map;
  * they all fetch the same records per poll and differ only in what they do with
  * them.
  */
-final class BenchmarkConsumers {
+public final class BenchmarkConsumers {
 
     /**
      * Records per {@code poll()} for every approach. The actor's natural batch
      * size is set to the same value, so one actor batch and one batch-consumer
      * transaction cover the same number of records.
      */
-    static final int MAX_POLL_RECORDS = 500;
+    public static final int MAX_POLL_RECORDS = 500;
 
     private BenchmarkConsumers() {
     }
 
-    static KafkaConsumer<String, String> newConsumer(String bootstrapServers, String groupId, boolean autoCommit) {
+    public static KafkaConsumer<String, String> newConsumer(String bootstrapServers, String groupId, boolean autoCommit) {
         Map<String, Object> props = new HashMap<>();
         props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
         props.put(ConsumerConfig.GROUP_ID_CONFIG, groupId);

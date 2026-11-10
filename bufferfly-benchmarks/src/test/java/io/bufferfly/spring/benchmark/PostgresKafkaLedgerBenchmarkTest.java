@@ -1,8 +1,5 @@
 package io.bufferfly.spring.benchmark;
 
-import org.apache.kafka.clients.admin.Admin;
-import org.apache.kafka.clients.admin.AdminClientConfig;
-import org.apache.kafka.clients.admin.NewTopic;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
@@ -15,7 +12,6 @@ import org.testcontainers.kafka.KafkaContainer;
 
 import javax.sql.DataSource;
 import java.util.List;
-import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -23,14 +19,15 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /**
  * 🦋 <b>Benchmark</b>: BufferFly actor (natural batching) vs. a classic
  * multi-threaded locking consumer — both ingesting the <em>same</em> Kafka
- * workload over <b>3 topics</b> into the <em>same</em> real <b>Postgres</b>,
+ * workload — one topic with <b>3 partitions</b> — into the <em>same</em> real
+ * <b>Postgres</b>,
  * run on throwaway Docker containers via Testcontainers.
  *
  * <h2>What is compared</h2>
  * <table>
  *   <tr><th>&nbsp;</th><th>Classic</th><th>BufferFly actor</th></tr>
- *   <tr><td>Consumers</td><td>1 per topic + a {@code 7}-thread pool each</td>
- *       <td>1 per topic, routing to one actor per (topic,partition)</td></tr>
+ *   <tr><td>Consumers</td><td>1 per partition + a {@code 7}-thread pool each</td>
+ *       <td>1 per partition, routing to one actor per (topic,partition)</td></tr>
  *   <tr><td>Sum calc</td><td>per-account {@link java.util.concurrent.locks.ReentrantLock}</td>
  *       <td>single-writer actor, no locks</td></tr>
  *   <tr><td>DB writes</td><td>one tiny transaction per message</td>
@@ -54,12 +51,13 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 @DisplayName("🦋 Benchmark: actor natural-batching vs classic locking consumer over Postgres + Kafka")
 class PostgresKafkaLedgerBenchmarkTest {
 
-    private static final List<String> TOPICS = List.of("ledger-a", "ledger-b", "ledger-c");
-    private static final int MESSAGES_PER_TOPIC = 50_000;      // 150k total
-    private static final int ACCOUNTS_PER_TOPIC = 500;
+    private static final String TOPIC = "ledger";
+    private static final int PARTITIONS = 3;
+    private static final int MESSAGES = 150_000;
+    private static final int ACCOUNTS = 1_500;
     private static final int ACTOR_BATCH_SIZE = BenchmarkConsumers.MAX_POLL_RECORDS;
     private static final String DB_NAME = "ledger";
-    // The classic path runs TOPICS.size() x ClassicLockingConsumer.THREADS_PER_TOPIC
+    // The classic path runs PARTITIONS x ClassicLockingConsumer.THREADS_PER_PARTITION
     // (3 x 7 = 21) worker threads, each doing a tiny transaction at a time, plus
     // the main thread's stats/assertion queries. Size the pool to cover all of
     // them so a worker never blocks waiting to borrow a connection — the pool,
@@ -85,7 +83,7 @@ class PostgresKafkaLedgerBenchmarkTest {
     @DisplayName("both approaches persist every message exactly once; WAL/commit cost and throughput are reported")
     void benchmark_actor_vs_classic() throws Exception {
         String bootstrap = KAFKA.getBootstrapServers();
-        createTopics(bootstrap);
+        LedgerTopic.create(bootstrap, TOPIC, PARTITIONS);
 
         HikariDataSource dataSource = newPool();
         try {
@@ -98,24 +96,25 @@ class PostgresKafkaLedgerBenchmarkTest {
     private void runBenchmark(String bootstrap, DataSource dataSource) throws Exception {
         JdbcTemplate jdbc = new JdbcTemplate(dataSource);
 
-        long expectedTotal = (long) MESSAGES_PER_TOPIC * TOPICS.size();
+        long expectedTotal = MESSAGES;
 
         // --- produce the shared workload once; both approaches read it with their
         //     own consumer group from the beginning ---
         try (BenchmarkProducer producer = new BenchmarkProducer(bootstrap)) {
-            long produced = producer.produce(TOPICS, MESSAGES_PER_TOPIC, ACCOUNTS_PER_TOPIC);
+            long produced = producer.produce(TOPIC, MESSAGES, ACCOUNTS, false);
             assertEquals(expectedTotal, produced, "produced message count");
         }
+        List<Long> partitionSizes = LedgerTopic.partitionSizes(bootstrap, TOPIC, PARTITIONS);
 
         // =====================================================================
-        // 1) CLASSIC: 7-thread pool per topic, per-account lock, 1 tx/message
+        // 1) CLASSIC: 7-thread pool per partition, per-account lock, 1 tx/message
         // =====================================================================
         PgLedgerStore classicStore = new PgLedgerStore(dataSource, "classic");
         classicStore.createSchema();
         PgStats classicBefore = PgStats.capture(jdbc, DB_NAME);
         long classicMs;
         try (ClassicLockingConsumer classic =
-                     new ClassicLockingConsumer(bootstrap, TOPICS, "classic-group", classicStore)) {
+                     new ClassicLockingConsumer(bootstrap, TOPIC, PARTITIONS, "classic-group", classicStore)) {
             classicMs = classic.runUntil(expectedTotal);
         }
         PgStats classicDelta = PgStats.capture(jdbc, DB_NAME).minus(classicBefore);
@@ -129,7 +128,7 @@ class PostgresKafkaLedgerBenchmarkTest {
         PgStats actorBefore = PgStats.capture(jdbc, DB_NAME);
         long actorMs;
         try (ActorLedgerConsumer actor = new ActorLedgerConsumer(
-                bootstrap, TOPICS, "actor-group", actorOps, ACTOR_BATCH_SIZE)) {
+                bootstrap, TOPIC, PARTITIONS, "actor-group", actorOps, ACTOR_BATCH_SIZE)) {
             actorMs = actor.runUntil(expectedTotal);
         }
         PgStats actorDelta = PgStats.capture(jdbc, DB_NAME).minus(actorBefore);
@@ -157,10 +156,11 @@ class PostgresKafkaLedgerBenchmarkTest {
 
         System.out.println();
         System.out.println("==========================================================================================");
-        System.out.printf ("POSTGRES + KAFKA LEDGER BENCHMARK  —  %d messages over %d topics%n", expectedTotal, TOPICS.size());
+        System.out.printf ("POSTGRES + KAFKA LEDGER BENCHMARK  —  %d messages, 1 topic x %d partitions %s%n",
+                expectedTotal, PARTITIONS, partitionSizes);
         System.out.println("------------------------------------------------------------------------------------------");
         System.out.printf ("%-34s %16s %16s%n", "", "CLASSIC (locks)", "ACTOR (batching)");
-        System.out.printf ("%-34s %16s %16s%n", "consumers", TOPICS.size() + "x7 threads", TOPICS.size() + " actors");
+        System.out.printf ("%-34s %16s %16s%n", "consumers", PARTITIONS + "x7 threads", PARTITIONS + " actors");
         System.out.printf ("%-34s %14.2f ms %14.2f ms%n", "end-to-end time", (double) classicMs, (double) actorMs);
         System.out.printf ("%-34s %13.0f/s %13.0f/s%n", "throughput", classicTps, actorTps);
         System.out.printf ("%-34s %16d %16d%n", "pg xact_commit (delta)", classicDelta.xactCommit(), actorDelta.xactCommit());
@@ -198,13 +198,4 @@ class PostgresKafkaLedgerBenchmarkTest {
         return new HikariDataSource(config);
     }
 
-    private void createTopics(String bootstrap) throws Exception {        try (Admin admin = Admin.create(Map.of(AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrap))) {
-            // one partition per topic so each topic maps to exactly one actor
-            // (single writer) on the actor side and a clean comparison overall.
-            List<NewTopic> newTopics = TOPICS.stream()
-                    .map(t -> new NewTopic(t, 1, (short) 1))
-                    .toList();
-            admin.createTopics(newTopics).all().get();
-        }
-    }
 }

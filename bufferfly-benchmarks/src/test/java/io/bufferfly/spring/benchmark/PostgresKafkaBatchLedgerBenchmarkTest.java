@@ -2,9 +2,6 @@ package io.bufferfly.spring.benchmark;
 
 import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
-import org.apache.kafka.clients.admin.Admin;
-import org.apache.kafka.clients.admin.AdminClientConfig;
-import org.apache.kafka.clients.admin.NewTopic;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
@@ -30,8 +27,8 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
  * <h2>What is compared</h2>
  * <table>
  *   <tr><th>&nbsp;</th><th>Locking batch consumer</th><th>BufferFly actor</th></tr>
- *   <tr><td>Consumers</td><td>1 per topic + a {@code 7}-thread pool each</td>
- *       <td>1 per topic, routing to one actor per (topic,partition)</td></tr>
+ *   <tr><td>Consumers</td><td>1 per partition + a {@code 7}-thread pool each</td>
+ *       <td>1 per partition, routing to one actor per (topic,partition)</td></tr>
  *   <tr><td>Balance calc</td><td>in memory, per-account {@link java.util.concurrent.locks.ReentrantLock}</td>
  *       <td>in memory, single-writer actor, no locks</td></tr>
  *   <tr><td>DB writes</td><td>one synchronous bulk transaction per poll,
@@ -42,22 +39,30 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
  * actor batches up to the same number, and both issue the same change insert and
  * balance upsert as JDBC batches through the same {@link PgLedgerStore} and pool.
  *
+ * <h2>Topic layout</h2>
+ * One topic with {@link #PARTITIONS} partitions; records are keyed by account,
+ * so Kafka's default partitioner decides each account's partition (the split is
+ * not perfectly even and is reported per scenario). Each approach runs one
+ * consumer per partition.
+ *
  * <h2>Scenarios (key distribution)</h2>
  * <ul>
- *   <li><b>round-robin, 500 accounts</b> — each account appears at most once in
- *       any 500 consecutive records, so the batch consumer's workers never touch
- *       the same account within a poll: no lock contention.</li>
- *   <li><b>shuffled, 500 accounts</b> — same counts, random order: an account
+ *   <li><b>round-robin, 1,500 accounts</b> — about 500 accounts per partition,
+ *       each appearing at most once in any 500 consecutive records of its
+ *       partition, so the batch consumer's workers rarely touch the same
+ *       account within a poll.</li>
+ *   <li><b>shuffled, 1,500 accounts</b> — same counts, random order: an account
  *       can appear a few times in one poll.</li>
- *   <li><b>shuffled, 10 accounts</b> — about 50 records per account per poll,
- *       spread over 7 workers: heavy contention on few hot keys.</li>
+ *   <li><b>shuffled, 30 accounts</b> — about 10 hot accounts per partition,
+ *       about 50 records each per poll, spread over 7 workers: heavy
+ *       contention.</li>
  * </ul>
- * Every account receives exactly {@code MESSAGES_PER_TOPIC / accounts} credits
- * in every scenario, so final balances are asserted exactly.
+ * Every account receives exactly {@code MESSAGES / accounts} credits in every
+ * scenario, so final balances are asserted exactly.
  *
  * <h2>Fairness</h2>
  * <ul>
- *   <li>Each scenario's workload is produced once to its own topics; each run
+ *   <li>Each scenario's workload is produced once to its own topic; each run
  *       reads it from the beginning with its own consumer group and recreated
  *       tables.</li>
  *   <li>{@link #ROUNDS} rounds per scenario alternate which approach runs first;
@@ -73,10 +78,10 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 @DisplayName("🦋 Benchmark: actor natural-batching vs locking batch consumer over Postgres + Kafka")
 class PostgresKafkaBatchLedgerBenchmarkTest {
 
-    private static final List<String> BASE_TOPICS = List.of("ledger-a", "ledger-b", "ledger-c");
+    private static final int PARTITIONS = 3;
     // 600k per scenario: long enough per run that consumer-group join and JIT
     // warmup do not dominate the measured time
-    private static final int MESSAGES_PER_TOPIC = 200_000;
+    private static final int MESSAGES = 600_000;
     // Actor persistence batch size; defaults to the poll size. Override with
     // -Dbufferfly.bench.actorBatchSize=N to compare batch sizes.
     private static final int ACTOR_BATCH_SIZE =
@@ -87,9 +92,9 @@ class PostgresKafkaBatchLedgerBenchmarkTest {
     private static final int DB_POOL_SIZE = 24;
 
     private static final List<Scenario> SCENARIOS = List.of(
-            new Scenario("rr500", "round-robin, 500 accounts/topic", 500, false),
-            new Scenario("shuf500", "shuffled, 500 accounts/topic", 500, true),
-            new Scenario("shuf10", "shuffled, 10 accounts/topic", 10, true));
+            new Scenario("rr1500", "round-robin, 1,500 accounts", 1_500, false),
+            new Scenario("shuf1500", "shuffled, 1,500 accounts", 1_500, true),
+            new Scenario("shuf30", "shuffled, 30 accounts (hot keys)", 30, true));
 
     @Container
     @SuppressWarnings("resource")
@@ -104,10 +109,10 @@ class PostgresKafkaBatchLedgerBenchmarkTest {
     @SuppressWarnings("resource")
     static final KafkaContainer KAFKA = new KafkaContainer("apache/kafka-native:3.8.0");
 
-    /** A key distribution to benchmark, with its own topics. */
-    record Scenario(String id, String description, int accountsPerTopic, boolean shuffled) {
-        List<String> topics() {
-            return BASE_TOPICS.stream().map(t -> id + "-" + t).toList();
+    /** A key distribution to benchmark, with its own topic. */
+    record Scenario(String id, String description, int accounts, boolean shuffled) {
+        String topic() {
+            return id + "-ledger";
         }
     }
 
@@ -115,7 +120,7 @@ class PostgresKafkaBatchLedgerBenchmarkTest {
      * One measured run of one approach. {@code contendedLocks} is {@code -1} for
      * the actor, which takes no locks. {@code phaseMs} holds time per phase summed
      * over the run's threads (one poll thread, or one persistence thread, per
-     * topic), in reporting order.
+     * partition), in reporting order.
      */
     record Run(String approach, int round, long millis, PgStats db, long contendedLocks, long outOfOrder,
                Map<String, Long> phaseMs) {
@@ -130,24 +135,25 @@ class PostgresKafkaBatchLedgerBenchmarkTest {
     @DisplayName("both approaches persist every message exactly once in every key distribution; throughput, DB cost and lock contention are reported")
     void benchmark_actor_vs_locking_batch() throws Exception {
         String bootstrap = KAFKA.getBootstrapServers();
-        long expectedTotal = (long) MESSAGES_PER_TOPIC * BASE_TOPICS.size();
+        long expectedTotal = MESSAGES;
 
         List<Summary> summaries = new ArrayList<>();
         try (HikariDataSource dataSource = newPool()) {
             for (Scenario scenario : SCENARIOS) {
-                createTopics(bootstrap, scenario.topics());
+                LedgerTopic.create(bootstrap, scenario.topic(), PARTITIONS);
                 try (BenchmarkProducer producer = new BenchmarkProducer(bootstrap)) {
                     assertEquals(expectedTotal, producer.produce(
-                            scenario.topics(), MESSAGES_PER_TOPIC, scenario.accountsPerTopic(), scenario.shuffled()));
+                            scenario.topic(), MESSAGES, scenario.accounts(), scenario.shuffled()));
                 }
-                summaries.add(runScenario(scenario, bootstrap, dataSource, expectedTotal));
+                List<Long> partitionSizes = LedgerTopic.partitionSizes(bootstrap, scenario.topic(), PARTITIONS);
+                summaries.add(runScenario(scenario, partitionSizes, bootstrap, dataSource, expectedTotal));
             }
         }
         reportSummary(expectedTotal, summaries);
     }
 
-    private Summary runScenario(Scenario scenario, String bootstrap, HikariDataSource dataSource,
-                                long expectedTotal) throws Exception {
+    private Summary runScenario(Scenario scenario, List<Long> partitionSizes, String bootstrap,
+                                HikariDataSource dataSource, long expectedTotal) throws Exception {
         List<Run> lockBatch = new ArrayList<>();
         List<Run> actor = new ArrayList<>();
         for (int round = 0; round < ROUNDS; round++) {
@@ -159,7 +165,7 @@ class PostgresKafkaBatchLedgerBenchmarkTest {
                 lockBatch.add(runLockBatch(scenario, bootstrap, dataSource, round, expectedTotal));
             }
         }
-        reportScenario(scenario, expectedTotal, lockBatch, actor);
+        reportScenario(scenario, expectedTotal, partitionSizes, lockBatch, actor);
         return new Summary(scenario,
                 median(lockBatch, Run::millis), median(actor, Run::millis),
                 median(lockBatch, Run::contendedLocks), median(lockBatch, Run::outOfOrder));
@@ -175,7 +181,7 @@ class PostgresKafkaBatchLedgerBenchmarkTest {
         long contended;
         Map<String, Long> phases;
         try (LockingBatchLedgerConsumer consumer = new LockingBatchLedgerConsumer(
-                bootstrap, scenario.topics(), scenario.id() + "-lockbatch-" + round, store)) {
+                bootstrap, scenario.topic(), PARTITIONS, scenario.id() + "-lockbatch-" + round, store)) {
             ms = consumer.runUntil(expectedTotal);
             contended = consumer.contendedLockAcquisitions();
             phases = phases("process (poll thread waits)", consumer.processMillis(),
@@ -183,7 +189,7 @@ class PostgresKafkaBatchLedgerBenchmarkTest {
                     "kafka commitSync (blocks poll)", consumer.kafkaCommitMillis());
         }
         PgStats delta = settledStats(jdbc).minus(before);
-        assertCorrect("locking batch", store, expectedTotal, scenario.accountsPerTopic());
+        assertCorrect("locking batch", store, expectedTotal, scenario.accounts());
         return new Run("lockbatch", round, ms, delta, contended, store.outOfOrderChanges(), phases);
     }
 
@@ -197,7 +203,7 @@ class PostgresKafkaBatchLedgerBenchmarkTest {
         long ms;
         Map<String, Long> phases;
         try (ActorLedgerConsumer consumer = new ActorLedgerConsumer(
-                bootstrap, scenario.topics(), scenario.id() + "-actor-" + round, ops,
+                bootstrap, scenario.topic(), PARTITIONS, scenario.id() + "-actor-" + round, ops,
                 ACTOR_BATCH_SIZE)) {
             ms = consumer.runUntil(expectedTotal);
             phases = phases("poll thread: JSON parse", consumer.parseMillis(),
@@ -205,7 +211,7 @@ class PostgresKafkaBatchLedgerBenchmarkTest {
                     "persistence thread: db tx", ops.dbMillis());
         }
         PgStats delta = settledStats(jdbc).minus(before);
-        assertCorrect("actor", store, expectedTotal, scenario.accountsPerTopic());
+        assertCorrect("actor", store, expectedTotal, scenario.accounts());
         int outOfOrder = store.outOfOrderChanges();
         assertEquals(0, outOfOrder, "actor: a single writer per partition applies changes in offset order");
         return new Run("actor", round, ms, delta, -1, outOfOrder, phases);
@@ -220,11 +226,11 @@ class PostgresKafkaBatchLedgerBenchmarkTest {
     }
 
     /** Every message persisted exactly once, and every account holds its exact final balance. */
-    private static void assertCorrect(String approach, PgLedgerStore store, long expectedTotal, int accountsPerTopic) {
-        long perAccount = MESSAGES_PER_TOPIC / accountsPerTopic;
+    private static void assertCorrect(String approach, PgLedgerStore store, long expectedTotal, int accounts) {
+        long perAccount = MESSAGES / accounts;
         assertEquals(expectedTotal, store.totalChanges(), approach + ": every message persisted exactly once");
         assertEquals(expectedTotal, store.totalBalance(), approach + ": total balance == message count");
-        assertEquals((long) accountsPerTopic * BASE_TOPICS.size(), store.distinctAccounts(),
+        assertEquals(accounts, store.distinctAccounts(),
                 approach + ": every account touched");
         assertEquals(0, store.accountsWithBalanceOtherThan(perAccount),
                 approach + ": every account's final balance == its event count");
@@ -235,11 +241,12 @@ class PostgresKafkaBatchLedgerBenchmarkTest {
         return PgStats.capture(jdbc, DB_NAME);
     }
 
-    private static void reportScenario(Scenario scenario, long total, List<Run> lockBatch, List<Run> actor) {
+    private static void reportScenario(Scenario scenario, long total, List<Long> partitionSizes,
+                                       List<Run> lockBatch, List<Run> actor) {
         System.out.println();
         System.out.println("==============================================================================================================");
-        System.out.printf("BATCH LEDGER BENCHMARK [%s]  —  %d messages over %d topics, %d rounds, poll %d, actor batch %d%n",
-                scenario.description(), total, BASE_TOPICS.size(), ROUNDS,
+        System.out.printf("BATCH LEDGER BENCHMARK [%s]  —  %d messages, 1 topic x %d partitions %s, %d rounds, poll %d, actor batch %d%n",
+                scenario.description(), total, PARTITIONS, partitionSizes, ROUNDS,
                 BenchmarkConsumers.MAX_POLL_RECORDS, ACTOR_BATCH_SIZE);
         System.out.println("--------------------------------------------------------------------------------------------------------------");
         System.out.printf("%-6s %-10s %9s %9s %11s %12s %13s %15s %13s%n", "round", "approach", "time ms", "msg/s",
@@ -270,8 +277,8 @@ class PostgresKafkaBatchLedgerBenchmarkTest {
         System.out.printf("%-30s %20d %20d%n", "out-of-order changes",
                 median(lockBatch, Run::outOfOrder), median(actor, Run::outOfOrder));
         System.out.printf("Actor vs locking batch: time %.2fx  (>1 = actor faster)%n", lbMs / (double) Math.max(1, acMs));
-        System.out.println("-- where the time goes (median, per thread = sum / " + BASE_TOPICS.size()
-                + " topics, % of median wall time) --");
+        System.out.println("-- where the time goes (median, per thread = sum / " + PARTITIONS
+                + " partitions, % of median wall time) --");
         printPhases("LOCKING BATCH", lockBatch, lbMs);
         printPhases("ACTOR", actor, acMs);
         System.out.println("==============================================================================================================");
@@ -279,7 +286,7 @@ class PostgresKafkaBatchLedgerBenchmarkTest {
 
     private static void printPhases(String label, List<Run> runs, long wallMs) {
         for (String phase : runs.get(0).phaseMs().keySet()) {
-            long perThread = median(runs, r -> r.phaseMs().get(phase)) / BASE_TOPICS.size();
+            long perThread = median(runs, r -> r.phaseMs().get(phase)) / PARTITIONS;
             System.out.printf("  %-14s %-32s %9d ms %6.1f%%%n", label, phase, perThread,
                     100.0 * perThread / Math.max(1, wallMs));
         }
@@ -318,11 +325,4 @@ class PostgresKafkaBatchLedgerBenchmarkTest {
         return new HikariDataSource(config);
     }
 
-    private void createTopics(String bootstrap, List<String> topics) throws Exception {
-        try (Admin admin = Admin.create(Map.of(AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrap))) {
-            // one partition per topic: one actor (single writer) per topic on the
-            // actor side, one consumer per topic on both sides
-            admin.createTopics(topics.stream().map(t -> new NewTopic(t, 1, (short) 1)).toList()).all().get();
-        }
-    }
 }
