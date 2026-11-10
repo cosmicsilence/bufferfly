@@ -5,11 +5,9 @@ import io.bufferfly.core.actor.ActorManager;
 import io.bufferfly.core.actor.ActorReference;
 import io.bufferfly.core.persistence.PersistenceConfig;
 import io.bufferfly.spring.ledger.AddToAccount;
-import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
-import org.apache.kafka.common.serialization.StringDeserializer;
 
 import java.time.Duration;
 import java.util.List;
@@ -36,7 +34,6 @@ public final class ActorLedgerConsumer implements AutoCloseable {
     private final String groupId;
     private final PgActorLedgerOperations operations;
     private final int batchSize;
-    private final long timeoutMs;
     private final ObjectMapper mapper = new ObjectMapper();
 
     private final ActorManager manager = new ActorManager();
@@ -45,27 +42,27 @@ public final class ActorLedgerConsumer implements AutoCloseable {
             new java.util.concurrent.atomic.AtomicBoolean(true);
     private final List<Thread> pollThreads = new java.util.concurrent.CopyOnWriteArrayList<>();
     private final List<KafkaConsumer<String, String>> consumers = new java.util.concurrent.CopyOnWriteArrayList<>();
+    /** Time the poll threads spend parsing and handing records to actors, summed over poll threads. */
+    private final java.util.concurrent.atomic.AtomicLong parseNanos = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong tellNanos = new java.util.concurrent.atomic.AtomicLong();
 
     public ActorLedgerConsumer(String bootstrapServers, List<String> topics, String groupId,
-                               PgActorLedgerOperations operations, int batchSize, long timeoutMs) {
+                               PgActorLedgerOperations operations, int batchSize) {
         this.bootstrapServers = bootstrapServers;
         this.topics = List.copyOf(topics);
         this.groupId = groupId;
         this.operations = operations;
         this.batchSize = batchSize;
-        this.timeoutMs = timeoutMs;
     }
 
     /**
      * Starts one poll thread per topic, routing records to a per-partition
-     * actor, and waits until {@code store} reports {@code expectedTotal} changes
-     * persisted.
+     * actor, and waits until {@code expectedTotal} changes are committed.
      *
-     * @param store         the shared store, polled for the persisted count
      * @param expectedTotal total changes to wait for
      * @return milliseconds from start to all persisted
      */
-    public long runUntil(PgLedgerStore store, long expectedTotal) throws InterruptedException {
+    public long runUntil(long expectedTotal) throws InterruptedException {
         long start = System.nanoTime();
 
         for (String topic : topics) {
@@ -77,9 +74,10 @@ public final class ActorLedgerConsumer implements AutoCloseable {
             pollThreads.add(poll);
         }
 
-        // wait until all changes are durably persisted
-        while (store.totalChanges() < expectedTotal) {
-            Thread.sleep(25);
+        // wait until all changes are durably persisted (counted after commit,
+        // so no polling query hits the database during the measured window)
+        while (operations.persisted() < expectedTotal) {
+            Thread.sleep(5);
         }
         long elapsed = (System.nanoTime() - start) / 1_000_000L;
         running.set(false);
@@ -106,32 +104,37 @@ public final class ActorLedgerConsumer implements AutoCloseable {
 
     private void route(ConsumerRecord<String, String> record) {
         try {
+            long t0 = System.nanoTime();
             AddToAccount cmd = mapper.readValue(record.value(), AddToAccount.class);
+            long t1 = System.nanoTime();
             String key = record.topic() + "-" + record.partition();
             ActorReference<BenchmarkRecord> actor = actors.computeIfAbsent(key, k -> {
                 PersistenceConfig<PgLedgerChange> config = PersistenceConfig.builder(operations)
                         .batchSize(batchSize)
-                        .timeoutMs(timeoutMs)
                         .maxRetries(3)
                         .build();
                 return manager.start(new PgLedgerActor("pg-ledger-" + key, config));
             });
             actor.tell(new BenchmarkRecord(record.topic(), record.partition(), record.offset(), cmd));
+            parseNanos.addAndGet(t1 - t0);
+            tellNanos.addAndGet(System.nanoTime() - t1);
         } catch (Exception e) {
             throw new RuntimeException("actor router failed", e);
         }
     }
 
+    /** @return ms the poll threads spent parsing JSON, summed over poll threads. */
+    public long parseMillis() {
+        return parseNanos.get() / 1_000_000L;
+    }
+
+    /** @return ms the poll threads spent in {@code tell} (incl. waiting on a full mailbox), summed. */
+    public long tellMillis() {
+        return tellNanos.get() / 1_000_000L;
+    }
+
     private KafkaConsumer<String, String> newConsumer() {
-        Map<String, Object> props = new java.util.HashMap<>();
-        props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
-        props.put(ConsumerConfig.GROUP_ID_CONFIG, groupId);
-        props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
-        props.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, true);
-        props.put(ConsumerConfig.MAX_POLL_RECORDS_CONFIG, 500);
-        props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
-        props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
-        return new KafkaConsumer<>(props);
+        return BenchmarkConsumers.newConsumer(bootstrapServers, groupId, true);
     }
 
     @Override

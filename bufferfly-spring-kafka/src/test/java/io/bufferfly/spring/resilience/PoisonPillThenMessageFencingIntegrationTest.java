@@ -118,9 +118,8 @@ class PoisonPillThenMessageFencingIntegrationTest {
         KafkaContext ctx = noopContext();
         PersistenceConfig<Message> config = PersistenceConfig.builder(operations)
                 .batchSize(10)
-                .timeoutMs(40L)
                 .maxRetries(0)
-                .dispatcher(new NaturalBatchingDispatcher<>(10, 40L))
+                .dispatcher(new NaturalBatchingDispatcher<>(10))
                 .onUnrecoverable(ctx::restartActor)
                 .build();
 

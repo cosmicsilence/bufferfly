@@ -7,8 +7,11 @@ import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.common.serialization.StringSerializer;
 
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.Random;
 
 /**
  * Produces the benchmark workload: {@code messagesPerTopic} credits spread
@@ -40,16 +43,37 @@ public final class BenchmarkProducer implements AutoCloseable {
     /**
      * Publishes {@code messagesPerTopic} to each topic, round-robining across
      * {@code accountsPerTopic} per-topic accounts. Account keys are namespaced by
-     * topic so the two approaches' tables are directly comparable.
+     * topic so the approaches' tables are directly comparable.
      *
      * @return total messages produced across all topics
      */
     public long produce(List<String> topics, int messagesPerTopic, int accountsPerTopic) {
+        return produce(topics, messagesPerTopic, accountsPerTopic, false);
+    }
+
+    /**
+     * Like {@link #produce(List, int, int)}, but optionally shuffles the order of
+     * each topic's messages (fixed seed, so runs are reproducible). Each account
+     * still receives exactly {@code messagesPerTopic / accountsPerTopic} credits;
+     * only their order changes, so the same account can appear several times
+     * within one poll.
+     *
+     * @return total messages produced across all topics
+     */
+    public long produce(List<String> topics, int messagesPerTopic, int accountsPerTopic, boolean shuffled) {
         long total = 0;
+        Random random = new Random(SHUFFLE_SEED);
         try {
             for (String topic : topics) {
+                List<Integer> accountOrder = new ArrayList<>(messagesPerTopic);
                 for (int i = 0; i < messagesPerTopic; i++) {
-                    String account = topic + "-ACC-" + (i % accountsPerTopic);
+                    accountOrder.add(i % accountsPerTopic);
+                }
+                if (shuffled) {
+                    Collections.shuffle(accountOrder, random);
+                }
+                for (int accountIndex : accountOrder) {
+                    String account = topic + "-ACC-" + accountIndex;
                     String json = mapper.writeValueAsString(new AddToAccount(account, 1L, "credit"));
                     producer.send(new ProducerRecord<>(topic, account, json));
                     total++;
@@ -61,6 +85,8 @@ public final class BenchmarkProducer implements AutoCloseable {
         }
         return total;
     }
+
+    private static final long SHUFFLE_SEED = 42L;
 
     @Override
     public void close() {

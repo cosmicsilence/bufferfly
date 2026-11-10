@@ -3,14 +3,15 @@ Performance benchmarks for BufferFly. Not published and not run as part of the \
 standard build/test lifecycle — run explicitly with the `benchmarks` task.'''
 
 // -----------------------------------------------------------------------------
-// This module hosts the three BufferFly benchmarks that used to live in the
-// src/test of bufferfly-core, bufferfly-cpu-bound and bufferfly-spring-kafka:
+// This module hosts the BufferFly benchmarks:
 //
-//   * PersistenceActorBenchmarkTest        (core: actor batching vs per-row)
-//   * DispatcherComparisonBenchmarkTest    (cpu-bound: spinning vs VT dispatch)
-//   * PostgresKafkaLedgerBenchmarkTest     (spring-kafka: actor vs classic)
+//   * PersistenceActorBenchmarkTest          (core: actor batching vs per-row)
+//   * DispatcherComparisonBenchmarkTest      (cpu-bound: spinning vs VT dispatch)
+//   * PostgresKafkaLedgerBenchmarkTest       (spring-kafka: actor vs per-message consumer)
+//   * PostgresKafkaBatchLedgerBenchmarkTest  (spring-kafka: actor vs batching locking consumer)
+//   * ShardedActorContainerThroughputBenchmarkTest (spring-kafka: container poll -> route -> commit, no DB)
 //
-// They are long-running and Docker-dependent, so they MUST NOT run on
+// The benchmarks are long-running and Docker-dependent, so they MUST NOT run on
 // `./gradlew build` or `./gradlew test`. The standard `test` task is therefore
 // detached from the `check`/`build` lifecycle and the benchmarks are driven by
 // the dedicated `benchmarks` task declared at the bottom of this file.
@@ -101,6 +102,11 @@ tasks.register('benchmarks', Test) {
     forkEvery = 1
     // Benchmarks push millions of messages / 150k rows — give them headroom.
     maxHeapSize = '2g'
+
+    // Forward benchmark tuning properties (e.g. -Dbufferfly.bench.actorBatchSize=250)
+    // from the Gradle command line to the forked test JVM.
+    System.properties.findAll { it.key.toString().startsWith('bufferfly.bench.') }
+            .each { k, v -> systemProperty k.toString(), v }
 
     testLogging {
         events 'passed', 'skipped', 'failed'

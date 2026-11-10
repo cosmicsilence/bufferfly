@@ -35,8 +35,15 @@ actor engine for the most common high-volume ingestion shape: **Kafka → actor
   - [What the classic consumer does](#what-the-classic-consumer-does)
   - [What the actor consumer does](#what-the-actor-consumer-does)
   - [Results](#results)
-  - [Why the actor is dramatically faster](#why-the-actor-is-dramatically-faster)
-  - [Run it yourself](#run-it-yourself)
+  - [Why the actor is so much faster here](#why-the-actor-is-so-much-faster-here)
+- [📊 Benchmark: actor natural-batching vs a batching locking consumer](#-benchmark-actor-natural-batching-vs-a-batching-locking-consumer)
+  - [How the two are configured](#how-the-two-are-configured)
+  - [Key distributions](#key-distributions)
+  - [Results](#results-1)
+  - [What this shows](#what-this-shows)
+  - [Not measured yet](#not-measured-yet)
+- [📊 Benchmark: `ShardedActorContainer` throughput](#-benchmark-shardedactorcontainer-throughput-kafka--actors-no-database)
+  - [Run them yourself](#run-them-yourself)
 
 ---
 
@@ -105,7 +112,6 @@ public class LedgerShardFactory implements ShardedActorFactory<AddToAccount> {
         // one actor is created per assigned partition
         PersistenceConfig<LedgerChange> config = PersistenceConfig.builder(operations)
                 .batchSize(200)
-                .timeoutMs(20L)
                 .maxRetries(5)
                 .onUnrecoverable(ctx::restartActor) // halt + restart + rewind on fatal failure
                 .build();
@@ -401,7 +407,7 @@ dead-lettered correctly.
 | :--- | :--- |
 | **One actor per partition** | On `onPartitionsAssigned` it builds a `KafkaContext`, asks your factory for an actor, and starts it; on revoke/loss it stops that actor. Per-partition ordering is preserved — one single-writer actor owns a partition. |
 | **Records as `ConsumedRecord<V>`** | The deserialized value plus `topic`, `partition`, `offset`, so a persistent actor always has the offset for the fencing-token pattern. |
-| **No message loss (manual ack)** | `MANUAL_IMMEDIATE` acks; durability relies not on the Kafka ack but on storing the consumed **offset in the same DB transaction as the data**. On restart the actor seeks back to its DB-stored offset. |
+| **No message loss (per-partition commits)** | A batch listener (one call per `poll()`) commits with a non-blocking `commitAsync` only the partitions whose whole slice reached their actor; durability relies not on the Kafka commit but on storing the consumed **offset in the same DB transaction as the data**. On restart the actor seeks back to its DB-stored offset. |
 | **Offset as a fencing token** | The stored offset is advanced with a compare-and-set (`WHERE latest_offset = :expected`) in the same transaction. A failed CAS means a zombie actor is racing the new owner → the batch is rejected as `UnrecoverableException`. |
 | **Exactly-once sink** | Writes are idempotent by `(topic, partition, offset)` — a re-delivered record is skipped, never double-inserted. |
 | **Backpressure that pauses the partition** | When the buffer crosses the high watermark, `KafkaContext.pausePartition()` stops fetching for that partition only; `resumePartition()` fires once it recedes to the low watermark. |
@@ -560,11 +566,12 @@ is the whole point — *same result, far more DB work.*
 - The actor keeps the running balance **in memory in a plain `HashMap`**
   (single-writer, no locks), merges the amount, and hands a `PgLedgerChange` to
   the natural-batching persistence runner. The actor loop never touches the DB.
-- The runner drains the buffer and coalesces up to `batchSize` (500) events —
-  or whatever accumulated within `timeoutMs` (20 ms) — into **one bulk
-  transaction** via `PgLedgerStore.applyBatch`: a batched `INSERT` of all
-  changes, one balance upsert per account, and a single offset advance, all in
-  the same transaction.
+- The runner drains whatever has accumulated in the buffer, up to `batchSize`
+  (500, the same as the consumer's `max.poll.records`) events, into **one bulk
+  transaction** via
+  `PgLedgerStore.applyBatch`: a batched `INSERT` of all changes and a batched
+  balance upsert (one row per touched account), with the fencing offset
+  advanced in the same transaction.
 
 So N tiny commits collapse into a handful of fat ones, and the per-account
 read-modify-write that the classic path pays a lock + a round-trip for is just
@@ -578,71 +585,235 @@ Apache Kafka in Docker, shared 24-connection HikariCP pool:
 | Metric | CLASSIC (locks) | ACTOR (batching) | Advantage |
 | :--- | ---: | ---: | ---: |
 | consumers | 3 × 7 threads | 3 actors | — |
-| **end-to-end time** | 92,630 ms | **10,680 ms** | **8.67× faster** |
-| **throughput** | 1,619 msg/s | **14,045 msg/s** | **8.67×** |
-| **pg `xact_commit` (Δ)** | 149,254 | **1,476** | **101× fewer commits** |
-| pg `wal_records` (Δ) | 1,533,170 | 867,652 | 1.77× fewer |
-| **pg `wal_bytes` (Δ)** | 108,930,618 | **67,772,333** | **1.61× less WAL** |
+| **end-to-end time** | 92,819 ms | **3,285 ms** | **28.3× faster** |
+| **throughput** | 1,616 msg/s | **45,662 msg/s** | **28.3×** |
+| **pg `xact_commit` (Δ)** | 149,237 | **447** | **334× fewer commits** |
+| pg `wal_records` (Δ) | 1,533,179 | 853,899 | 1.80× fewer |
+| **pg `wal_bytes` (Δ)** | 108,944,531 | **67,509,478** | **1.61× less WAL** |
 
 Both approaches persisted all 150,000 messages exactly once with identical,
 correct balances — the benchmark fails otherwise.
 
+> **Why these differ from earlier published numbers (10,680 ms / 1,476
+> commits).** The actor used to issue one balance `UPDATE` statement per touched
+> account per batch, and to detect completion by running `SELECT COUNT(*)` every
+> 25 ms (each poll counted as a commit in `xact_commit`). The balance upsert is
+> now a single JDBC batch and completion is counted in memory after commit.
+> Re-running the old code on the same machine gave 12,508 ms and 1,434 commits;
+> with only the batched upsert applied it gave 4,749 ms and 760 commits. So the
+> earlier gap came from the benchmark's own write path, not from the actor.
+> The figures above also include two later framework changes: natural batching
+> no longer waits up to 20 ms for a batch to fill, and the container commits
+> offsets with `commitAsync`.
+
 > ⚠️ **About these numbers.** Postgres runs on the **same machine** as the test,
-> so the network round-trip per transaction is near-zero. That *understates* the
-> real-world gap: over a network to a managed database, where each transaction
-> costs a real round-trip and holds a pooled connection for its duration,
-> collapsing ~149k commits into ~1.5k is far more dramatic than the ~8.7× seen
-> here. Treat this as a conservative lower bound. Absolute figures vary with
-> hardware, JVM warmup, and Docker overhead.
+> so the network round-trip per transaction is near-zero. Absolute figures vary
+> with hardware, JVM warmup, and Docker overhead.
 
-### Why the actor is dramatically faster
+### Why the actor is so much faster here
 
-The actor does the *same work* and gets the *same result*, so the gap is pure
+The actor does the *same work* and gets the *same result*, so the gap is
 overhead the classic path pays and the actor avoids:
 
-1. **~101× fewer commits → far less transaction overhead.** The classic path
+1. **~334× fewer commits → far less transaction overhead.** The classic path
    pays a full `BEGIN`/`COMMIT` — and the `fsync`-backed WAL flush that makes a
-   commit durable — **once per message** (149,254 commits for 150k messages).
-   The actor commits **once per natural batch** (1,476 commits). A commit is one
+   commit durable — **once per message** (149,237 commits for 150k messages).
+   The actor commits **once per natural batch** (447 commits). A commit is one
    of the most expensive things a relational database does; amortizing it over
-   ~100 rows instead of paying it per row is the single biggest win.
+   hundreds of rows instead of paying it per row is the single biggest win.
 
 2. **Less WAL, so less I/O and less write amplification.** Every commit writes a
-   commit record to the WAL, and small transactions amplify WAL via per-commit
-   records and full-page writes. Fewer, fatter transactions mean fewer WAL
-   records (1.77×) and fewer WAL bytes (1.61×) for the identical logical change —
-   less disk I/O and less background churn on the database.
+   commit record to the WAL. Fewer, fatter transactions mean fewer WAL records
+   (1.80×) and fewer WAL bytes (1.61×) for the identical logical change.
 
-3. **No lock contention on hot accounts.** With 500 accounts and 21 worker
-   threads, the classic path constantly has multiple workers trying to update the
-   same account; they **serialize on the per-account `ReentrantLock`**, so extra
-   threads do not buy extra throughput on skewed keys — they just wait. The actor
-   has **no locks at all**: one single-writer actor owns the partition's state and
-   mutates a plain `HashMap`. The balance read-modify-write is an in-memory map
-   operation, not a locked DB round-trip.
+3. **One round-trip per row disappears.** The classic path reads the current
+   balance from the database inside each transaction; the actor keeps it in
+   memory, so its read-modify-write is a `HashMap.merge`.
 
 4. **The database sees one well-behaved borrower, not a thundering herd.** The
    classic path has 21 threads each holding a connection for a short, chatty
-   transaction, maximizing connection churn and WAL contention. The actor path
-   has one borrower doing a big bulk write per batch — exactly the access pattern
-   a relational store is happiest with.
+   transaction. The actor path has one borrower per partition doing a bulk write
+   per batch.
 
-In short: the classic path makes Postgres do ~150k transactions' worth of
-commit/WAL/lock work; the actor makes it do ~1.5k. **Postgres suffers from the
-commits and the WAL, not from the data** — and natural batching is what removes
-that suffering while preserving ordering and exactly-once semantics.
+This benchmark therefore mostly measures **batching vs. one transaction per
+message**. The next benchmark gives the conventional design batching as well.
 
-### Run it yourself
+---
 
-Requires Docker to be running (the test skips cleanly without it):
+## 📊 Benchmark: actor natural-batching vs a batching locking consumer
+
+`PostgresKafkaBatchLedgerBenchmarkTest` answers the obvious objection to the
+benchmark above — that a one-transaction-per-message consumer is a straw man.
+Its baseline, `LockingBatchLedgerConsumer`, is the strongest conventional design
+built from standard building blocks.
+
+### How the two are configured
+
+| | Locking batch consumer | Actor |
+| :--- | :--- | :--- |
+| Kafka consumers | 1 per topic (3), `max.poll.records` 500, manual `commitSync` | 1 per topic (3), `max.poll.records` 500, auto-commit |
+| Processing threads | **7 workers per topic (21)** | **1 actor per partition (3)**, plus 1 persistence thread each |
+| Balance state | shared `ConcurrentHashMap`; read the balance, add, put it back under a **per-account `ReentrantLock`** | plain `HashMap` owned by the actor, **no locks** |
+| DB write | **one synchronous transaction per poll**; the next poll waits for it | one transaction per natural batch (whatever accumulated, up to 500), asynchronous |
+| SQL | batched change insert + batched balance upsert + offset upsert | the same batched insert + upsert, offset fenced by `FencingOffsetRepository` |
+| Pipelining | fetch → process → write → commit, strictly in sequence | fetch, process and write overlap |
+
+All three topics' consumers share one database pool (24 connections) and the
+same `PgLedgerStore`. The poll size is defined once in
+`BenchmarkConsumers.MAX_POLL_RECORDS` and is also the actor's default batch
+size, so a batch-consumer transaction and an actor batch cover the same number
+of records.
+
+Both keep balances in memory and start from empty tables, so neither reloads
+state from the database. That is fine for a benchmark but means neither, as
+written here, survives a restart mid-stream; the actor's restart path (load
+state and rewind in `preStart`) is exercised by the showcase tests, not by this
+benchmark.
+
+### Key distributions
+
+The benchmark runs three scenarios, each with its own topics, 600,000 messages
+(200,000 per topic). Every account receives exactly the same number of credits
+in every scenario, so final balances are asserted exactly.
+
+| Scenario | Order | Accounts per topic | Records per account per 500-record poll |
+| :--- | :--- | ---: | ---: |
+| round-robin | `ACC-0, ACC-1, …` repeating | 500 | at most 1 — workers never share an account |
+| shuffled | random (fixed seed) | 500 | about 1, sometimes 2–3 |
+| shuffled, hot keys | random (fixed seed) | 10 | about 50, spread over 7 workers |
+
+Two contention measurements are reported for the batch consumer:
+
+- **contended locks** — lock acquisitions that found the account's lock already
+  held by another worker and had to wait;
+- **out-of-order rows** — change rows whose `resulting_balance` does not follow
+  from the previous change of the same account in Kafka offset order. Every
+  amount is `+1`, so in offset order each account must read 1, 2, 3, …; the
+  final balance is still correct, but the history is not in production order.
+
+The actor must report **0 out-of-order rows** in every run (asserted): one
+writer per partition applies changes in offset order.
+
+### Results
+
+Postgres 16 + Apache Kafka in Docker, shared 24-connection HikariCP pool. 5
+rounds per scenario, alternating which approach runs first; each run uses its
+own consumer group and freshly created tables, and every run must persist every
+message exactly once with each account holding its exact final balance.
+Medians:
+
+| Scenario | Locking batch | Actor (batch 500) | Actor speed | Contended locks | Out-of-order rows |
+| :--- | ---: | ---: | ---: | ---: | ---: |
+| round-robin, 500 accounts/topic | **15,126 ms** | 18,597 ms | 0.81× | 0 | 0 |
+| shuffled, 500 accounts/topic | 15,591 ms | **13,119 ms** | **1.19×** | 175 | 1,124 |
+| shuffled, 10 accounts/topic | 11,358 ms | **8,795 ms** | **1.29×** | 6,911 | 51,441 |
+
+| Median database cost | Locking batch | Actor |
+| :--- | ---: | ---: |
+| pg `xact_commit`, round-robin / shuffled / hot keys | 1,239 / 1,217 / 1,204 | 1,229 / 1,210 / 1,220 |
+| pg `wal_bytes`, round-robin | 303,277,944 | 305,136,876 |
+
+**Where the time goes** — per thread (sum over the 3 topics ÷ 3), as a share of
+the median run:
+
+| Phase | Round-robin | Shuffled | Hot keys |
+| :--- | ---: | ---: | ---: |
+| Lock consumer: in-memory processing (parse + locked update) | 2.1% | 2.1% | 2.2% |
+| Lock consumer: database transaction (blocks the next poll) | 92.4% | 73.6% | 64.2% |
+| Lock consumer: `commitSync` (blocks the next poll) | 2.0% | 1.7% | 2.0% |
+| Actor poll thread: JSON parse | 1.0% | 1.6% | 2.0% |
+| Actor poll thread: hand-off to the actor (`tell`) | 1.0% | 1.5% | 2.4% |
+| Actor persistence thread: database transaction | 80.0% | 97.9% | 93.6% |
+
+**Smaller actor batches** (`-Dbufferfly.bench.actorBatchSize=250`, polls stay
+at 500): the actor commits twice as often (~2,400 vs ~1,200) and its
+persistence thread is in a transaction 97–98% of the time in every scenario.
+Separate run, medians:
+
+| Scenario | Locking batch | Actor (batch 250) | Actor speed |
+| :--- | ---: | ---: | ---: |
+| round-robin, 500 accounts/topic | 13,942 ms | **12,567 ms** | **1.11×** |
+| shuffled, 500 accounts/topic | **12,754 ms** | 13,894 ms | 0.92× |
+| shuffled, 10 accounts/topic | **8,600 ms** | 9,284 ms | 0.93× |
+
+### What this shows
+
+- **Database cost is identical.** With the same batch size and the same SQL,
+  both commit about once per 500 messages and write the same WAL. Once the
+  conventional design batches, the database does the same work.
+- **The database is the bottleneck for both.** In-memory work is 2–5% of the
+  run on either side, so removing locks or overlapping fetch with writing can
+  only save a few percent. Each topic has one partition, so both designs have
+  exactly 3 writers with one transaction in flight each.
+- **Lock contention is real but cheap.** With 10 hot accounts about 7,000 lock
+  acquisitions per run had to wait, but a lock is held only for a map read and
+  write, so waiting costs almost nothing.
+- **Ordering is where the designs differ.** The lock consumer's workers apply
+  one account's updates in a different order than Kafka produced them (51,441
+  out-of-order change rows with hot keys); the actor never does.
+- **Results are noisy.** Single rounds of the same configuration vary by up to
+  ~40% on this machine, and the winner flips between runs and batch sizes.
+  Treat differences under ~20% as noise. The round-robin case, where the actor
+  at batch 500 spends ~20% of its time outside a transaction, is not explained
+  yet.
+- **What the actor buys.** Single-writer, offset-ordered state per partition
+  with no locks, per-partition backpressure that pauses only the slow
+  partition, and a supervised restart that rewinds the offset from the
+  database. The batch consumer has none of these: a slow write blocks every
+  partition on that consumer, and a failure needs hand-written recovery.
+
+### Not measured yet
+
+- **A remote database.** Every synchronous write and `commitSync` blocks the
+  batch consumer's next poll, so round-trip latency costs it more than it costs
+  the actor, whose fetching overlaps with writing.
+- **Many partitions per consumer.** The actor writes each partition on its own
+  persistence thread; the batch consumer writes all of a poll's partitions in
+  one transaction on one thread.
+- **A consumer that keeps no state in memory.** The common conventional
+  design reads the touched balances from the database on every poll (select,
+  calculate, batch update/insert) because it cannot trust a cache across
+  rebalances. The actor can load its partition's state once on assignment and
+  keep it, which this benchmark does not exercise.
+
+---
+
+## 📊 Benchmark: `ShardedActorContainer` throughput (Kafka → actors, no database)
+
+The other Kafka benchmarks drive actors from a plain `KafkaConsumer`, so they do
+not exercise the Spring container. `ShardedActorContainerThroughputBenchmarkTest`
+does: a single consumer (`concurrency = 1`) owns all 3 partitions of one topic,
+so every poll is split per partition, routed through each partition's rewind
+gate to its actor, and committed with `commitAsync`. The actors only count
+records, so the measured time is the container's poll → route → commit path.
+
+300,000 messages, 3 rounds, median:
+
+| Version | Steady-state throughput |
+| :--- | ---: |
+| per-record listener, `MANUAL_IMMEDIATE` ack per record (previous release) | ~8,800 msg/s |
+| batch listener, `commitSync` per poll | ~377,000 msg/s |
+| **batch listener, `commitAsync` per poll (current)** | **~468,000 msg/s** |
+
+Steady state is measured from the first record to the last; including the
+consumer-group join, the current version takes ~660 ms for the 300,000 records.
+
+### Run them yourself
+
+Requires Docker to be running (the tests skip cleanly without it):
 
 ```bash
-./gradlew :bufferfly-spring-kafka:test --tests '*PostgresKafkaLedgerBenchmarkTest*'
+./gradlew :bufferfly-benchmarks:benchmarks --tests '*PostgresKafkaLedgerBenchmarkTest*'
+./gradlew :bufferfly-benchmarks:benchmarks --tests '*PostgresKafkaBatchLedgerBenchmarkTest*'
+./gradlew :bufferfly-benchmarks:benchmarks --tests '*PostgresKafkaBatchLedgerBenchmarkTest*' -Dbufferfly.bench.actorBatchSize=250
+./gradlew :bufferfly-benchmarks:benchmarks --tests '*ShardedActorContainerThroughputBenchmarkTest*'
 ```
 
-The workload size is tunable at the top of `PostgresKafkaLedgerBenchmarkTest`
-(`MESSAGES_PER_TOPIC`, `ACCOUNTS_PER_TOPIC`, `ACTOR_BATCH_SIZE`,
-`ACTOR_TIMEOUT_MS`).
+The workload size is tunable at the top of each test class
+(`MESSAGES_PER_TOPIC`, `ACCOUNTS_PER_TOPIC`, and `ROUNDS` for the batch
+benchmark). The poll size is `BenchmarkConsumers.MAX_POLL_RECORDS`; the actor's
+batch size defaults to it and can be overridden with
+`-Dbufferfly.bench.actorBatchSize`.
 
 ---
 

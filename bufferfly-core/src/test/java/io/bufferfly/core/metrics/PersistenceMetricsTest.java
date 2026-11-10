@@ -65,7 +65,7 @@ class PersistenceMetricsTest {
 
     private static PersistenceConfig<Item> config(InMemoryBufferflyMetrics metrics, FakeOps ops, int maxRetries) {
         return PersistenceConfig.builder(ops)
-                .batchSize(10).timeoutMs(10L).maxRetries(maxRetries)
+                .batchSize(10).maxRetries(maxRetries)
                 .metrics(metrics).componentName(ACTOR).build();
     }
 
@@ -171,7 +171,7 @@ class PersistenceMetricsTest {
     @Test
     void should_notThrow_when_runnerUsesNoopMetricsByDefault() {
         PersistenceConfig<Item> config = PersistenceConfig.builder(new FakeOps())
-                .batchSize(10).timeoutMs(10L).maxRetries(0).build(); // NOOP metrics
+                .batchSize(10).maxRetries(0).build(); // NOOP metrics
         BatchingPersistenceRunner<Item> runner = config.instantiate();
         runner.persistBatch(List.of(PersistenceRunner.newEvent(new Item(1, false, false))));
         // No exception, nothing to assert beyond "it ran".

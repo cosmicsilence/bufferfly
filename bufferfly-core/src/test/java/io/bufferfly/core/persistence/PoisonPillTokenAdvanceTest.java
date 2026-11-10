@@ -104,7 +104,7 @@ class PoisonPillTokenAdvanceTest {
     void should_persistPrePillAndFencePastPill_but_abandonPostPill_when_poisonPillIsInTheMiddleOfABatch() {
         FakeFencingOps ops = new FakeFencingOps(0L);
         boolean[] unrecoverable = {false};
-        PersistenceConfig<Rec> config = new PersistenceConfig<>(ops, 10, 10L, 0, () -> unrecoverable[0] = true);
+        PersistenceConfig<Rec> config = new PersistenceConfig<>(ops, 10, 0, () -> unrecoverable[0] = true);
         BatchingPersistenceRunner<Rec> runner = config.instantiate();
 
         // Restart at a known-good token: token 0 already committed.

@@ -33,7 +33,6 @@ public final class MessageShardFactory implements ShardedActorFactory<String> {
     private final MessageOperations operations;
 
     private final int batchSize;
-    private final long timeoutMs;
     private final int highWatermark;
     private final int lowWatermark;
     private final long evaluateIntervalMs;
@@ -45,12 +44,11 @@ public final class MessageShardFactory implements ShardedActorFactory<String> {
     private final AtomicInteger createdActors = new AtomicInteger();
 
     public MessageShardFactory(MessageOperations operations,
-                               int batchSize, long timeoutMs,
+                               int batchSize,
                                int highWatermark, int lowWatermark,
                                long evaluateIntervalMs) {
         this.operations = operations;
         this.batchSize = batchSize;
-        this.timeoutMs = timeoutMs;
         this.highWatermark = highWatermark;
         this.lowWatermark = lowWatermark;
         this.evaluateIntervalMs = evaluateIntervalMs;
@@ -82,12 +80,11 @@ public final class MessageShardFactory implements ShardedActorFactory<String> {
         };
 
         PersistenceDispatcher<Message> dispatcher = new BackpressurePersistenceDispatcher<>(
-                new NaturalBatchingDispatcher<>(batchSize, timeoutMs),
+                new NaturalBatchingDispatcher<>(batchSize),
                 highWatermark, lowWatermark, backpressure, evaluateIntervalMs);
 
         PersistenceConfig<Message> config = PersistenceConfig.builder(operations)
                 .batchSize(batchSize)
-                .timeoutMs(timeoutMs)
                 .maxRetries(5)
                 .dispatcher(dispatcher)
                 .onUnrecoverable(onUnrecoverable)

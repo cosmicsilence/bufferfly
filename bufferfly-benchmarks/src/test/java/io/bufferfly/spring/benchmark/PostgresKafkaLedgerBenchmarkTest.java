@@ -57,8 +57,7 @@ class PostgresKafkaLedgerBenchmarkTest {
     private static final List<String> TOPICS = List.of("ledger-a", "ledger-b", "ledger-c");
     private static final int MESSAGES_PER_TOPIC = 50_000;      // 150k total
     private static final int ACCOUNTS_PER_TOPIC = 500;
-    private static final int ACTOR_BATCH_SIZE = 500;
-    private static final long ACTOR_TIMEOUT_MS = 20L;
+    private static final int ACTOR_BATCH_SIZE = BenchmarkConsumers.MAX_POLL_RECORDS;
     private static final String DB_NAME = "ledger";
     // The classic path runs TOPICS.size() x ClassicLockingConsumer.THREADS_PER_TOPIC
     // (3 x 7 = 21) worker threads, each doing a tiny transaction at a time, plus
@@ -130,8 +129,8 @@ class PostgresKafkaLedgerBenchmarkTest {
         PgStats actorBefore = PgStats.capture(jdbc, DB_NAME);
         long actorMs;
         try (ActorLedgerConsumer actor = new ActorLedgerConsumer(
-                bootstrap, TOPICS, "actor-group", actorOps, ACTOR_BATCH_SIZE, ACTOR_TIMEOUT_MS)) {
-            actorMs = actor.runUntil(actorStore, expectedTotal);
+                bootstrap, TOPICS, "actor-group", actorOps, ACTOR_BATCH_SIZE)) {
+            actorMs = actor.runUntil(expectedTotal);
         }
         PgStats actorDelta = PgStats.capture(jdbc, DB_NAME).minus(actorBefore);
 

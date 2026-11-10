@@ -89,7 +89,6 @@ class PersistenceActorDatabaseUnavailableTest {
         PersistenceConfig<Tweet> config = new PersistenceConfig<>(
                 operations,
                 100,  // batch size
-                20L,  // 20ms timeout
                 8,    // max retries on TransientException
                 () -> unrecoverableHookCalled.set(true)
         );
@@ -242,7 +241,6 @@ class PersistenceActorDatabaseUnavailableTest {
         PersistenceConfig<Tweet> fastConfig = new PersistenceConfig<>(
                 operations,
                 10,   // batch size
-                10L,  // 10ms timeout
                 2,    // only 2 retries
                 () -> unrecoverableTriggered.set(true)
         );

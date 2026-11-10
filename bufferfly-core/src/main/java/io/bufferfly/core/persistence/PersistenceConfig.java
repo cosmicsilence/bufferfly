@@ -14,7 +14,6 @@ import io.bufferfly.core.metrics.BufferflyMetrics;
 public final class PersistenceConfig<E> {
 
     public static final int DEFAULT_BATCH_SIZE = 1_000;
-    public static final long DEFAULT_TIMEOUT_MS = 20L;
     public static final int DEFAULT_MAX_RETRIES = 5;
 
     /** Default component label used for metrics when no actor name is supplied. */
@@ -22,7 +21,6 @@ public final class PersistenceConfig<E> {
 
     private final TransactionalOperations<E> operations;
     private final int batchSize;
-    private final long timeoutMs;
     private final int maxRetries;
     private final Runnable onUnrecoverable;
     private final PersistenceDispatcher<E> dispatcher;
@@ -32,41 +30,38 @@ public final class PersistenceConfig<E> {
     private volatile BatchingPersistenceRunner<E> runner;
 
     public PersistenceConfig(TransactionalOperations<E> operations) {
-        this(operations, DEFAULT_BATCH_SIZE, DEFAULT_TIMEOUT_MS, DEFAULT_MAX_RETRIES, () -> {}, null, BufferflyMetrics.NOOP);
+        this(operations, DEFAULT_BATCH_SIZE, DEFAULT_MAX_RETRIES, () -> {}, null, BufferflyMetrics.NOOP);
     }
 
-    public PersistenceConfig(TransactionalOperations<E> operations, int batchSize, long timeoutMs, int maxRetries) {
-        this(operations, batchSize, timeoutMs, maxRetries, () -> {}, null, BufferflyMetrics.NOOP);
+    public PersistenceConfig(TransactionalOperations<E> operations, int batchSize, int maxRetries) {
+        this(operations, batchSize, maxRetries, () -> {}, null, BufferflyMetrics.NOOP);
     }
 
     public PersistenceConfig(
             TransactionalOperations<E> operations,
             int batchSize,
-            long timeoutMs,
             int maxRetries,
             Runnable onUnrecoverable) {
-        this(operations, batchSize, timeoutMs, maxRetries, onUnrecoverable, null, BufferflyMetrics.NOOP);
+        this(operations, batchSize, maxRetries, onUnrecoverable, null, BufferflyMetrics.NOOP);
     }
 
     public PersistenceConfig(
             TransactionalOperations<E> operations,
             int batchSize,
-            long timeoutMs,
             int maxRetries,
             Runnable onUnrecoverable,
             PersistenceDispatcher<E> dispatcher) {
-        this(operations, batchSize, timeoutMs, maxRetries, onUnrecoverable, dispatcher, BufferflyMetrics.NOOP);
+        this(operations, batchSize, maxRetries, onUnrecoverable, dispatcher, BufferflyMetrics.NOOP);
     }
 
     public PersistenceConfig(
             TransactionalOperations<E> operations,
             int batchSize,
-            long timeoutMs,
             int maxRetries,
             Runnable onUnrecoverable,
             PersistenceDispatcher<E> dispatcher,
             BufferflyMetrics metrics) {
-        this(operations, batchSize, timeoutMs, maxRetries, onUnrecoverable, dispatcher, metrics, DEFAULT_COMPONENT_NAME);
+        this(operations, batchSize, maxRetries, onUnrecoverable, dispatcher, metrics, DEFAULT_COMPONENT_NAME);
     }
 
     /**
@@ -80,7 +75,6 @@ public final class PersistenceConfig<E> {
     public PersistenceConfig(
             TransactionalOperations<E> operations,
             int batchSize,
-            long timeoutMs,
             int maxRetries,
             Runnable onUnrecoverable,
             PersistenceDispatcher<E> dispatcher,
@@ -88,13 +82,10 @@ public final class PersistenceConfig<E> {
             String componentName) {
         if (operations == null) throw new NullPointerException("operations must not be null");
         if (batchSize < 1) throw new IllegalArgumentException("batchSize must be >= 1");
-        if (timeoutMs < 1 || timeoutMs > 50)
-            throw new IllegalArgumentException("timeoutMs must be >= 1 AND <= 50");
         if (maxRetries < 0) throw new IllegalArgumentException("maxRetries must be >= 0");
         if (onUnrecoverable == null) throw new NullPointerException("onUnrecoverable must not be null");
         this.operations = operations;
         this.batchSize = batchSize;
-        this.timeoutMs = timeoutMs;
         this.maxRetries = maxRetries;
         this.onUnrecoverable = onUnrecoverable;
         this.dispatcher = dispatcher;
@@ -119,7 +110,7 @@ public final class PersistenceConfig<E> {
         if (processor == null) throw new NullPointerException("processor must not be null");
         PersistenceDispatcher<E> disp = this.dispatcher != null
                 ? this.dispatcher
-                : new NaturalBatchingDispatcher<>(this.batchSize, this.timeoutMs, this.metrics, this.componentName);
+                : new NaturalBatchingDispatcher<>(this.batchSize, this.metrics, this.componentName);
         BatchingPersistenceRunner<E> instantiatedRunner = new BatchingPersistenceRunner<>(
                 this.operations,
                 this,
@@ -155,10 +146,6 @@ public final class PersistenceConfig<E> {
         return batchSize;
     }
 
-    public long timeoutMs() {
-        return timeoutMs;
-    }
-
     public int maxRetries() {
         return maxRetries;
     }
@@ -186,37 +173,32 @@ public final class PersistenceConfig<E> {
     }
 
     public PersistenceConfig<E> withBatchSize(int batchSize) {
-        return new PersistenceConfig<>(operations, batchSize, timeoutMs, maxRetries, onUnrecoverable, dispatcher, metrics, componentName);
-    }
-
-    public PersistenceConfig<E> withTimeoutMs(long timeoutMs) {
-        return new PersistenceConfig<>(operations, batchSize, timeoutMs, maxRetries, onUnrecoverable, dispatcher, metrics, componentName);
+        return new PersistenceConfig<>(operations, batchSize, maxRetries, onUnrecoverable, dispatcher, metrics, componentName);
     }
 
     public PersistenceConfig<E> withMaxRetries(int maxRetries) {
-        return new PersistenceConfig<>(operations, batchSize, timeoutMs, maxRetries, onUnrecoverable, dispatcher, metrics, componentName);
+        return new PersistenceConfig<>(operations, batchSize, maxRetries, onUnrecoverable, dispatcher, metrics, componentName);
     }
 
     public PersistenceConfig<E> withOnUnrecoverable(Runnable onUnrecoverable) {
-        return new PersistenceConfig<>(operations, batchSize, timeoutMs, maxRetries, onUnrecoverable, dispatcher, metrics, componentName);
+        return new PersistenceConfig<>(operations, batchSize, maxRetries, onUnrecoverable, dispatcher, metrics, componentName);
     }
 
     public PersistenceConfig<E> withDispatcher(PersistenceDispatcher<E> dispatcher) {
-        return new PersistenceConfig<>(operations, batchSize, timeoutMs, maxRetries, onUnrecoverable, dispatcher, metrics, componentName);
+        return new PersistenceConfig<>(operations, batchSize, maxRetries, onUnrecoverable, dispatcher, metrics, componentName);
     }
 
     public PersistenceConfig<E> withMetrics(BufferflyMetrics metrics) {
-        return new PersistenceConfig<>(operations, batchSize, timeoutMs, maxRetries, onUnrecoverable, dispatcher, metrics, componentName);
+        return new PersistenceConfig<>(operations, batchSize, maxRetries, onUnrecoverable, dispatcher, metrics, componentName);
     }
 
     public PersistenceConfig<E> withComponentName(String componentName) {
-        return new PersistenceConfig<>(operations, batchSize, timeoutMs, maxRetries, onUnrecoverable, dispatcher, metrics, componentName);
+        return new PersistenceConfig<>(operations, batchSize, maxRetries, onUnrecoverable, dispatcher, metrics, componentName);
     }
 
     public static class Builder<E> {
         private final TransactionalOperations<E> operations;
         private int batchSize = DEFAULT_BATCH_SIZE;
-        private long timeoutMs = DEFAULT_TIMEOUT_MS;
         private int maxRetries = DEFAULT_MAX_RETRIES;
         private Runnable onUnrecoverable = () -> {};
         private PersistenceDispatcher<E> dispatcher;
@@ -230,11 +212,6 @@ public final class PersistenceConfig<E> {
 
         public Builder<E> batchSize(int batchSize) {
             this.batchSize = batchSize;
-            return this;
-        }
-
-        public Builder<E> timeoutMs(long timeoutMs) {
-            this.timeoutMs = timeoutMs;
             return this;
         }
 
@@ -270,7 +247,7 @@ public final class PersistenceConfig<E> {
         }
 
         public PersistenceConfig<E> build() {
-            return new PersistenceConfig<>(operations, batchSize, timeoutMs, maxRetries, onUnrecoverable, dispatcher, metrics, componentName);
+            return new PersistenceConfig<>(operations, batchSize, maxRetries, onUnrecoverable, dispatcher, metrics, componentName);
         }
     }
 }

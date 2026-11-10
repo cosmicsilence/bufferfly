@@ -2,11 +2,9 @@ package io.bufferfly.spring.benchmark;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.bufferfly.spring.ledger.AddToAccount;
-import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
-import org.apache.kafka.common.serialization.StringDeserializer;
 
 import java.time.Duration;
 import java.util.List;
@@ -140,15 +138,7 @@ public final class ClassicLockingConsumer implements AutoCloseable {
     }
 
     private KafkaConsumer<String, String> newConsumer() {
-        Map<String, Object> props = new java.util.HashMap<>();
-        props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
-        props.put(ConsumerConfig.GROUP_ID_CONFIG, groupId);
-        props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
-        props.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, true);
-        props.put(ConsumerConfig.MAX_POLL_RECORDS_CONFIG, 500);
-        props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
-        props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
-        return new KafkaConsumer<>(props);
+        return BenchmarkConsumers.newConsumer(bootstrapServers, groupId, true);
     }
 
     public long processed() {

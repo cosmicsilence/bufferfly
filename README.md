@@ -61,10 +61,11 @@ Kafka ──► Actor (in-memory, single-threaded, CPU-bound) ──► Persiste
 - **The actor loop is pure and non-blocking.** It never touches the database. It transforms each
   message and hands the result to the persistence layer. One actor owns a partition, so per-key
   ordering is preserved without locks.
-- **The persistence runner does natural batching.** It drains the buffer and coalesces up to
-  `batchSize` events — *or* whatever has accumulated within `timeoutMs` — into a **single bulk
-  transaction**. Under load the batch is always full (maximum DB efficiency); under light load the
-  timeout keeps latency bounded. Millions of tiny transactions become thousands of fat ones.
+- **The persistence runner does natural batching.** It drains whatever has accumulated in the
+  buffer, up to `batchSize` events, into a **single bulk transaction** — it never waits for more.
+  While one batch is being written the next one accumulates, so under load batches are full
+  (maximum DB efficiency) and under light load each event is written as soon as the previous batch
+  commits. Millions of tiny transactions become thousands of fat ones.
 - **The buffer is the shock absorber.** Bursts are absorbed in memory and smoothed into a steady
   write rate the database can sustain. The connection pool sees one borrower doing bulk writes, not
   a thundering herd.
@@ -206,7 +207,7 @@ Two cooperating layers guarantee the contract:
    buffer can grow without bound. This is the primary path.
 2. **Reactive (safety net).** If a record is delivered while already saturated and `tell` throws
    `UnderPressureException` or `MailBoxRefusedException`, the consumer pauses the partition and
-   leaves the record **un-acked** — Kafka redelivers it after resume.
+   does not commit that partition's slice of the poll.
 
 Because durability is anchored to the **DB-stored offset** (committed in the same transaction as the
 data), a paused-and-redelivered record is simply re-consumed, never lost and never double-written.
@@ -332,60 +333,91 @@ so the commit/WAL cost of the per-row path is visible next to the actor's bulk t
 
 | Metric | Actor + natural batching | 15 virtual threads, one INSERT per row | Advantage |
 | :--- | :---: | :---: | :---: |
-| **time for 100,000 rows** | **~1,035 ms** | ~12,210 ms | **~11.8× faster** |
-| **throughput** | **~96,650 rows/s** | ~8,190 rows/s | **~11.8×** |
-| **pg `xact_commit`** | **485** (101 bulk tx) | 98,999 | **~204× fewer commits** |
-| pg `wal_records` | 87,476 | 413,598 | ~4.7× fewer |
-| **pg `wal_bytes`** | **8,529,030** | 33,903,210 | **~3.98× less WAL** |
+| **time for 100,000 rows** | **~1,060 ms** | ~12,334 ms | **~11.6× faster** |
+| **throughput** | **~94,300 rows/s** | ~8,110 rows/s | **~11.6×** |
+| **pg `xact_commit`** | **499** (103 bulk tx) | 97,753 | **~196× fewer commits** |
+| pg `wal_records` | 93,550 | 403,869 | ~4.3× fewer |
+| **pg `wal_bytes`** | **9,103,464** | 33,055,427 | **~3.6× less WAL** |
 
-The actor coalesces the 100,000 writes into ~101 bulk transactions, turning per-row transaction
+The actor coalesces the 100,000 writes into ~103 bulk transactions, turning per-row transaction
 overhead (begin/commit + WAL flush) into a near-constant cost — exactly the pain described above,
 measured against a real database.
 
 > ⚠️ **About these numbers.** Postgres runs on the **same machine** as the test, so the network
 > round-trip per transaction is near-zero — which *understates* the advantage. Over a network to a
 > managed database, where each commit costs a real round-trip and holds a pooled connection,
-> collapsing ~99k commits into ~485 is far more dramatic than the ~11.8× seen here. Treat this as a
+> collapsing ~98k commits into ~500 is far more dramatic than the ~11.6× seen here. Treat this as a
 > conservative lower bound that isolates the batching effect itself. Absolute figures vary with
 > hardware, JVM warmup, and Docker overhead.
 
 > Run it yourself (requires Docker; skips cleanly without it):
-> `./gradlew :bufferfly-core:test --tests '*PersistenceActorBenchmarkTest*'`
+> `./gradlew :bufferfly-benchmarks:benchmarks --tests '*PersistenceActorBenchmarkTest*'`
 
 ### 📊 Real Postgres + Kafka: actor vs. a classic locking consumer
 
-`PostgresKafkaLedgerBenchmarkTest` (in `bufferfly-spring-kafka`) takes the batching story to a
-**networked, real database**: a BufferFly actor pipeline and a classic locking consumer ingest the
-**same** Kafka workload — **150,000 messages over 3 topics** — into the **same real Postgres**, on
-throwaway Docker containers via Testcontainers. Both write through the **same HikariCP pool** and the
-same schema/SQL, so the only variable is *how* each drives the database. Beyond wall-clock it captures
-Postgres's own `pg_stat_database.xact_commit` and `pg_stat_wal` counters, exposing the commit/WAL cost
-of the per-message path next to the actor's bulk transactions. Both must persist every message exactly
+`PostgresKafkaLedgerBenchmarkTest` takes the batching story to a **real database**: a BufferFly
+actor pipeline and a classic locking consumer ingest the **same** Kafka workload —
+**150,000 messages over 3 topics** — into the **same real Postgres**, on throwaway Docker containers
+via Testcontainers. Both write through the **same HikariCP pool** and the same schema, so the only
+variable is *how* each drives the database. Beyond wall-clock it captures Postgres's own
+`pg_stat_database.xact_commit` and `pg_stat_wal` counters. Both must persist every message exactly
 once with identical balances — same result, very different DB cost.
 
 | Metric | Classic (7 threads/topic, 1 tx/msg) | Actor (natural batching) | Advantage |
 | :--- | :---: | :---: | :---: |
-| **end-to-end time** | 92,630 ms | **10,680 ms** | **8.67× faster** |
-| **throughput** | ~1,619 msg/s | **~14,045 msg/s** | **8.67×** |
-| **pg `xact_commit`** | 149,254 | **1,476** | **≈101× fewer commits** |
-| pg `wal_records` | 1,533,170 | 867,652 | ~1.77× fewer |
-| **pg `wal_bytes`** | 108,930,618 | **67,772,333** | **~1.61× less WAL** |
+| **end-to-end time** | 92,819 ms | **3,285 ms** | **28.3× faster** |
+| **throughput** | ~1,616 msg/s | **~45,662 msg/s** | **28.3×** |
+| **pg `xact_commit`** | 149,237 | **447** | **≈334× fewer commits** |
+| pg `wal_records` | 1,533,179 | 853,899 | ~1.80× fewer |
+| **pg `wal_bytes`** | 108,944,531 | **67,509,478** | **~1.61× less WAL** |
 
-The classic path pays a full `BEGIN`/`COMMIT` + WAL flush **per message** and serializes hot accounts
-on a per-account `ReentrantLock`; the actor collapses ~149k commits into ~1.5k fat ones and does the
-balance read-modify-write lock-free in a single-writer `HashMap`. Postgres suffers from the commits and
-the WAL, not the data — natural batching is what removes that suffering.
+The classic path pays a full `BEGIN`/`COMMIT` + WAL flush **per message**; the actor collapses
+~149k commits into a few hundred fat ones. This comparison shows the value of **batching**, not of
+the actor model specifically: the next benchmark gives the conventional design batching too.
 
-> ⚠️ **About these numbers.** Postgres runs on the **same machine** as the test, so there is almost no
-> network round-trip per transaction — which *understates* the advantage. Over a network to a managed
-> database, where every commit costs a real round-trip and holds a pooled connection, collapsing ~149k
-> commits into ~1.5k is far more dramatic than the ~8.7× seen here. Treat it as a conservative lower
-> bound; absolute figures vary with hardware, JVM warmup, and Docker overhead. See the
-> [`bufferfly-spring-kafka` README](bufferfly-spring-kafka/README.md#-benchmark-actor-natural-batching-vs-classic-locking-consumer)
-> for the full breakdown.
+### 📊 Real Postgres + Kafka: actor vs. a batching locking consumer
 
-> Run it yourself (requires Docker; skips cleanly without it):
-> `./gradlew :bufferfly-spring-kafka:test --tests '*PostgresKafkaLedgerBenchmarkTest*'`
+A one-transaction-per-message baseline is easy to beat. `PostgresKafkaBatchLedgerBenchmarkTest`
+pits the actor against the strongest conventional design built from standard building blocks:
+`LockingBatchLedgerConsumer` keeps balances **in memory under per-account `ReentrantLock`s** (7 worker
+threads per topic) and writes each Kafka poll in **one synchronous bulk transaction** before the next
+poll, then `commitSync`s the offsets. Both poll 500 records at a time and issue the identical change
+insert and balance upsert as JDBC batches.
+
+It runs **three key distributions**, 600,000 messages each over 3 topics, 5 rounds alternating which
+approach runs first, and reports medians. It also counts lock acquisitions that had to wait, and
+change rows whose recorded balance is out of Kafka-offset order (the lock consumer's workers can
+apply one account's updates in a different order than they were produced; the actor never does).
+
+| Key distribution | Locking batch | Actor (batch 500) | Actor speed | Contended locks | Out-of-order rows |
+| :--- | ---: | ---: | ---: | ---: | ---: |
+| round-robin, 500 accounts/topic | **15,126 ms** | 18,597 ms | 0.81× | 0 | 0 |
+| shuffled, 500 accounts/topic | 15,591 ms | **13,119 ms** | **1.19×** | 175 | 1,124 |
+| shuffled, 10 accounts/topic (hot keys) | 11,358 ms | **8,795 ms** | **1.29×** | 6,911 | 51,441 |
+
+- **Database cost is the same.** Both commit about once per 500 messages (~1,200–1,250 commits) and
+  write the same WAL. Once the conventional design batches, the database does the same work.
+- **The database write dominates both.** Each side spends ~65–98% of its time inside a transaction
+  and ~2–5% on in-memory work, so lock-free memory and overlapped fetching can only win a few
+  percent here.
+- **Results are noisy.** Single rounds of the same configuration vary by up to ~40%; treat gaps under
+  ~20% as noise. With the actor's batch size lowered to 250 (polls stay at 500) the actor commits
+  twice as often and the outcome flips (1.11×, 0.92×, 0.93×), which is also within the noise.
+- **What the actor adds** over a well-built batch consumer is structural: no locks, offset-ordered
+  state per partition, per-partition backpressure, and supervised restart with offset rewind.
+
+Not yet measured: a remote database, many partitions per consumer, and a consumer that keeps no
+state in memory (reads balances from the database on every poll). See the
+[`bufferfly-spring-kafka` README](bufferfly-spring-kafka/README.md#-benchmark-actor-natural-batching-vs-a-batching-locking-consumer)
+for the setup, the time breakdown and per-batch-size results.
+
+> ⚠️ **About these numbers.** Postgres and Kafka run in Docker on the **same machine** as the test,
+> so database round-trips are near-zero. Absolute figures vary with hardware, JVM warmup, and Docker
+> overhead.
+
+> Run them yourself (requires Docker; skips cleanly without it):
+> `./gradlew :bufferfly-benchmarks:benchmarks --tests '*PostgresKafkaLedgerBenchmarkTest*'`
+> `./gradlew :bufferfly-benchmarks:benchmarks --tests '*PostgresKafkaBatchLedgerBenchmarkTest*'`
 
 ### 📊 Firehose: actor dispatch throughput
 
@@ -478,7 +510,6 @@ public class LedgerShardFactory implements ShardedActorFactory<AddToAccount> {
         // one actor is created per assigned partition
         PersistenceConfig<LedgerChange> config = PersistenceConfig.builder(operations)
                 .batchSize(200)
-                .timeoutMs(20L)
                 .maxRetries(5)
                 .onUnrecoverable(ctx::restartActor) // halt + restart + rewind on fatal failure
                 .build();
@@ -501,10 +532,12 @@ a reassigned partition cleanly gets a fresh actor.
 `partition`, and `offset` — so a persistent actor always has the offset available for the
 fencing-token pattern below.
 
-**No message loss (manual ack).** The container uses `MANUAL_IMMEDIATE` acks via a dedicated
-`ShardedActorConsumer`. Durability does **not** rely on the Kafka ack; it relies on the actor storing
-the consumed **offset in the same database transaction as the data**. On restart the actor seeks back
-to its DB-stored offset, so anything acked to Kafka but not committed to the DB is simply re-consumed.
+**No message loss (per-partition commits).** The listener is a batch listener — one invocation per
+`poll()` — and commits offsets itself with a non-blocking `commitAsync` on the native consumer, only
+for partitions whose whole slice of the poll reached their actor. Durability does **not** rely on the Kafka commit; it
+relies on the actor storing the consumed **offset in the same database transaction as the data**. On
+restart the actor seeks back to its DB-stored offset, so anything committed to Kafka but not to the DB
+is simply re-consumed.
 
 **Offset as an optimistic-locking fencing token.** The persistence layer stores the latest processed
 offset (per topic/partition) and advances it with a compare-and-set (`WHERE latest_offset = :expected`)
@@ -519,13 +552,15 @@ only adjusted for newly-inserted rows. No loss, no duplicates.
 `pausePartition()` when its buffer crosses the high watermark and `resumePartition()` once it recedes
 to the low watermark — fetching stops for that partition only, not the whole container. As a reactive
 safety net, if `tell` throws `UnderPressureException` or `MailBoxRefusedException` the consumer pauses
-the partition and leaves the record un-acked for redelivery. **No message is ever dropped under
-pressure — the broker is simply told to wait.**
+the partition and does not commit its slice. **No message is ever dropped under pressure — the broker
+is simply told to wait.**
 
 **Signal-based, thread-safe seeks.** Kafka's consumer is single-threaded, so an actor never touches it
 directly. `KafkaContext.seek(...)`/`seekToBeginning()` record a *signal* that the framework applies on
-the consumer thread (via Spring's `ConsumerSeekAware` callback) before the next poll; records left over
-from a poll taken before a rewind are discarded so a stale offset can never slip through.
+the consumer thread (via Spring's `ConsumerSeekAware` callback). The rest of that partition's slice of
+the current poll is discarded and not committed, while other partitions keep delivering and committing;
+the next poll re-reads the partition from the sought position. The gate never compares offsets, so log
+compaction removing the sought offset cannot wedge the partition.
 
 **Persistence failure → actor restart → offset rewind.** When the runner hits an `UnrecoverableException`
 (e.g. a failed zombie fence) it halts and calls your `onUnrecoverable` hook. Wiring it to
