@@ -7,14 +7,12 @@ import io.bufferfly.core.metrics.BufferflyMetrics;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 public class ActorManager {
 
     private final Map<String, DispatchingActor<?>> startedActors = new ConcurrentHashMap<>();
-
-    private final ExecutorService callStartExecutor = Executors.newVirtualThreadPerTaskExecutor();
 
     /**
      * Shared scheduler backing every actor's {@link Scheduler} capability. A
@@ -92,34 +90,51 @@ public class ActorManager {
     }
 
     /**
-     * Registers and starts {@code actor}, returning an {@link ActorReference}
-     * through which callers can send messages and stop the actor.
+     * Registers and starts an actor, returning its reference once the actor's
+     * {@code preStart} has completed.
+     *
+     * <p>{@code preStart} runs on the calling thread and this method blocks until
+     * it returns, so whoever holds the reference holds a <em>started</em> actor:
+     * anything {@code preStart} sets up (loaded state, requested Kafka seeks) is
+     * in place before anyone else can {@code tell} it. Messages the actor sends
+     * itself during {@code preStart} are queued and processed right after it.
+     * {@code preStart} must not wait for its own messages to be processed — the
+     * actor is single-threaded, so that would block the caller forever.
      *
      * <p>If an actor with the same name is already registered, the existing
-     * reference is returned and {@code actor} is ignored (idempotent).
+     * reference is returned and {@code actor} is ignored (idempotent), after
+     * waiting for that actor's start to complete.
      *
      * @param actor the actor implementation to register
      * @return a reference that provides {@code tell()} and {@code stop()}
+     * @throws RuntimeException whatever {@code preStart} threw; the actor is then
+     *                          not registered and may be started again
      */
     public <T> ActorReference<T> start(Actor<T> actor) {
-        final var registered = startedActors.computeIfAbsent(actor.name(), ignored -> {
+        AtomicBoolean created = new AtomicBoolean(false);
+        @SuppressWarnings("unchecked")
+        final DispatchingActor<T> registered = (DispatchingActor<T>) startedActors.computeIfAbsent(actor.name(), ignored -> {
             ActorDispatcher dispatcher = configuredDispatchers.getOrDefault(
                     actor.name(), defaultDispatcher);
-            DispatchingActor<T> dispatchingActor = new DispatchingActor<>(actor, dispatcher);
-            callStartExecutor.execute(dispatchingActor::start);
-            return dispatchingActor;
+            created.set(true);
+            return new DispatchingActor<>(actor, dispatcher);
         });
-        return (ActorReference<T>) registered;
+        if (created.get()) {
+            // Run preStart outside computeIfAbsent: it may block, or start other actors.
+            registered.start();
+        } else {
+            registered.awaitStarted();
+        }
+        return registered;
     }
 
     /**
-     * Releases the manager's shared executors. The scheduler pool is daemon so
-     * it never blocks JVM exit; call this for a clean shutdown (e.g. in tests or
-     * a container stop) to stop the scheduler threads promptly.
+     * Releases the manager's shared scheduler. It is daemon so it never blocks
+     * JVM exit; call this for a clean shutdown (e.g. in tests or a container
+     * stop) to stop the scheduler threads promptly.
      */
     public void shutdown() {
         scheduledExecutor.shutdownNow();
-        callStartExecutor.shutdownNow();
     }
 
     private static ActorDispatcher instantiateDispatcher(
@@ -227,17 +242,33 @@ public class ActorManager {
 
         private final Actor<T> delegate;
         private final ActorDispatcher dispatcher;
+        /** Completes when {@code preStart} has returned (or fails with what it threw). */
+        private final CompletableFuture<Void> started = new CompletableFuture<>();
 
         DispatchingActor(Actor<T> delegate, ActorDispatcher dispatcher) {
             this.delegate = delegate;
             this.dispatcher = dispatcher;
         }
 
+        /** Runs {@code preStart} on the calling thread; rethrows its failure after unregistering. */
         void start() {
-            // Inject the actor's context: its own reference (this) plus a
-            // one-shot self-scheduler backed by the shared scheduled executor.
-            delegate.setContext(new ActorContext<>(this, new SelfTellScheduler<>(this, scheduledExecutor)));
-            delegate.start();
+            try {
+                // Inject the actor's context: its own reference (this) plus a
+                // one-shot self-scheduler backed by the shared scheduled executor.
+                delegate.setContext(new ActorContext<>(this, new SelfTellScheduler<>(this, scheduledExecutor)));
+                delegate.start();
+                started.complete(null);
+            } catch (RuntimeException | Error e) {
+                startedActors.remove(delegate.name(), this);
+                dispatcher.clear(delegate);
+                started.completeExceptionally(e);
+                throw e;
+            }
+        }
+
+        /** Waits until another caller's {@link #start()} of this actor has finished. */
+        void awaitStarted() {
+           started.join();
         }
 
         @Override

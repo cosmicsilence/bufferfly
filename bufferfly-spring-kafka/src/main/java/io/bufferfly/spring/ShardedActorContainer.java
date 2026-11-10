@@ -26,6 +26,8 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 /**
  * Wires a single {@link ShardedActor}-annotated factory to a Spring Kafka
@@ -62,8 +64,11 @@ import java.util.concurrent.ConcurrentHashMap;
  * {@link KafkaContext#seek(long)} call records the request, and the consumer
  * thread applies it through the partition's
  * {@link ConsumerSeekAware.ConsumerSeekCallback}. Requests made before the
- * callback is available (e.g. during an actor's asynchronous {@code preStart})
- * are buffered and flushed once the partition's callback arrives.
+ * callback is available (e.g. in {@code preStart}, which runs while the
+ * partition is being assigned) are buffered and applied once the partition's
+ * callback arrives. Starting an actor blocks until its {@code preStart} has
+ * finished, so a rewind it requests there is recorded before any record of the
+ * partition is routed to it.
  *
  * <h2>Backpressure</h2>
  * Two cooperating mechanisms:
@@ -159,8 +164,8 @@ public final class ShardedActorContainer<K, V> {
         // (see onMessage). MANUAL + never acknowledging keeps Spring from
         // committing anything on its own.
         props.setAckMode(ContainerProperties.AckMode.MANUAL);
-        // Fire onIdleContainer periodically so a seek signalled by an actor's
-        // asynchronous preStart is flushed even when no records are arriving.
+        // Fire onIdleContainer periodically so a seek an actor requested (e.g. in
+        // preStart, or on a restart) is applied even when no records arrive.
         props.setIdleEventInterval(200L);
         props.setMessageListener(routing);
         props.setConsumerRebalanceListener(new ShardRebalanceListener());
@@ -232,13 +237,26 @@ public final class ShardedActorContainer<K, V> {
      * shard's stable {@link SeekState} (so a restart keeps the bound seek
      * callback and rewind gate). Sets the shard's {@code actorRef}/{@code consumer}.
      */
-    private void startActor(TopicPartition tp, Shard<V> shard) {
+    private boolean startActor(TopicPartition tp, Shard<V> shard) {
         KafkaContextImpl ctx = new KafkaContextImpl(tp, shard.seekState);
-        Actor<ConsumedRecord<V>> actor = factory.createActor(tp, ctx);
-        ActorReference<ConsumedRecord<V>> ref = actorManager.start(actor);
+        Actor<ConsumedRecord<V>> actor;
+        ActorReference<ConsumedRecord<V>> ref;
+        try {
+            actor = factory.createActor(tp, ctx);
+            // Blocks until the actor's preStart has finished, so a rewind the
+            // actor requests there is recorded before any record is routed to it.
+            ref = actorManager.start(actor);
+        } catch (RuntimeException e) {
+            // Leave the shard without an actor (its records are discarded, not
+            // committed) and retry through the supervisor's backoff.
+            log.error("Failed to start actor for partition {}; requesting a supervised restart", tp, e);
+            routing.requestRestart(tp);
+            return false;
+        }
         shard.actorRef = ref;
         shard.consumer = new ShardedActorConsumer<>(tp, ref, this::pausePartition, metrics, factory.actorName(tp));
         log.info("Partition {} -> started actor '{}'", tp, actor.name());
+        return true;
     }
 
     private void pausePartition(TopicPartition tp) {
@@ -354,16 +372,15 @@ public final class ShardedActorContainer<K, V> {
         void assign(TopicPartition tp) {
             Shard<V> shard = shards.computeIfAbsent(tp, p -> new Shard<>());
             if (!shard.hasActor()) {
-                ShardedActorContainer.this.startActor(tp, shard);
                 metrics.partitionAssigned(factory.actorName(tp));
+                ShardedActorContainer.this.startActor(tp, shard);
             }
         }
 
         /** Start a fresh actor for an existing shard (restart path). */
         void startActorForRestart(TopicPartition tp) {
             Shard<V> shard = shards.get(tp);
-            if (shard != null && !shard.hasActor()) {
-                ShardedActorContainer.this.startActor(tp, shard);
+            if (shard != null && !shard.hasActor() && ShardedActorContainer.this.startActor(tp, shard)) {
                 metrics.actorRestarted(factory.actorName(tp));
             }
         }
@@ -428,8 +445,8 @@ public final class ShardedActorContainer<K, V> {
         @Override
         public void onPartitionsAssigned(Map<TopicPartition, Long> assignments, ConsumerSeekCallback callback) {
             // Runs on the consumer thread. Bind the callback to each partition's
-            // (stable) SeekState and flush any seek the actor already signalled
-            // during its (async) preStart.
+            // (stable) SeekState and apply any seek the actor already requested
+            // in its preStart.
             assignments.keySet().forEach(tp -> {
                 Shard<V> shard = shards.computeIfAbsent(tp, p -> new Shard<>());
                 shard.seekState.bind(callback);
@@ -438,8 +455,10 @@ public final class ShardedActorContainer<K, V> {
 
         @Override
         public void onIdleContainer(Map<TopicPartition, Long> assignments, ConsumerSeekCallback callback) {
-            // Covers the race where the actor's async preStart signalled a seek
-            // AFTER onPartitionsAssigned and before any record arrived.
+            // Applies seeks requested while no records arrive for the whole
+            // consumer: after onPartitionsAssigned bound the callback (the order
+            // of Spring's two assignment callbacks is not relied upon), or by an
+            // actor restarted on a quiet partition.
             assignments.keySet().forEach(tp -> {
                 Shard<V> shard = shards.get(tp);
                 if (shard != null) {
@@ -576,7 +595,17 @@ public final class ShardedActorContainer<K, V> {
 
     /** Package-private seam: assign partitions (start a shard each). */
     void onAssigned(Collection<TopicPartition> partitions) {
-        partitions.forEach(routing::assign);
+        // Each start blocks until the actor's preStart has finished (it typically
+        // reads its stored state and offset). Start a rebalance's actors in
+        // parallel so the callback takes as long as the slowest preStart, not the
+        // sum; close() waits for all of them.
+        if (partitions.size() <= 1) {
+            partitions.forEach(routing::assign);
+            return;
+        }
+        try (ExecutorService starter = Executors.newVirtualThreadPerTaskExecutor()) {
+            partitions.forEach(tp -> starter.execute(() -> routing.assign(tp)));
+        }
     }
 
     /** Package-private seam: revoke partitions (release each shard). */

@@ -45,7 +45,7 @@ class ShardedActorContainerTest {
     private static final TopicPartition TP1 = new TopicPartition(TOPIC, 1);
 
     /** Records every value it receives; signals a seek to a stored offset on start. */
-    static final class CountingActor extends AbstractActor<ConsumedRecord<String>> {
+    static class CountingActor extends AbstractActor<ConsumedRecord<String>> {
         final List<String> received = new CopyOnWriteArrayList<>();
         private final String name;
         final KafkaContext ctx;
@@ -144,6 +144,12 @@ class ShardedActorContainerTest {
 
     private static Map<TopicPartition, OffsetAndMetadata> commit(TopicPartition tp, long next) {
         return Map.of(tp, new OffsetAndMetadata(next));
+    }
+
+    private static CountingActor actorFor(CapturingFactory factory, TopicPartition tp) {
+        return factory.created.stream()
+                .filter(a -> a.name().equals(tp.topic() + "-" + tp.partition()))
+                .findFirst().orElseThrow();
     }
 
     /** Applies the actor's initial preStart seek on the "consumer thread" for {@code tp}. */
@@ -344,8 +350,9 @@ class ShardedActorContainerTest {
         RecordingSeekCallback cb1 = new RecordingSeekCallback();
         awaitInitialSeekApplied(container, TP0, cb0, 100L);
         awaitInitialSeekApplied(container, TP1, cb1, 100L);
-        CountingActor actor0 = factory.created.get(0);
-        CountingActor actor1 = factory.created.get(1);
+        // Actors of one assignment start in parallel, so look them up by partition.
+        CountingActor actor0 = actorFor(factory, TP0);
+        CountingActor actor1 = actorFor(factory, TP1);
 
         // P0's actor signals a rewind (as a restarted actor's preStart would).
         actor0.ctx.seek(100L);
@@ -438,6 +445,73 @@ class ShardedActorContainerTest {
 
         assertEquals(List.of(TP0), paused, "pausePartition() pauses only the actor's own partition");
         assertEquals(List.of(TP0), resumed, "resumePartition() resumes only the actor's own partition");
+    }
+
+    /**
+     * Fresh assignment (not a restart): the actor's {@code preStart} loads its
+     * state and requests a rewind. Assignment blocks until {@code preStart} has
+     * finished, so the rewind is already requested when the first poll for the
+     * partition arrives: records from the consumer's old position are discarded
+     * and never reach the actor (which would otherwise apply them on top of the
+     * state it just loaded and double-count).
+     */
+    @Test
+    void should_discardRecordsOnFreshAssignment_untilActorsSeekIsApplied() {
+        CapturingFactory factory = new CapturingFactory(5L); // preStart requests seek(5)
+        ShardedActorContainer<String, String> container = newContainer(factory);
+
+        container.onAssigned(List.of(TP0)); // returns only after preStart requested its seek
+        CountingActor actor = factory.created.get(0);
+
+        // The very next poll still comes from the consumer's old position.
+        assertTrue(container.onBatch(List.of(rec(TP0, 0L, "stale-0"), rec(TP0, 1L, "stale-1"))).isEmpty(),
+                "records polled before the actor's seek is applied are discarded, not committed");
+
+        // The consumer thread applies the seek; the next poll starts at offset 5.
+        RecordingSeekCallback cb = new RecordingSeekCallback();
+        container.bindSeekCallback(TP0, cb);
+        assertTrue(cb.seeks.stream().anyMatch(s -> s.offset() == 5L), "seek(5) applied");
+        assertEquals(Map.of(TP0, new OffsetAndMetadata(6L)), container.onBatch(List.of(rec(TP0, 5L, "a"))));
+
+        await().untilAsserted(() -> assertEquals(List.of("a"), actor.received,
+                "the actor only ever sees records from the position it rewound to"));
+    }
+
+    /**
+     * A {@code preStart} that fails on assignment (e.g. the database is down
+     * while loading state) must not leave the partition without an actor: the
+     * container requests a supervised restart, which starts a fresh actor after
+     * the backoff.
+     */
+    @Test
+    void should_restartActor_whenPreStartFailsOnAssignment() {
+        java.util.concurrent.atomic.AtomicInteger attempts = new java.util.concurrent.atomic.AtomicInteger();
+        List<CountingActor> started = new CopyOnWriteArrayList<>();
+        ShardedActorFactory<String> factory = (tp, ctx) -> new CountingActor(tp.topic() + "-" + tp.partition(), ctx, 0L) {
+            @Override
+            protected void preStart() {
+                if (attempts.incrementAndGet() == 1) {
+                    throw new IllegalStateException("database unavailable");
+                }
+                super.preStart();
+                started.add(this);
+            }
+        };
+        @SuppressWarnings("unchecked")
+        ConsumerFactory<String, String> cf = mock(ConsumerFactory.class);
+        ShardedActorContainer<String, String> container =
+                new ShardedActorContainer<>("events-group", TOPIC, 3, factory, cf, new ActorManager());
+        container.setPausePartitionAction(tp -> { });
+        container.setResumePartitionAction(tp -> { });
+
+        container.onAssigned(List.of(TP0)); // first preStart fails; must not throw out of the callback
+
+        await().atMost(java.time.Duration.ofSeconds(10))
+                .untilAsserted(() -> assertEquals(1, started.size(), "a fresh actor is started after the failure"));
+        RecordingSeekCallback cb = new RecordingSeekCallback();
+        awaitInitialSeekApplied(container, TP0, cb, 0L);
+        assertEquals(commit(TP0, 1L), container.onBatch(List.of(rec(TP0, 0L, "hello"))));
+        await().untilAsserted(() -> assertEquals(List.of("hello"), started.get(0).received));
     }
 
     @Test

@@ -478,4 +478,88 @@ class ActorManagerTest {
         assertTrue(ex.getMessage().contains("Actor='stopped-actor' is not started"),
                 "Exception message should mention the actor name and not started status");
     }
+
+    // -----------------------------------------------------------------------
+    // Blocking start: start() returns only after preStart has completed
+    // -----------------------------------------------------------------------
+
+    @Test
+    void should_returnFromStart_onlyAfterPreStartCompleted() {
+        java.util.concurrent.atomic.AtomicBoolean preStartDone = new java.util.concurrent.atomic.AtomicBoolean();
+
+        class SlowPreStartActor extends AbstractActor<String> {
+            private final String name = "slow-pre-start-" + UUID.randomUUID();
+
+            @Override
+            public String name() {
+                return name;
+            }
+
+            @Override
+            protected void preStart() {
+                try {
+                    Thread.sleep(200);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+                preStartDone.set(true);
+            }
+
+            @Override
+            public void receive(String message) {
+            }
+
+            @Override
+            public void onError(String message, Exception e) {
+            }
+        }
+
+        SlowPreStartActor actor = new SlowPreStartActor();
+        manager.start(actor);
+
+        assertTrue(preStartDone.get(), "start() must not return before preStart has completed");
+        assertEquals(Actor.State.STARTED, actor.currentState(), "the returned reference is a started actor");
+    }
+
+    @Test
+    void should_rethrowPreStartFailure_andLeaveActorUnregistered() {
+        AtomicInteger attempts = new AtomicInteger();
+        String name = "failing-pre-start-" + UUID.randomUUID();
+
+        class FailingOnceActor extends AbstractActor<String> {
+            final List<String> received = new CopyOnWriteArrayList<>();
+
+            @Override
+            public String name() {
+                return name;
+            }
+
+            @Override
+            protected void preStart() {
+                if (attempts.incrementAndGet() == 1) {
+                    throw new IllegalStateException("cannot load state");
+                }
+            }
+
+            @Override
+            public void receive(String message) {
+                received.add(message);
+            }
+
+            @Override
+            public void onError(String message, Exception e) {
+            }
+        }
+
+        IllegalStateException ex = assertThrows(IllegalStateException.class,
+                () -> manager.start(new FailingOnceActor()));
+        assertEquals("cannot load state", ex.getMessage(), "preStart's own exception is rethrown");
+
+        // Not registered: the same name can be started again with a fresh instance.
+        FailingOnceActor retry = new FailingOnceActor();
+        ActorReference<String> ref = manager.start(retry);
+        ref.tell("hello");
+        await().atMost(Duration.ofSeconds(5)).untilAsserted(() -> assertEquals(List.of("hello"), retry.received));
+        assertEquals(2, attempts.get());
+    }
 }
