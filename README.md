@@ -508,7 +508,7 @@ Kubernetes pods in front of a relational database is equally critical:
   is no JobManager, TaskManager slots, RocksDB state backend, or S3 checkpoint storage to configure
   and operate.
 - **Data-Oriented In-Memory State (Structure of Arrays):** Because BufferFly actors own private state and rehydrate directly from the database on rebalance, you can apply **Data-Oriented Design** and store millions of entities in cache-friendly **Structure of Arrays (SoA)** primitive layouts (`long[]`, off-heap `MemorySegment`) with zero GC pressure. Flink requires state to live in managed `ValueState`/`MapState` (boxed heap objects or serialized RocksDB bytes) so it can snapshot and redistribute key groups during checkpoints and rescaling.
-
+- **Plain Java Ergonomics & Explicit Recovery:** BufferFly actors use standard Java (`HashMap`, normal constructors, and an explicit `preStart()` hook that loads DB state and seeks to `storedOffset + 1`). Flink requires serialized execution graphs, static nested classes, `TypeInformation` descriptors, and `ValueState` wrappers for distributed closures and checkpoint serialization.
 ### 📊 Firehose: actor dispatch throughput
 
 A burst of 15,000,000 messages to a single actor (`DispatcherComparisonBenchmarkTest`):
