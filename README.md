@@ -21,6 +21,59 @@ commonly between a Kafka consumer and a relational store.
 
 ---
 
+## Quick start
+
+Requires **Java 25+**. Pick the module you need:
+
+**Gradle**
+
+```groovy
+dependencies {
+    implementation 'io.github.cosmicsilence:bufferfly-core:1.2.0'
+
+    // Spring Boot + Kafka integration (already includes bufferfly-core)
+    implementation 'io.github.cosmicsilence:bufferfly-spring-kafka:1.2.0'
+}
+```
+
+**Maven**
+
+```xml
+<dependency>
+    <groupId>io.github.cosmicsilence</groupId>
+    <artifactId>bufferfly-core</artifactId>
+    <version>1.2.0</version>
+</dependency>
+
+<!-- Spring Boot + Kafka integration (already includes bufferfly-core) -->
+<dependency>
+    <groupId>io.github.cosmicsilence</groupId>
+    <artifactId>bufferfly-spring-kafka</artifactId>
+    <version>1.2.0</version>
+</dependency>
+```
+
+A first actor with `bufferfly-core`:
+
+```java
+final class Counter extends AbstractActor<Integer> {
+    private long total; // owned by this actor alone: no locks
+
+    @Override public void receive(Integer amount) { total += amount; }
+    @Override public String name() { return "counter"; }
+    @Override public void onError(Integer amount, Exception e) { /* log it */ }
+}
+
+ActorManager manager = new ActorManager();
+ActorReference<Integer> counter = manager.start(new Counter());
+counter.tell(1); // enqueued; processed on the actor's own virtual thread
+```
+
+Next steps: a [persistent actor with natural batching](#persistence-model), or
+[one actor per Kafka partition on Spring](#-bufferfly-spring-kafka).
+
+---
+
 ## The problem: Kafka + mini-transactions + connection pools under pressure
 
 A very common ingestion pipeline looks like this:
@@ -72,6 +125,42 @@ Kafka ──► Actor (in-memory, single-threaded, CPU-bound) ──► Persiste
 - **Backpressure is first-class.** When the buffer fills past a high watermark, BufferFly pushes
   back — on Spring + Kafka it *pauses the partition* so the broker stops delivering until the buffer
   drains back below a low watermark.
+
+### End to end on Spring + Kafka
+
+One partition's path, from the poll to the durable offset:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant K as Kafka
+    participant C as ShardedActorContainer<br/>(consumer thread)
+    participant A as Partition actor<br/>(mailbox + apply)
+    participant D as NaturalBatchingDispatcher<br/>(persistence thread)
+    participant DB as Database
+
+    C->>K: poll() — up to max.poll.records
+    K-->>C: records of the assigned partitions
+    C->>C: split per partition discard a slice while a rewind is pending
+    C->>A: tell(ConsumedRecord) for each record of the slice
+    C-)K: commitAsync(partitions whose slice was delivered)
+    Note over C,K: only a hint — on restart the actor seeks to the offset stored in the DB
+    A->>A: apply(record): update in-memory state, no I/O
+    A->>D: enqueue PersistenceEvent
+    opt buffer reaches highWatermark
+        D-->>C: pause this partition (resumed at lowWatermark)
+    end
+    D->>D: drain up to batchSize, never wait for more
+    D->>DB: BEGIN · bulk write · advance offset WHERE offset = expected · COMMIT
+    alt committed
+        D->>D: run post-commit side effects
+    else offset fence failed (zombie) or unrecoverable error
+        D->>C: onUnrecoverable → restartActor()
+        C->>A: stop, back off, start a fresh actor
+        A->>DB: preStart: load state and stored offset
+        A->>C: seek(stored + 1) — the partition is re-read from there
+end 
+```
 
 ### Persistence model
 
@@ -317,19 +406,18 @@ trusting the lease (the Kafka assignment) on its own.
 
 ## Performance
 
-BufferFly is engineered with strict mechanical sympathy. There are two independent performance
-stories: **batching throughput to the database** — measured against a real, throwaway Postgres both
-directly (core) and end-to-end over Kafka (spring-kafka) — and **raw actor dispatch throughput**
-(core vs. cpu-bound).
+There are two independent performance stories: **batching throughput to the database** and **raw
+actor dispatch throughput**. The headline numbers follow; setup, methodology, time breakdowns and
+caveats are in the [benchmarks README](bufferfly-benchmarks/README.md).
 
-### 📊 Batching vs. one-transaction-per-row
+> ⚠️ The database benchmarks run Postgres and Kafka in Docker on the **same machine** as the test,
+> so round-trips are near zero, and absolute figures vary with hardware and load. Treat gaps under
+> ~20% as noise.
 
-`PersistenceActorBenchmarkTest` compares a BufferFly persistent actor (natural batching) against the
-naive approach of 15 virtual threads each doing one `INSERT` per row, over 100,000 rows into a
-**real Postgres** (a throwaway Docker container via Testcontainers). Both paths write through the
-**same HikariCP pool** and the same table/SQL, so the only variable is *how* each drives the database;
-beyond wall-clock it captures Postgres's own `pg_stat_database.xact_commit` and `pg_stat_wal` counters,
-so the commit/WAL cost of the per-row path is visible next to the actor's bulk transactions.
+### 📊 Batching vs. one transaction per row
+
+100,000 rows into Postgres: one persistent actor with natural batching vs 15 virtual threads each
+doing one `INSERT` per row, through the same connection pool and SQL.
 
 | Metric | Actor + natural batching | 15 virtual threads, one INSERT per row | Advantage |
 | :--- | :---: | :---: | :---: |
@@ -339,29 +427,15 @@ so the commit/WAL cost of the per-row path is visible next to the actor's bulk t
 | pg `wal_records` | 87,457 | 412,117 | ~4.7× fewer |
 | **pg `wal_bytes`** | **8,484,851** | 33,862,017 | **~4.0× less WAL** |
 
-The actor coalesces the 100,000 writes into ~103 bulk transactions, turning per-row transaction
-overhead (begin/commit + WAL flush) into a near-constant cost — exactly the pain described above,
-measured against a real database.
+- The 100,000 writes collapse into ~103 bulk transactions, so per-row commit and WAL-flush cost
+  becomes a near-constant cost.
+- The database is local here; over a network every commit also costs a round-trip, which this
+  benchmark does not measure.
 
-> ⚠️ **About these numbers.** Postgres runs on the **same machine** as the test, so the network
-> round-trip per transaction is near-zero — which *understates* the advantage. Over a network to a
-> managed database, where each commit costs a real round-trip and holds a pooled connection,
-> collapsing ~98k commits into ~500 is far more dramatic than the ~10.6× seen here. Treat this as a
-> conservative lower bound that isolates the batching effect itself. Absolute figures vary with
-> hardware, JVM warmup, and Docker overhead.
+### 📊 Kafka → Postgres: actor vs. a classic locking consumer
 
-> Run it yourself (requires Docker; skips cleanly without it):
-> `./gradlew :bufferfly-benchmarks:benchmarks --tests '*PersistenceActorBenchmarkTest*'`
-
-### 📊 Real Postgres + Kafka: actor vs. a classic locking consumer
-
-`PostgresKafkaLedgerBenchmarkTest` takes the batching story to a **real database**: a BufferFly
-actor pipeline and a classic locking consumer ingest the **same** Kafka workload —
-**150,000 messages on one topic with 3 partitions, keyed by account** — into the **same real Postgres**, on throwaway Docker containers
-via Testcontainers. Both write through the **same HikariCP pool** and the same schema, so the only
-variable is *how* each drives the database. Beyond wall-clock it captures Postgres's own
-`pg_stat_database.xact_commit` and `pg_stat_wal` counters. Both must persist every message exactly
-once with identical balances — same result, very different DB cost.
+150,000 messages on one topic with 3 partitions, keyed by account: 7 worker threads per partition
+with one transaction per message, vs one actor per partition with natural batching.
 
 | Metric | Classic (7 threads/partition, 1 tx/msg) | Actor (natural batching) | Advantage |
 | :--- | :---: | :---: | :---: |
@@ -371,23 +445,15 @@ once with identical balances — same result, very different DB cost.
 | pg `wal_records` | 1,530,328 | 720,263 | ~2.1× fewer |
 | **pg `wal_bytes`** | 106,938,138 | **54,968,827** | **~1.9× less WAL** |
 
-The classic path pays a full `BEGIN`/`COMMIT` + WAL flush **per message**; the actor collapses
-~149k commits into a few hundred fat ones. This comparison shows the value of **batching**, not of
-the actor model specifically: the next benchmark gives the conventional design batching too.
+- Same result (every message exactly once, identical balances), ~292× fewer commits.
+- This shows the value of **batching**, not of the actor model: the next benchmark gives the
+  conventional design batching too.
 
-### 📊 Real Postgres + Kafka: actor vs. a batching locking consumer
+### 📊 Kafka → Postgres: actor vs. a batching locking consumer
 
-A one-transaction-per-message baseline is easy to beat. `PostgresKafkaBatchLedgerBenchmarkTest`
-pits the actor against the strongest conventional design built from standard building blocks:
-`LockingBatchLedgerConsumer` keeps balances **in memory under per-account `ReentrantLock`s** (7 worker
-threads per partition) and writes each Kafka poll in **one synchronous bulk transaction** before the next
-poll, then `commitSync`s the offsets. Both poll 500 records at a time and issue the identical change
-insert and balance upsert as JDBC batches.
-
-It runs **three key distributions**, 600,000 messages each on one topic with 3 partitions, 5 rounds
-alternating which approach runs first, and reports medians. It also counts lock acquisitions that had to wait, and
-change rows whose recorded balance is out of Kafka-offset order (the lock consumer's workers can
-apply one account's updates in a different order than they were produced; the actor never does).
+The strongest conventional design: balances in memory under per-account locks (7 workers per
+partition), one bulk transaction per 500-record poll, then `commitSync`. 600,000 messages per
+scenario, medians of 5 rounds.
 
 | Key distribution | Locking batch | Actor (batch 500) | Actor speed | Contended locks | Out-of-order rows |
 | :--- | ---: | ---: | ---: | ---: | ---: |
@@ -395,40 +461,19 @@ apply one account's updates in a different order than they were produced; the ac
 | shuffled, 1,500 accounts | **13,078 ms** | 13,663 ms | 0.96× | 195 | 1,166 |
 | shuffled, 30 accounts (hot keys) | **7,570 ms** | 9,167 ms | 0.83× | 7,982 | 53,596 |
 
-- **Database cost is the same.** Both commit about once per 500 messages (~1,200–1,240 commits) and
-  write the same WAL. Once the conventional design batches, the database does the same work.
-- **The database write dominates both.** Each side spends ~75–93% of its time inside a transaction
-  and ~2–5% on in-memory work, so lock-free memory and overlapped fetching can only win a few
-  percent here.
-- **Results are noisy.** Single rounds of the same configuration vary by up to ~35%, and the lock
-  consumer's round-robin median was 15.9 s in this run and 9.7 s in the next with identical
-  settings; treat gaps under ~20% as noise. With the actor's batch size lowered to 250 (polls stay
-  at 500) the actor commits twice as often and came out at 0.91×, 0.85× and 0.80×.
-- **What the actor adds** over a well-built batch consumer is structural: no locks, offset-ordered
-  state per partition, per-partition backpressure, and supervised restart with offset rewind.
+- **Same database cost, so throughput is a tie on 1,500 accounts.** Both commit ~1,200 times and
+  spend 75–93% of their time in the transaction. With 30 hot accounts the lock consumer won every
+  round; why is not measured.
+- **Ordering differs.** The lock consumer's workers apply an account's updates out of Kafka order
+  (53,596 rows with hot keys); the actor never does.
+- **What the actor adds is structural:** no locks, per-partition backpressure, and supervised
+  restart with offset rewind.
 
-Not yet measured: a remote database, many partitions per consumer, and a consumer that keeps no
-state in memory (reads balances from the database on every poll). See the
-[`bufferfly-spring-kafka` README](bufferfly-spring-kafka/README.md#-benchmark-actor-natural-batching-vs-a-batching-locking-consumer)
-for the setup, the time breakdown and per-batch-size results.
+### 📊 Kafka → Postgres: sharded actors vs. Apache Flink
 
-> ⚠️ **About these numbers.** Postgres and Kafka run in Docker on the **same machine** as the test,
-> so database round-trips are near-zero. Absolute figures vary with hardware, JVM warmup, and Docker
-> overhead.
-
-> Run them yourself (requires Docker; skips cleanly without it):
-> `./gradlew :bufferfly-benchmarks:benchmarks --tests '*PostgresKafkaLedgerBenchmarkTest*'`
-> `./gradlew :bufferfly-benchmarks:benchmarks --tests '*PostgresKafkaBatchLedgerBenchmarkTest*'`
-
-### 📊 Real Postgres + Kafka: sharded actors vs. Apache Flink
-
-`FlinkVsShardedActorLedgerBenchmarkTest` runs the ledger through **Apache Flink 2.2.1** in its
-standard form — `KafkaSource` → `keyBy(account)` → `KeyedProcessFunction` with the balance in keyed
-`ValueState` → `JdbcSink` in batches of 500 — and through BufferFly's `ShardedActorContainer` with a
-persistent actor per partition and natural batching up to 500. Same topic, tables and batch size;
-state in memory on both sides; Flink defaults otherwise (local environment, checkpointing off).
-
-600,000 messages per scenario, medians of 3 rounds, steady-state time:
+Apache Flink 2.2.1 (`KafkaSource` → `keyBy(account)` → keyed `ValueState` → `JdbcSink`, batches of
+500, checkpointing off) vs BufferFly's `ShardedActorContainer` with an actor per partition. Same
+topic, tables and batch size; 600,000 messages, medians of 3 rounds, steady-state time:
 
 | Key distribution | BufferFly (3 writers) | Flink, parallelism 3 | Flink, default (22) |
 | :--- | ---: | ---: | ---: |
@@ -436,43 +481,43 @@ state in memory on both sides; Flink defaults otherwise (local environment, chec
 | shuffled, 1,500 accounts | 12,574 ms | 13,875 ms | **6,107 ms** |
 | shuffled, 30 accounts (hot keys) | 9,092 ms | 12,481 ms | **6,617 ms** |
 
-- **Same number of writers:** BufferFly and Flink at parallelism 3 are close with 1,500 accounts
-  (one each way), and BufferFly is ~1.4× faster with hot keys. The cause of Flink's hot-key result
-  is not measured; it is not key skew (the 30 keys split 12 / 11 / 7 over its 3 subtasks).
-- **Flink's default parallelism** writes over 22 connections against BufferFly's 3 (one per
-  partition), and was fastest in every scenario of this run.
-- **Database cost:** BufferFly commits about half as often (~1,150–1,200 vs ~2,400–2,500) and
-  writes up to ~30% less WAL with hot keys, because it upserts each account once per batch instead
-  of once per change.
-- **Noisy run.** The machine was busier than in an earlier run of the same code, where every
-  contender was 30–50% faster (BufferFly 9.8 / 10.8 / 7.1 s, Flink p3 9.2 / 10.4 / 10.9 s, Flink
-  default 3.6 / 3.4 / 5.1 s); the ranking was the same except that BufferFly led Flink p3 on
-  shuffled keys only in the latest run.
-- **Correctness:** every run persists each change exactly once, with exact balances and no change
-  out of offset order. Partitions move between the 3 consumers once at start-up while the group
-  forms; BufferFly's actors reload their partition's state and offset in `preStart`, so this is
-  lossless.
+- **With the same 3 writers**, BufferFly and Flink are close on 1,500 accounts, and BufferFly is
+  ~1.4× faster with hot keys (the cause of Flink's slowdown is not measured).
+- **Flink at default parallelism** writes over 22 connections against BufferFly's 3 and was fastest
+  in every scenario.
+- **BufferFly commits about half as often** and writes up to ~30% less WAL. Every run is exact,
+  including the partition moves while the consumer group forms.
 
-See the [`bufferfly-spring-kafka` README](bufferfly-spring-kafka/README.md#-benchmark-sharded-actors-vs-apache-flink-keyed-state--jdbc-sink)
-for the setup, the database counters and what is not compared (checkpointing, exactly-once sinks,
-RocksDB, a real Flink cluster).
+### Operational predictability: BufferFly vs. Flink in production
 
-> Run it yourself (requires Docker; skips cleanly without it):
-> `./gradlew :bufferfly-benchmarks:benchmarks --tests '*FlinkVsShardedActorLedgerBenchmarkTest*'`
+Raw throughput benchmarks only tell half the story; how each system behaves when scaled across
+Kubernetes pods in front of a relational database is equally critical:
 
+- **Hard cap on database writers.** In BufferFly, active writers are bounded by your **Kafka
+  partition count** (1 actor and 1 writer per partition). Deploying 10 Spring Boot pods for a
+  20-partition topic means **at most 20 concurrent database writers** for that topic across the
+  whole cluster, giving the database a predictable, bounded load regardless of pod count. (During
+  a rebalance, a revoked actor's in-flight batch can briefly overlap with the new owner; the offset
+  fence rejects whichever write is stale.)
+- **No separate sink tuning required.** In Flink, `keyBy` decouples downstream operators from Kafka
+  partitions. Scaling out TaskManagers scales sink parallelism along with it, which can flood a
+  relational database with concurrent connections and row locks unless you explicitly cap sink
+  parallelism, size task slots, and tune connection pools per pod.
+- **No external state infrastructure.** BufferFly runs as a standard Spring Boot service, with
+  offsets stored in your database and in-memory state reloaded from it when an actor starts. There
+  is no JobManager, TaskManager slots, RocksDB state backend, or S3 checkpoint storage to configure
+  and operate.
+- **Data-Oriented In-Memory State (Structure of Arrays):** Because BufferFly actors own private state and rehydrate directly from the database on rebalance, you can apply **Data-Oriented Design** and store millions of entities in cache-friendly **Structure of Arrays (SoA)** primitive layouts (`long[]`, off-heap `MemorySegment`) with zero GC pressure. Flink requires state to live in managed `ValueState`/`MapState` (boxed heap objects or serialized RocksDB bytes) so it can snapshot and redistribute key groups during checkpoints and rescaling.
+- **Plain Java Ergonomics & Explicit Recovery:** BufferFly actors use standard Java (`HashMap`, normal constructors, and an explicit `preStart()` hook that loads DB state and seeks to `storedOffset + 1`). Flink requires serialized execution graphs, static nested classes, `TypeInformation` descriptors, and `ValueState` wrappers for distributed closures and checkpoint serialization.
 ### 📊 Firehose: actor dispatch throughput
 
-End-to-end processing of a burst of 15,000,000 messages to a single target actor path
-(`DispatcherComparisonBenchmarkTest`):
+A burst of 15,000,000 messages to a single actor (`DispatcherComparisonBenchmarkTest`):
 
 | Upstream Producers | bufferfly-core<br>*(Virtual Threads)* | bufferfly-cpu-bound<br>*(Hardware-Pinned Core)* | Speedup |
 | :--- | :---: | :---: | :---: |
 | **1 producer**   | ~5.5M msg/s | **⚡ 14.9M msg/s** | **2.71×** |
 | **10 producers** | ~3.3M msg/s | **⚡ 13.9M msg/s** | **4.17×** |
 | **50 producers** | ~2.8M msg/s | **⚡ 11.0M msg/s** | **3.97×** |
-
-> A single producer gets closest to **15M msg/s** on the spinning engine, because no other
-> producer contends for the mailbox's cache line.
 
 ### 📦 bufferfly-core — the virtual thread engine
 
@@ -525,12 +570,8 @@ Kafka consumer. You write the actor; BufferFly wires the consumer, the lifecycle
 
 ### Setup
 
-Add the dependency (Spring Boot's Kafka auto-configuration provides the `ConsumerFactory` from your
-`spring.kafka.*` properties):
-
-```groovy
-implementation 'io.github.cosmicsilence:bufferfly-spring-kafka'
-```
+Add `bufferfly-spring-kafka` (see [Quick start](#quick-start)). Spring Boot's Kafka
+auto-configuration provides the `ConsumerFactory` from your `spring.kafka.*` properties.
 
 Annotate a factory bean with `@ShardedActor` and implement `ShardedActorFactory`:
 
@@ -545,7 +586,7 @@ Annotate a factory bean with `@ShardedActor` and implement `ShardedActorFactory`
 public class LedgerShardFactory implements ShardedActorFactory<AddToAccount> {
 
     private final LedgerOperations operations;          // your TransactionalOperations
-    private final BalanceConfirmationService read Model; // any collaborator
+    private final BalanceConfirmationService readModel; // any collaborator
 
     @Override
     public Actor<ConsumedRecord<AddToAccount>> createActor(TopicPartition tp, KafkaContext ctx) {
@@ -632,6 +673,7 @@ rewinds — all wired entirely by Spring through `@ShardedActor`.
 ./gradlew build          # compile + test all modules
 ./gradlew :bufferfly-core:test
 ./gradlew :bufferfly-spring-kafka:test
+./gradlew :bufferfly-benchmarks:benchmarks   # needs Docker; see bufferfly-benchmarks/README.md
 ```
 
 Requires a Java 25 toolchain.
